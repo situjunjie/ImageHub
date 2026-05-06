@@ -447,14 +447,9 @@ const CURRENT_FRONTEND_VERSION = typeof __FRONTEND_BUILD_VERSION__ === "string"
   : "dev";
 const ALLOWED_API_ENDPOINTS = [
   {
-    value: "https://www.taijiai.online/",
-    label: "太极 AI",
-    description: "主服务地址",
-  },
-  {
-    value: "https://bobdong.cn/",
-    label: "BobDong",
-    description: "备用服务地址",
+    value: "https://ai.gigimed.cn/",
+    label: "有济AI",
+    description: "固定服务地址",
   },
 ] as const;
 const DEFAULT_API_URL = ALLOWED_API_ENDPOINTS[0].value;
@@ -5929,12 +5924,12 @@ export default function App() {
               spellCheck={false}
             />
           </label>
-          <div className="prompt-group-hint api-key-hint" role="note">
+          {/* <div className="prompt-group-hint api-key-hint" role="note">
             <WandSparkles size={14} />
             <span>
               推荐使用 <strong>banana Pro 官转</strong> 或 <strong>OpenRouter</strong> 分组。
             </span>
-          </div>
+          </div> */}
           <label className="check-row">
             <input
               type="checkbox"
