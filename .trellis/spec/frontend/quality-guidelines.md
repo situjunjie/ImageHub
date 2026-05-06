@@ -32,7 +32,26 @@ Questions to answer:
 
 <!-- Patterns that must always be used -->
 
-(To be filled by the team)
+### Browser API Compatibility
+
+Feature-detect browser APIs that are not guaranteed in every supported runtime before using them.
+
+**Problem**: Direct calls such as `crypto.randomUUID()` can crash app initialization in browsers or contexts where the method is unavailable.
+
+**Required behavior**:
+- Check the method exists before calling it.
+- Prefer the stronger compatible API when available, such as `crypto.getRandomValues()` for ID generation.
+- Provide a narrow fallback for non-security-sensitive identifiers so the UI can still load.
+
+```typescript
+function uid() {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+
+  return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+```
 
 ---
 
