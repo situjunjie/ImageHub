@@ -2,6 +2,7 @@ import {
   AlertCircle,
   ArrowRight,
   BarChart3,
+  Bot,
   CheckCircle2,
   Clock3,
   ChevronRight,
@@ -9,6 +10,9 @@ import {
   Database,
   Download,
   DownloadCloud,
+  ExternalLink,
+  Flame,
+  Heart,
   ImagePlus,
   Loader2,
   LogOut,
@@ -22,6 +26,7 @@ import {
   Send,
   Settings2,
   ShieldCheck,
+  Star,
   Square,
   CheckSquare,
   Trash2,
@@ -177,7 +182,7 @@ type ModelLoadState = {
 };
 
 type LocalLogLevel = "info" | "success" | "warning" | "error";
-type LocalLogType = "model_load" | "api_health" | "prompt_analysis" | "image_generation";
+type LocalLogType = "model_load" | "api_health" | "prompt_analysis" | "image_generation" | "agent_analysis";
 
 type ReferenceUploadStatus =
   | "none"
@@ -272,6 +277,9 @@ type PromptAnalysisState = {
   message: string;
   result?: PromptAnalysisResult;
   error?: string;
+  streamPreview?: string;
+  streamCharacters?: number;
+  streamChunks?: number;
 };
 
 type PromptVariant = "stable" | "creative" | "commercial";
@@ -340,6 +348,67 @@ type AnalysisCountdown = {
   label: string;
 };
 
+type AgentModeIntentType = "single_image" | "multi_image_batch" | "brochure_project" | "page_refine" | "unknown";
+type AgentModeCostLevel = "low" | "medium" | "high";
+type AgentModeStatus = "idle" | "analyzing" | "receiving" | "needs_confirmation" | "planned" | "executing" | "error";
+
+type AgentModeJobSpec = {
+  id: string;
+  title: string;
+  prompt: string;
+  objective?: string;
+  negativePrompt?: string;
+  aspectRatio?: string;
+  size?: string;
+  resolution?: ImageResolution;
+  quality?: string;
+  count?: number;
+};
+
+type AgentModeBrochurePage = {
+  pageNo: number;
+  role: string;
+  title: string;
+  objective: string;
+};
+
+type AgentModeBrochureProject = {
+  title: string;
+  companyName?: string;
+  industry?: string;
+  purpose?: string;
+  pageCount: number;
+  summary: string;
+  outline: AgentModeBrochurePage[];
+  styleDirections: string[];
+  requestPrompt?: string;
+};
+
+type AgentModeAnalysisResult = {
+  intentType: AgentModeIntentType;
+  confidence: number;
+  reasoningSummary: string;
+  estimatedCostLevel: AgentModeCostLevel;
+  requiresConfirmation: boolean;
+  autoExecute: boolean;
+  jobs: AgentModeJobSpec[];
+  brochureProject?: AgentModeBrochureProject;
+  analysisModel?: string;
+  source?: "ai" | "local";
+};
+
+type AgentModeState = {
+  status: AgentModeStatus;
+  message: string;
+  requestId?: string;
+  error?: string;
+  result?: AgentModeAnalysisResult;
+  streamPreview?: string;
+  streamCharacters?: number;
+  streamChunks?: number;
+  requestPrompt?: string;
+};
+
 type PreviewItem = {
   id: string;
   requestId?: string;
@@ -362,7 +431,123 @@ type PreviewItem = {
   submittedReferenceImages?: SubmittedReference[];
 };
 
-type AppPage = "home" | "studio" | "admin";
+type AppPage = "home" | "studio" | "square" | "admin";
+
+type SquareFeedTab = "latest" | "hot" | "top_day" | "top_week" | "top_month";
+
+type SquareFeedItem = {
+  id: string;
+  imageId: string;
+  requestId?: string;
+  thumbnailUrl: string;
+  prompt: string;
+  caption: string;
+  model: string;
+  params: Partial<ImageParams> & Record<string, unknown>;
+  width?: number;
+  height?: number;
+  aspectRatio?: string;
+  sourceType: string;
+  reasonPlan?: unknown;
+  recommenderLabel: string;
+  pageLabel?: string;
+  likeCount: number;
+  createdAt: number;
+  updatedAt: number;
+  rankScore: number;
+  likedByRequester?: boolean;
+};
+
+type SquareFeedResponse = {
+  ok: boolean;
+  tab: SquareFeedTab;
+  items: SquareFeedItem[];
+  nextCursor: string;
+  hasMore: boolean;
+  error?: string;
+};
+
+type SquareQuotaResponse = {
+  ok: boolean;
+  dailyRecommendUsed: number;
+  dailyRecommendLeft: number;
+  dailyLikeUsed: number;
+  dailyLikeLeft: number;
+  shelfCount: number;
+  shelfLimit: number;
+  dayKey?: string;
+  error?: string;
+};
+
+type SquareRecommendResponse = {
+  ok: boolean;
+  status?: string;
+  action?: "added" | "replaced" | "rejected";
+  item?: SquareFeedItem;
+  remainingDailyQuota?: number;
+  remainingShelfSlots?: number;
+  replacedItemId?: string;
+  reasonCode?: string;
+  error?: string;
+};
+
+type SquareLikeResponse = {
+  ok: boolean;
+  status?: "liked" | "unliked" | "rejected";
+  action?: "liked" | "unliked" | "noop" | "rejected";
+  likeCount?: number;
+  remainingLikeQuota?: number;
+  reasonCode?: string;
+  error?: string;
+};
+
+type SquareRecommendStatus = {
+  status: "submitting" | "success" | "error";
+  message: string;
+  itemId?: string;
+};
+
+type SquareAdminTrend = {
+  dateKey: string;
+  recommendAttempts: number;
+  added: number;
+  replaced: number;
+  rejected: number;
+  likes: number;
+  unlikes: number;
+};
+
+type SquareAdminReason = {
+  reasonCode: string;
+  count: number;
+};
+
+type SquareAdminRiskEvent = {
+  id: string;
+  requestId: string;
+  apiKeyHash: string;
+  itemId?: string;
+  imageId?: string;
+  event: string;
+  reasonCode: string;
+  severity: "low" | "medium" | "high";
+  ipHash: string;
+  uaHash: string;
+  timestamp: number;
+  detail?: unknown;
+};
+
+type SquareAdminOverview = {
+  activeItems: number;
+  totalItems: number;
+  totalRecommendAttempts: number;
+  totalLikes: number;
+  replacementRate: number;
+  likeRate: number;
+  trend: SquareAdminTrend[];
+  rejectedReasonTop: SquareAdminReason[];
+  riskEvents: SquareAdminRiskEvent[];
+};
 
 type AdminUserView = {
   username: string;
@@ -371,7 +556,7 @@ type AdminUserView = {
 
 type AdminRequestLog = {
   requestId: string;
-  requestType?: "image_generation" | "prompt_analysis";
+  requestType?: "image_generation" | "prompt_analysis" | "agent_analysis";
   batchId?: string;
   batchIndex?: number;
   batchTotal?: number;
@@ -433,6 +618,7 @@ type AdminStats = {
 const DB_NAME = "codex-image-batch-studio";
 const STORE_NAME = "history";
 const HISTORY_PAGE_SIZE = 20;
+const SQUARE_PAGE_SIZE = 20;
 const REFERENCE_LIMIT = 6;
 const MAX_REFERENCE_SIZE = 10 * 1024 * 1024;
 const MAX_REFERENCE_REQUEST_BYTES = 512 * 1024;
@@ -442,6 +628,15 @@ const LARGE_REFERENCE_EDGE = 4096;
 const PROMPT_TEXTAREA_MAX_HEIGHT = 220;
 const FRONTEND_VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const API_KEY_MIN_LENGTH = 8;
+const AGENT_MODE_STORAGE_KEY = "imageStudioAgentModeEnabled";
+const AGENT_MODE_NAME = "Agent 模式 A";
+const SQUARE_FEED_TABS: Array<{ value: SquareFeedTab; label: string; icon: typeof Clock3 }> = [
+  { value: "latest", label: "最新", icon: Clock3 },
+  { value: "hot", label: "热门", icon: Flame },
+  { value: "top_day", label: "精选", icon: Star },
+  { value: "top_week", label: "本周", icon: BarChart3 },
+  { value: "top_month", label: "本月", icon: BarChart3 },
+];
 const CURRENT_FRONTEND_VERSION = typeof __FRONTEND_BUILD_VERSION__ === "string"
   ? __FRONTEND_BUILD_VERSION__
   : "dev";
@@ -455,16 +650,21 @@ const ALLOWED_API_ENDPOINTS = [
 const DEFAULT_API_URL = ALLOWED_API_ENDPOINTS[0].value;
 const DEFAULT_PROTOCOL: ImageProtocol = "custom-openai";
 const DEFAULT_IMAGE_RESOLUTION: ImageResolution = "1K";
+const GPT_IMAGE_2_MODEL = "gpt-image-2";
+const GPT_IMAGE_2_PRO_MODEL = "gpt-image-2-pro";
+const GPT_IMAGE_2_FAMILY_MODEL = "gpt-5.4-image-2";
+const GEMINI_3_PRO_IMAGE_MODEL = "gemini-3-pro-image-preview";
+const PRIMARY_IMAGE_MODELS = [GPT_IMAGE_2_MODEL, GEMINI_3_PRO_IMAGE_MODEL] as const;
 const SUPPORTED_REFERENCE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
 const ASPECT_RATIOS = [
-  { value: "1:1", label: "1:1 方图", hint: "头像、商品主图、社媒配图" },
+  { value: "1:1", label: "1:1 方图 · 1024x1024", hint: "GPT Image 官方方图尺寸" },
   { value: "4:5", label: "4:5 竖版社媒", hint: "小红书、信息流、电商卡片" },
   { value: "5:4", label: "5:4 横版产品", hint: "商品展示、横版构图" },
   { value: "3:4", label: "3:4 竖版照片", hint: "人像、封面、海报草图" },
   { value: "4:3", label: "4:3 经典横图", hint: "摄影、PPT、内容插图" },
-  { value: "2:3", label: "2:3 竖版海报", hint: "海报、人物全身、印刷" },
-  { value: "3:2", label: "3:2 相机横图", hint: "风景、产品场景、摄影" },
+  { value: "2:3", label: "2:3 竖图 · 1024x1536", hint: "GPT Image 官方竖图尺寸" },
+  { value: "3:2", label: "3:2 横图 · 1536x1024", hint: "GPT Image 官方横图尺寸" },
   { value: "9:16", label: "9:16 手机竖屏", hint: "短视频封面、Story、壁纸" },
   { value: "16:9", label: "16:9 宽屏", hint: "视频封面、网页头图、桌面壁纸" },
   { value: "21:9", label: "21:9 超宽屏", hint: "横幅、电影感场景" },
@@ -476,27 +676,69 @@ const ASPECT_RATIOS = [
 ] as const;
 
 const ALL_ASPECT_RATIOS = ASPECT_RATIOS.map((ratio) => ratio.value);
+const GPT_IMAGE_SUPPORTED_ASPECT_RATIOS = ["1:1", "2:3", "3:2"] as const;
+const GPT_IMAGE_2_PRO_SUPPORTED_ASPECT_RATIOS = ["1:1", "4:5", "5:4", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9"] as const;
+const GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"] as const;
 
 const IMAGEN_ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"];
 const STABILITY_ASPECT_RATIOS = ["16:9", "1:1", "21:9", "2:3", "3:2", "4:5", "5:4", "9:16", "9:21"];
-const OPENAI_ASPECT_RATIOS = ["1:1", "4:5", "5:4", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9", "9:21"];
+const OPENAI_ASPECT_RATIOS = [...GPT_IMAGE_SUPPORTED_ASPECT_RATIOS];
 
 const SIZE_BY_RATIO: Record<string, string> = {
   "1:1": "1024x1024",
   "4:5": "1024x1280",
   "5:4": "1280x1024",
-  "3:4": "1024x1365",
-  "4:3": "1365x1024",
+  "3:4": "1152x1536",
+  "4:3": "1536x1152",
   "2:3": "1024x1536",
   "3:2": "1536x1024",
   "9:16": "1024x1792",
   "16:9": "1792x1024",
-  "21:9": "1792x768",
-  "9:21": "768x1792",
+  "21:9": "2016x864",
+  "9:21": "864x2016",
   "4:1": "2048x512",
   "1:4": "512x2048",
   "8:1": "2048x256",
   "1:8": "256x2048",
+};
+
+const PRO_2K_SIZE_BY_RATIO: Record<string, string> = {
+  "1:1": "2048x2048",
+  "4:5": "2048x2560",
+  "5:4": "2560x2048",
+  "3:4": "2304x3072",
+  "4:3": "3072x2304",
+  "2:3": "2048x3072",
+  "3:2": "3072x2048",
+  "9:16": "2160x3840",
+  "16:9": "3840x2160",
+  "21:9": "3840x1646",
+};
+
+const PRO_4K_SIZE_BY_RATIO: Record<string, string> = {
+  "1:1": "3840x3840",
+  "4:5": "3072x3840",
+  "5:4": "3840x3072",
+  "3:4": "2880x3840",
+  "4:3": "3840x2880",
+  "2:3": "2560x3840",
+  "3:2": "3840x2560",
+  "9:16": "2160x3840",
+  "16:9": "3840x2160",
+  "21:9": "3840x1646",
+};
+
+const GEMINI_3_PRO_SIZE_BY_RATIO: Record<string, string> = {
+  "1:1": "1024x1024",
+  "2:3": "832x1248",
+  "3:2": "1248x832",
+  "3:4": "896x1200",
+  "4:3": "1200x896",
+  "4:5": "864x1088",
+  "5:4": "1088x864",
+  "9:16": "768x1344",
+  "16:9": "1344x768",
+  "21:9": "1536x672",
 };
 
 const IMAGE_RESOLUTIONS: Array<{ value: ImageResolution; label: string; hint: string; multiplier: number }> = [
@@ -524,7 +766,7 @@ const PROTOCOLS: Array<{
     shortLabel: "兼容协议",
     description: "适合第三方中转或自建 OpenAI 风格图片接口",
     defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: ["gpt-image-1", "gpt-image-2"],
+    defaultModels: [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_PRO_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
     supportedAspectRatios: ALL_ASPECT_RATIOS,
     supportsReferenceImages: true,
     supportsNegativePrompt: true,
@@ -537,7 +779,7 @@ const PROTOCOLS: Array<{
     shortLabel: "OpenAI",
     description: "OpenAI 风格 Images API，宽高比会转换为 size 参数",
     defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: ["gpt-image-1"],
+    defaultModels: [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_PRO_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
     supportedAspectRatios: OPENAI_ASPECT_RATIOS,
     supportsReferenceImages: true,
     supportsNegativePrompt: true,
@@ -563,8 +805,8 @@ const PROTOCOLS: Array<{
     shortLabel: "Gemini",
     description: "Google Gemini 原生 generateContent 生图/改图",
     defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: ["gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"],
-    supportedAspectRatios: ALL_ASPECT_RATIOS,
+    defaultModels: [GEMINI_3_PRO_IMAGE_MODEL, "gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"],
+    supportedAspectRatios: [...GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS],
     supportsReferenceImages: true,
     supportsNegativePrompt: true,
     supportsQuality: false,
@@ -1183,6 +1425,7 @@ function getClientId() {
 
 function pageFromHash(): AppPage {
   if (window.location.hash === "#studio") return "studio";
+  if (window.location.hash === "#square") return "square";
   if (window.location.hash.startsWith("#admin")) return "admin";
   return "home";
 }
@@ -1422,12 +1665,68 @@ function getAspectDefinition(value: string) {
   return ASPECT_RATIOS.find((ratio) => ratio.value === value) || ASPECT_RATIOS[0];
 }
 
-function getSupportedAspectRatios(protocol: ImageProtocol) {
+function normalizedImageModelId(model = "") {
+  return model.replace(/^models\//, "").trim().toLowerCase();
+}
+
+function isGptImage2Model(model = "") {
+  const normalized = normalizedImageModelId(model);
+  return normalized === GPT_IMAGE_2_MODEL || normalized === GPT_IMAGE_2_FAMILY_MODEL || normalized.includes("image-2");
+}
+
+function isGptImage2ProModel(model = "") {
+  return normalizedImageModelId(model) === GPT_IMAGE_2_PRO_MODEL;
+}
+
+function isGemini3ProImageModel(model = "") {
+  return normalizedImageModelId(model) === GEMINI_3_PRO_IMAGE_MODEL;
+}
+
+function protocolForImageModel(model: string, fallback: ImageProtocol = DEFAULT_PROTOCOL): ImageProtocol {
+  if (isGemini3ProImageModel(model)) return "gemini-native";
+  if (isGptImage2Model(model)) {
+    return fallback === "openai-images" ? "openai-images" : "custom-openai";
+  }
+  return fallback;
+}
+
+function protocolMatchesImageModel(protocol: ImageProtocol, model = "") {
+  if (!model) return true;
+  if (isGemini3ProImageModel(model)) return protocol === "gemini-native";
+  if (isGptImage2Model(model)) return protocol === "custom-openai" || protocol === "openai-images";
+  return true;
+}
+
+function imageModelLaneLabel(model: string) {
+  if (isGemini3ProImageModel(model)) return "Gemini 原生接口";
+  if (isGptImage2ProModel(model)) return "GPT Image 2 Pro 接口";
+  if (isGptImage2Model(model)) return "GPT Image 2 接口";
+  return "图片模型";
+}
+
+function usesOfficialGptImageSizing(protocol: ImageProtocol, model = "") {
+  return isGptImage2Model(model) && !isGptImage2ProModel(model) && (
+    protocol === "custom-openai"
+    || protocol === "openai-images"
+    || protocol === "openai-responses"
+  );
+}
+
+function getSupportedAspectRatios(protocol: ImageProtocol, model = "") {
+  if (isGemini3ProImageModel(model) && protocol === "gemini-native") {
+    return [...GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS];
+  }
+  if (isGptImage2ProModel(model)) {
+    return [...GPT_IMAGE_2_PRO_SUPPORTED_ASPECT_RATIOS];
+  }
+  if (usesOfficialGptImageSizing(protocol, model)) {
+    return [...GPT_IMAGE_SUPPORTED_ASPECT_RATIOS];
+  }
   return getProtocolDefinition(protocol).supportedAspectRatios;
 }
 
-function isAspectRatioSupported(protocol: ImageProtocol, aspectRatio: string) {
-  return getSupportedAspectRatios(protocol).includes(aspectRatio);
+function isAspectRatioSupported(protocol: ImageProtocol, aspectRatio: string, model = "") {
+  return getSupportedAspectRatios(protocol, model).includes(aspectRatio);
 }
 
 function isImageResolution(value: unknown): value is ImageResolution {
@@ -1442,12 +1741,53 @@ function scaleSize(size: string, resolution: ImageResolution) {
   const [width, height] = size.split("x").map((item) => Number(item));
   const multiplier = IMAGE_RESOLUTIONS.find((item) => item.value === resolution)?.multiplier || 1;
   if (!Number.isFinite(width) || !Number.isFinite(height) || multiplier === 1) return size;
-  return `${Math.round(width * multiplier)}x${Math.round(height * multiplier)}`;
+  const MAX_EDGE = 3840;
+  let w = Math.round(width * multiplier);
+  let h = Math.round(height * multiplier);
+  const longest = Math.max(w, h);
+  if (longest > MAX_EDGE) {
+    const factor = MAX_EDGE / longest;
+    w = Math.round(width * multiplier * factor);
+    h = Math.round(height * multiplier * factor);
+  }
+  return `${w}x${h}`;
+}
+
+function baseSizeForModel(aspectRatio: string, protocol: ImageProtocol, model = "") {
+  if (isGemini3ProImageModel(model) && protocol === "gemini-native") {
+    return GEMINI_3_PRO_SIZE_BY_RATIO[aspectRatio] || GEMINI_3_PRO_SIZE_BY_RATIO["1:1"];
+  }
+  return SIZE_BY_RATIO[aspectRatio] || SIZE_BY_RATIO["1:1"];
 }
 
 function resolveSize(aspectRatio: string, resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION) {
   const baseSize = SIZE_BY_RATIO[aspectRatio] || SIZE_BY_RATIO["1:1"];
   return scaleSize(baseSize, safeImageResolution(resolution));
+}
+
+function resolveRequestSize(
+  aspectRatio: string,
+  resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION,
+  protocol: ImageProtocol,
+  model = "",
+) {
+  const baseSize = baseSizeForModel(aspectRatio, protocol, model);
+  if (usesOfficialGptImageSizing(protocol, model)) return baseSize;
+  if (isGptImage2ProModel(model)) {
+    const res = safeImageResolution(resolution);
+    if (res === "4K") return PRO_4K_SIZE_BY_RATIO[aspectRatio] || PRO_4K_SIZE_BY_RATIO["1:1"];
+    if (res === "2K") return PRO_2K_SIZE_BY_RATIO[aspectRatio] || PRO_2K_SIZE_BY_RATIO["1:1"];
+    return baseSize;
+  }
+  return scaleSize(baseSize, safeImageResolution(resolution));
+}
+
+function normalizeResolutionForRequest(
+  resolution: ImageResolution,
+  protocol: ImageProtocol,
+  model = "",
+) {
+  return usesOfficialGptImageSizing(protocol, model) ? DEFAULT_IMAGE_RESOLUTION : safeImageResolution(resolution);
 }
 
 function normalizeImageParams(params: Partial<ImageParams> = {}): ImageParams {
@@ -1789,6 +2129,15 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
 function createReferenceThumbnail(dataUrl: string, maxEdge = 160): Promise<string> {
   return new Promise((resolve, reject) => {
     const image = new Image();
@@ -1815,6 +2164,42 @@ function createReferenceThumbnail(dataUrl: string, maxEdge = 160): Promise<strin
       }
     };
     image.onerror = () => reject(new Error("无法读取参考图缩略图"));
+    image.src = dataUrl;
+  });
+}
+
+function createSquareThumbnail(dataUrl: string, maxEdge = 1024): Promise<{ dataUrl: string; width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      const naturalWidth = image.naturalWidth;
+      const naturalHeight = image.naturalHeight;
+      const longestEdge = Math.max(naturalWidth, naturalHeight);
+      if (longestEdge > 0 && longestEdge <= maxEdge) {
+        resolve({ dataUrl, width: naturalWidth, height: naturalHeight });
+        return;
+      }
+      const scale = longestEdge > 0 ? Math.min(1, maxEdge / longestEdge) : 1;
+      const width = Math.max(1, Math.round(naturalWidth * scale));
+      const height = Math.max(1, Math.round(naturalHeight * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { alpha: true });
+      if (!context) {
+        reject(new Error("无法创建广场压缩图"));
+        return;
+      }
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
+      context.drawImage(image, 0, 0, width, height);
+      try {
+        resolve({ dataUrl: canvas.toDataURL("image/webp", 0.82), width, height });
+      } catch {
+        resolve({ dataUrl: canvas.toDataURL("image/png"), width, height });
+      }
+    };
+    image.onerror = () => reject(new Error("无法读取广场推荐图"));
     image.src = dataUrl;
   });
 }
@@ -2283,15 +2668,16 @@ function loadInitialParams(): ImageParams {
 }
 
 function isAllowedImageModel(model: string) {
-  const normalized = model.toLowerCase();
-  return normalized === "gpt-image-2" || normalized === "gpt-5.4-image-2" || normalized.includes("image-2");
+  return isGptImage2Model(model) || isGemini3ProImageModel(model);
 }
 
 function imageModelPriority(model: string) {
-  const normalized = model.toLowerCase();
-  if (normalized === "gpt-image-2") return 0;
-  if (normalized === "gpt-5.4-image-2") return 1;
-  return 2;
+  const normalized = normalizedImageModelId(model);
+  if (normalized === GPT_IMAGE_2_MODEL) return 0;
+  if (normalized === GPT_IMAGE_2_PRO_MODEL) return 1;
+  if (normalized === GPT_IMAGE_2_FAMILY_MODEL) return 2;
+  if (normalized === GEMINI_3_PRO_IMAGE_MODEL) return 3;
+  return 10;
 }
 
 function filterAllowedImageModels(models: string[]) {
@@ -2307,11 +2693,19 @@ function preferModel(models: string[], current: string) {
   const allowedModels = filterAllowedImageModels(models);
   if (current && allowedModels.includes(current) && isAllowedImageModel(current)) return current;
   return (
-    allowedModels.find((model) => model.toLowerCase() === "gpt-image-2") ||
-    allowedModels.find((model) => model.toLowerCase() === "gpt-5.4-image-2") ||
+    allowedModels.find((model) => normalizedImageModelId(model) === GPT_IMAGE_2_MODEL) ||
+    allowedModels.find((model) => normalizedImageModelId(model) === GPT_IMAGE_2_FAMILY_MODEL) ||
+    allowedModels.find((model) => normalizedImageModelId(model) === GEMINI_3_PRO_IMAGE_MODEL) ||
     allowedModels[0] ||
     ""
   );
+}
+
+function imageModelsForProtocol(protocol: ImageProtocol, upstreamModels: string[] = []) {
+  return filterAllowedImageModels([
+    ...upstreamModels,
+    ...getProtocolDefinition(protocol).defaultModels,
+  ]).filter((model) => protocolMatchesImageModel(protocol, model));
 }
 
 function normalizedModelId(model: string) {
@@ -2487,7 +2881,7 @@ function buildLocalPromptAnalysis({
       fix: "切换到兼容协议或 Gemini Native。",
     });
   }
-  if (!isAspectRatioSupported(protocol, params.aspectRatio)) {
+  if (!isAspectRatioSupported(protocol, params.aspectRatio, selectedModel)) {
     risks.push({
       level: "high",
       title: "宽高比不兼容",
@@ -2505,13 +2899,23 @@ function buildLocalPromptAnalysis({
   }
 
   const suggestedAspectRatio = recommendAspectRatioForPrompt(trimmed, params.aspectRatio);
+  const fallbackAspectRatio = getSupportedAspectRatios(protocol, selectedModel)[0] || "1:1";
+  const nextSuggestedAspectRatio = isAspectRatioSupported(protocol, suggestedAspectRatio, selectedModel)
+    ? suggestedAspectRatio
+    : fallbackAspectRatio;
   const suggestedParams: SuggestedParams = {
-    aspectRatio: isAspectRatioSupported(protocol, suggestedAspectRatio) ? suggestedAspectRatio : getSupportedAspectRatios(protocol)[0] || "1:1",
-    size: resolveSize(
-      isAspectRatioSupported(protocol, suggestedAspectRatio) ? suggestedAspectRatio : getSupportedAspectRatios(protocol)[0] || "1:1",
-      params.resolution,
+    aspectRatio: nextSuggestedAspectRatio,
+    size: resolveRequestSize(
+      nextSuggestedAspectRatio,
+      safeImageResolution(params.resolution),
+      protocol,
+      selectedModel,
     ),
-    resolution: params.resolution,
+    resolution: normalizeResolutionForRequest(
+      safeImageResolution(params.resolution),
+      protocol,
+      selectedModel,
+    ),
     count: /海报|封面|logo|文字|信息图/.test(trimmed) ? 2 : Math.min(Math.max(params.batchCount, 2), 4),
     quality: selectedModel ? params.quality : "auto",
     styleStrength: mode === "style" ? "high" : "medium",
@@ -2611,6 +3015,128 @@ function normalizePromptAnalysisResult(value: unknown, fallback: PromptAnalysisR
   };
 }
 
+function safeAgentModeIntentType(value: unknown): AgentModeIntentType {
+  return value === "single_image"
+    || value === "multi_image_batch"
+    || value === "brochure_project"
+    || value === "page_refine"
+    || value === "unknown"
+    ? value
+    : "unknown";
+}
+
+function safeAgentModeCostLevel(value: unknown): AgentModeCostLevel {
+  return value === "low" || value === "medium" || value === "high" ? value : "low";
+}
+
+function normalizeAgentModeJobSpec(value: unknown, index: number): AgentModeJobSpec | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const title = typeof record.title === "string" && record.title.trim() ? record.title.trim() : `任务 ${index + 1}`;
+  const prompt = typeof record.prompt === "string" ? record.prompt.trim() : "";
+  if (!prompt) return null;
+  return {
+    id: typeof record.id === "string" && record.id.trim() ? record.id : `agent-job-${index + 1}`,
+    title,
+    prompt,
+    objective: typeof record.objective === "string" ? record.objective.trim() : "",
+    negativePrompt: typeof record.negativePrompt === "string" ? record.negativePrompt.trim() : "",
+    aspectRatio: typeof record.aspectRatio === "string" ? record.aspectRatio.trim() : "",
+    size: typeof record.size === "string" ? record.size.trim() : "",
+    resolution: isImageResolution(record.resolution) ? record.resolution : undefined,
+    quality: typeof record.quality === "string" ? record.quality.trim() : "",
+    count: typeof record.count === "number" ? clampNumber(record.count, 1, 8) : 1,
+  };
+}
+
+function normalizeAgentModeBrochurePage(value: unknown, index: number): AgentModeBrochurePage | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const title = typeof record.title === "string" && record.title.trim() ? record.title.trim() : `第 ${index + 1} 页`;
+  return {
+    pageNo: typeof record.pageNo === "number" ? clampNumber(record.pageNo, 1, 64) : index + 1,
+    role: typeof record.role === "string" && record.role.trim() ? record.role.trim() : "content",
+    title,
+    objective: typeof record.objective === "string" && record.objective.trim()
+      ? record.objective.trim()
+      : `${title} 页面主视觉`,
+  };
+}
+
+function normalizeAgentModeBrochureProject(value: unknown, promptText: string): AgentModeBrochureProject | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const title = typeof record.title === "string" && record.title.trim() ? record.title.trim() : "宣传画册项目";
+  const outline = Array.isArray(record.outline)
+    ? record.outline
+      .map(normalizeAgentModeBrochurePage)
+      .filter(Boolean) as AgentModeBrochurePage[]
+    : [];
+  const styleDirections = Array.isArray(record.styleDirections)
+    ? record.styleDirections
+      .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      .slice(0, 6)
+    : [];
+  return {
+    title,
+    companyName: typeof record.companyName === "string" ? record.companyName.trim() : "",
+    industry: typeof record.industry === "string" ? record.industry.trim() : "",
+    purpose: typeof record.purpose === "string" ? record.purpose.trim() : "",
+    pageCount: typeof record.pageCount === "number" ? clampNumber(record.pageCount, 4, 32) : Math.max(outline.length, 4),
+    summary: typeof record.summary === "string" && record.summary.trim()
+      ? record.summary.trim()
+      : "已识别为宣传画册任务，建议先选择整本模板方向，再展开单页生成。",
+    outline,
+    styleDirections,
+    requestPrompt: promptText,
+  };
+}
+
+function normalizeAgentModeAnalysisResult(value: unknown, promptText: string): AgentModeAnalysisResult {
+  const fallback: AgentModeAnalysisResult = {
+    intentType: "single_image",
+    confidence: 0.6,
+    reasoningSummary: "未拿到完整解析结果，已按单图任务处理。",
+    estimatedCostLevel: "low",
+    requiresConfirmation: false,
+    autoExecute: true,
+    jobs: [{
+      id: "agent-job-1",
+      title: "图片生成",
+      prompt: promptText.trim(),
+      count: 1,
+    }],
+    source: "local",
+  };
+  if (!value || typeof value !== "object") return fallback;
+  const record = value as Record<string, unknown>;
+  const jobs = Array.isArray(record.jobs)
+    ? record.jobs
+      .map(normalizeAgentModeJobSpec)
+      .filter(Boolean) as AgentModeJobSpec[]
+    : [];
+  const brochureProject = normalizeAgentModeBrochureProject(record.brochureProject, promptText);
+  const intentType = safeAgentModeIntentType(record.intentType);
+  return {
+    intentType,
+    confidence: typeof record.confidence === "number" ? clampNumber(record.confidence, 0, 1) : fallback.confidence,
+    reasoningSummary: typeof record.reasoningSummary === "string" && record.reasoningSummary.trim()
+      ? record.reasoningSummary.trim()
+      : fallback.reasoningSummary,
+    estimatedCostLevel: safeAgentModeCostLevel(record.estimatedCostLevel),
+    requiresConfirmation: typeof record.requiresConfirmation === "boolean"
+      ? record.requiresConfirmation
+      : intentType !== "single_image",
+    autoExecute: typeof record.autoExecute === "boolean"
+      ? record.autoExecute
+      : intentType === "single_image" && jobs.length > 0,
+    jobs: jobs.length > 0 ? jobs : fallback.jobs,
+    brochureProject,
+    analysisModel: typeof record.analysisModel === "string" ? record.analysisModel : undefined,
+    source: record.source === "ai" || record.source === "local" ? record.source : fallback.source,
+  };
+}
+
 function createJob(
   index: number,
   total: number,
@@ -2670,6 +3196,7 @@ export default function App() {
   const [sidebarRecords, setSidebarRecords] = useState<HistoryRecord[]>([]);
   const [highlightedRecordId, setHighlightedRecordId] = useState<string>("");
   const [previewItem, setPreviewItem] = useState<PreviewItem | null>(null);
+  const [squareRecommendState, setSquareRecommendState] = useState<Record<string, SquareRecommendStatus>>({});
   const [isLoadingMainRecords, setIsLoadingMainRecords] = useState(false);
   const [isLoadingSidebarRecords, setIsLoadingSidebarRecords] = useState(false);
   const [hasMoreMainRecords, setHasMoreMainRecords] = useState(true);
@@ -2706,6 +3233,15 @@ export default function App() {
   const [lastAppliedAgent, setLastAppliedAgent] = useState<AgentContext | null>(null);
   const [localLogs, setLocalLogs] = useState<LocalLogEntry[]>(loadLocalLogs);
   const [isLocalLogOpen, setIsLocalLogOpen] = useState(false);
+  const [isAgentModeEnabled, setIsAgentModeEnabled] = useState(() =>
+    loadBooleanSetting(AGENT_MODE_STORAGE_KEY, false),
+  );
+  const [agentModeState, setAgentModeState] = useState<AgentModeState>({
+    status: "idle",
+    message: "",
+  });
+  const [agentModePendingPlan, setAgentModePendingPlan] = useState<AgentModeAnalysisResult | null>(null);
+  const [agentModeBrochureDraft, setAgentModeBrochureDraft] = useState<AgentModeBrochureProject | null>(null);
   const [analysisCountdown, setAnalysisCountdown] = useState<AnalysisCountdown | null>(null);
   const [isComposerCollapsed, setIsComposerCollapsed] = useState(false);
   const [isBulkDownloading, setIsBulkDownloading] = useState(false);
@@ -2744,21 +3280,39 @@ export default function App() {
   const protocolDefinition = getProtocolDefinition(apiConfig.protocol);
   const currentApiConnectionKey = apiConnectionKey(apiConfig);
   const isModelConnectionVerified = modelState.status === "ready" && verifiedModelKey === currentApiConnectionKey;
+  const isOfficialGptImageSizeMode = usesOfficialGptImageSizing(apiConfig.protocol, selectedModel);
+  const supportedAspectRatios = getSupportedAspectRatios(apiConfig.protocol, selectedModel);
+  const supportedAspectOptions = ASPECT_RATIOS.filter((ratio) => supportedAspectRatios.includes(ratio.value));
   const selectedAspectRatio = getAspectDefinition(params.aspectRatio);
-  const selectedResolution = safeImageResolution(params.resolution);
+  const selectedResolution = normalizeResolutionForRequest(
+    safeImageResolution(params.resolution),
+    apiConfig.protocol,
+    selectedModel,
+  );
   const selectedResolutionDefinition = IMAGE_RESOLUTIONS.find((item) => item.value === selectedResolution) || IMAGE_RESOLUTIONS[0];
-  const resolvedRequestSize = resolveSize(params.aspectRatio, selectedResolution);
-  const aspectRatioSupported = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio);
+  const resolvedRequestSize = resolveRequestSize(
+    params.aspectRatio,
+    selectedResolution,
+    apiConfig.protocol,
+    selectedModel,
+  );
+  const aspectRatioSupported = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel);
+  const selectedAspectHint = isGemini3ProImageModel(selectedModel)
+    ? "Gemini 3 Pro 官方支持比例"
+    : selectedAspectRatio.hint;
   const composerConfigSummary = `${params.batchCount}张 · ${params.aspectRatio} · ${selectedResolution}`;
   const composerConfigDetail = `${resolvedRequestSize} · ${params.quality} · ${params.outputFormat.toUpperCase()} · 并发 ${params.concurrency}`;
 
+  const selectableImageModels = useMemo(
+    () => filterAllowedImageModels([...models, ...PRIMARY_IMAGE_MODELS]),
+    [models],
+  );
   const filteredModels = useMemo(() => {
     const query = modelFilter.trim().toLowerCase();
-    return models
-      .filter(isAllowedImageModel)
+    return selectableImageModels
       .filter((model) => model.toLowerCase().includes(query))
       .slice(0, 80);
-  }, [modelFilter, models]);
+  }, [modelFilter, selectableImageModels]);
   const preferredAnalysisModel = useMemo(
     () => preferAnalysisModel(analysisModels, selectedAnalysisModel),
     [analysisModels, selectedAnalysisModel],
@@ -2803,8 +3357,12 @@ export default function App() {
   );
   const isAgentEnabled = Boolean(selectedAgent);
   const latestLocalLogLevel = localLogs[0]?.level;
+  const isAgentModeBusy = isAgentModeEnabled && (
+    agentModeState.status === "analyzing"
+    || agentModeState.status === "receiving"
+  );
   const modelStatusMessage = isAutoLoadingModels
-    ? "正在自动验证 API Key 并读取 image-2 模型..."
+    ? "正在自动验证 API Key 并读取图片模型..."
     : isModelConnectionVerified && verifiedModelAt
       ? `${modelState.message} · ${formatDate(verifiedModelAt)}`
       : modelState.message;
@@ -2814,9 +3372,11 @@ export default function App() {
     selectedModel.length > 0 &&
     isAllowedImageModel(selectedModel) &&
     models.includes(selectedModel) &&
+    protocolMatchesImageModel(apiConfig.protocol, selectedModel) &&
     isModelConnectionVerified &&
     aspectRatioSupported;
-  const canRequestGenerate = canGenerate && !isPromptAnalyzing && !analysisCountdown;
+  const canRequestGenerate = canGenerate && !isPromptAnalyzing && !analysisCountdown && !isAgentModeBusy;
+  const canUseSquareIdentity = apiConfig.apiKey.trim().length >= API_KEY_MIN_LENGTH;
 
   useEffect(() => {
     void loadMainRecordsPage();
@@ -2927,10 +3487,45 @@ export default function App() {
   }, [isAutoPromptAnalysisEnabled, analysisState.mode]);
 
   useEffect(() => {
-    if (isAspectRatioSupported(apiConfig.protocol, params.aspectRatio)) return;
-    const fallbackRatio = getSupportedAspectRatios(apiConfig.protocol)[0] || "1:1";
-    updateParams({ aspectRatio: fallbackRatio, size: resolveSize(fallbackRatio, params.resolution) });
-  }, [apiConfig.protocol, params.aspectRatio, params.resolution]);
+    localStorage.setItem(AGENT_MODE_STORAGE_KEY, String(isAgentModeEnabled));
+  }, [isAgentModeEnabled]);
+
+  useEffect(() => {
+    if (!isAgentModeEnabled) {
+      setAgentModeState({ status: "idle", message: "" });
+      setAgentModePendingPlan(null);
+      setAgentModeBrochureDraft(null);
+      return;
+    }
+    cancelAnalysisCountdown();
+    setAnalysisState({ status: "idle", mode: "send", message: "" });
+    setShowPromptPresets(false);
+    setIsAgentPanelOpen(false);
+    setAgentModeState({
+      status: "idle",
+      message: "告诉我你想做一张图、一组不同图片，或者一本宣传画册。",
+    });
+    setAgentModePendingPlan(null);
+    setAgentModeBrochureDraft(null);
+  }, [isAgentModeEnabled]);
+
+  useEffect(() => {
+    const normalizedResolution = normalizeResolutionForRequest(
+      safeImageResolution(params.resolution),
+      apiConfig.protocol,
+      selectedModel,
+    );
+    const fallbackRatio = getSupportedAspectRatios(apiConfig.protocol, selectedModel)[0] || "1:1";
+    const nextAspectRatio = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel)
+      ? params.aspectRatio
+      : fallbackRatio;
+    if (nextAspectRatio === params.aspectRatio && normalizedResolution === params.resolution) return;
+    updateParams({
+      aspectRatio: nextAspectRatio,
+      resolution: normalizedResolution,
+      size: resolveRequestSize(nextAspectRatio, normalizedResolution, apiConfig.protocol, selectedModel),
+    });
+  }, [apiConfig.protocol, selectedModel, params.aspectRatio, params.resolution]);
 
   useEffect(() => {
     if (!isPromptAnalyzing) {
@@ -2971,7 +3566,7 @@ export default function App() {
       setVerifiedModelKey("");
       setVerifiedModelAt(0);
       setModels([]);
-      setSelectedModel("");
+      setSelectedModel((current) => protocolMatchesImageModel(apiConfig.protocol, current) ? current : "");
       setAnalysisModels([]);
       setSelectedAnalysisModel("");
       setModelState({ status: "idle", message: "填写 API Key 后自动验证" });
@@ -2983,7 +3578,7 @@ export default function App() {
       setVerifiedModelKey("");
       setVerifiedModelAt(0);
       setModels([]);
-      setSelectedModel("");
+      setSelectedModel((current) => protocolMatchesImageModel(apiConfig.protocol, current) ? current : "");
       setAnalysisModels([]);
       setSelectedAnalysisModel("");
       setModelState({ status: "idle", message: "API Key 已变化，等待自动验证" });
@@ -3312,6 +3907,7 @@ export default function App() {
     const incomingFiles = Array.from(files);
     if (incomingFiles.length === 0) return;
     cancelAnalysisCountdown();
+    clearAgentModeDrafts();
     setIsComposerCollapsed(false);
     const nextImages = await Promise.all(incomingFiles.slice(0, REFERENCE_LIMIT).map(fileToReference));
     setReferenceImages((current) => [...current, ...nextImages].slice(0, REFERENCE_LIMIT));
@@ -3442,7 +4038,7 @@ export default function App() {
         model: job.model,
         prompt: truncateForLog(job.prompt),
         aspectRatio: job.params.aspectRatio,
-        size: job.params.size || resolveSize(job.params.aspectRatio, job.params.resolution),
+        size: job.params.size || resolveRequestSize(job.params.aspectRatio, job.params.resolution, job.protocol, job.model),
         resolution: job.params.resolution,
         quality: job.params.quality,
         outputFormat: job.params.outputFormat,
@@ -3526,10 +4122,10 @@ export default function App() {
       if (upstreamModels.length === 0) {
         throw new Error("接口返回了空模型列表");
       }
-      const nextModels = filterAllowedImageModels(upstreamModels);
+      const nextModels = imageModelsForProtocol(config.protocol, upstreamModels);
       const nextAnalysisModels = filterAnalysisModels(upstreamModels);
       if (nextModels.length === 0) {
-        throw new Error("未找到可用的 image-2 模型");
+        throw new Error("未找到可用的图片模型");
       }
       const nextSelectedModel = preferModel(nextModels, selectedModel);
       const nextSelectedAnalysisModel = preferAnalysisModel(nextAnalysisModels, selectedAnalysisModel);
@@ -3541,12 +4137,12 @@ export default function App() {
       setAnalysisModels(nextAnalysisModels);
       setSelectedAnalysisModel(nextSelectedAnalysisModel);
       setModelFilter("");
-      setModelState({ status: "ready", message: `API Key 有效 · ${nextModels.length} 个 image-2 模型` });
+      setModelState({ status: "ready", message: `API Key 有效 · ${nextModels.length} 个图片模型` });
       pushLocalLog({
         type: "model_load",
         level: "success",
         title: silent ? "自动读取模型成功" : "读取模型成功",
-        message: `已读取 ${nextModels.length} 个 image-2 模型，选中 ${nextSelectedModel}。`,
+        message: `已读取 ${nextModels.length} 个图片模型，选中 ${nextSelectedModel}。`,
         endpoint: "/api/models",
         durationMs: Date.now() - startedAt,
         params: apiLogSnapshot(config),
@@ -3635,10 +4231,10 @@ export default function App() {
       if (!response.ok || !payload.ok) {
         throw payload.detail || payload;
       }
-      const nextModels = filterAllowedImageModels(Array.isArray(payload.models) ? payload.models : []);
+      const nextModels = imageModelsForProtocol(apiConfig.protocol, Array.isArray(payload.models) ? payload.models : []);
       const nextAnalysisModels = filterAnalysisModels(Array.isArray(payload.models) ? payload.models : []);
       if (nextModels.length === 0) {
-        throw new Error("未找到可用的 image-2 模型");
+        throw new Error("未找到可用的图片模型");
       }
       setVerifiedModelKey(modelLoadKey);
       setVerifiedModelAt(Date.now());
@@ -3651,7 +4247,7 @@ export default function App() {
           type: "api_health",
           level: "warning",
           title: "提交前验证通过但模型已刷新",
-          message: "当前选中模型不在最新 image-2 模型列表中，已自动改选，需要用户再次确认生成。",
+          message: "当前选中模型不在最新图片模型列表中，已自动改选，需要用户再次确认生成。",
           endpoint: "/api/models",
           durationMs: Date.now() - startedAt,
           params: apiLogSnapshot(),
@@ -3663,12 +4259,12 @@ export default function App() {
         });
         return false;
       }
-      setModelState({ status: "ready", message: `API Key 有效 · ${nextModels.length} 个 image-2 模型` });
+      setModelState({ status: "ready", message: `API Key 有效 · ${nextModels.length} 个图片模型` });
       pushLocalLog({
         type: "api_health",
         level: "success",
         title: "提交前验证通过",
-        message: `API Key 可用，已确认 ${nextModels.length} 个 image-2 模型。`,
+        message: `API Key 可用，已确认 ${nextModels.length} 个图片模型。`,
         endpoint: "/api/models",
         durationMs: Date.now() - startedAt,
         params: apiLogSnapshot(),
@@ -3796,7 +4392,7 @@ export default function App() {
             model: job.model,
             prompt: job.prompt,
             aspectRatio: job.params.aspectRatio,
-            size: job.params.size || resolveSize(job.params.aspectRatio, job.params.resolution),
+            size: job.params.size || resolveRequestSize(job.params.aspectRatio, job.params.resolution, job.protocol, job.model),
             resolution: job.params.resolution,
             quality: job.params.quality,
             outputFormat: job.params.outputFormat,
@@ -4052,7 +4648,7 @@ export default function App() {
       prompt: truncateForLog(promptText),
       negativePrompt: truncateForLog(analysisParams.negativePrompt || "", 400),
       aspectRatio: analysisParams.aspectRatio,
-      size: analysisParams.size || resolveSize(analysisParams.aspectRatio, analysisParams.resolution),
+      size: analysisParams.size || resolveRequestSize(analysisParams.aspectRatio, analysisParams.resolution, apiConfig.protocol, selectedModel),
       resolution: analysisParams.resolution,
       quality: analysisParams.quality,
       outputFormat: analysisParams.outputFormat,
@@ -4090,7 +4686,7 @@ export default function App() {
         prompt: promptText,
         negativePrompt: analysisParams.negativePrompt,
         aspectRatio: analysisParams.aspectRatio,
-        size: analysisParams.size || resolveSize(analysisParams.aspectRatio, analysisParams.resolution),
+        size: analysisParams.size || resolveRequestSize(analysisParams.aspectRatio, analysisParams.resolution, apiConfig.protocol, selectedModel),
         resolution: analysisParams.resolution,
         quality: analysisParams.quality,
         outputFormat: analysisParams.outputFormat,
@@ -4158,6 +4754,7 @@ export default function App() {
       let receivingAt: number | undefined;
       let lastError: unknown = null;
       let totalLength = 0;
+      let streamPreview = "";
 
       const flushFrame = (event: string, data: unknown) => {
         switch (event) {
@@ -4171,13 +4768,26 @@ export default function App() {
             break;
           case "receiving":
             receivingAt = Date.now();
-            setAnalysisState((current) => ({ ...current, status: "receiving", message: "正在接收结果..." }));
+            setAnalysisState((current) => ({
+              ...current,
+              status: "receiving",
+              message: "正在接收结果...",
+            }));
             break;
           case "chunk":
             chunkCount += 1;
             totalLength = (data as { totalLength?: number })?.totalLength ?? totalLength;
+            streamPreview = typeof (data as { preview?: unknown })?.preview === "string"
+              ? ((data as { preview?: string }).preview || "")
+              : streamPreview;
             setAnalysisState((current) => current.status === "receiving"
-              ? { ...current, message: `接收中... 已 ${totalLength} 字符` }
+              ? {
+                ...current,
+                message: `接收中... 已 ${totalLength} 字符`,
+                streamPreview,
+                streamCharacters: totalLength,
+                streamChunks: chunkCount,
+              }
               : current);
             break;
           case "done":
@@ -4289,17 +4899,21 @@ export default function App() {
     baseParams = params,
   ) {
     const suggestedRatio = result.suggestedParams.aspectRatio || baseParams.aspectRatio;
-    const nextRatio = applyRecommendedParams && isAspectRatioSupported(apiConfig.protocol, suggestedRatio)
+    const nextRatio = applyRecommendedParams && isAspectRatioSupported(apiConfig.protocol, suggestedRatio, selectedModel)
       ? suggestedRatio
       : baseParams.aspectRatio;
-    const nextResolution = applyRecommendedParams && result.suggestedParams.resolution
-      ? safeImageResolution(result.suggestedParams.resolution)
-      : safeImageResolution(baseParams.resolution);
+    const nextResolution = normalizeResolutionForRequest(
+      applyRecommendedParams && result.suggestedParams.resolution
+        ? safeImageResolution(result.suggestedParams.resolution)
+        : safeImageResolution(baseParams.resolution),
+      apiConfig.protocol,
+      selectedModel,
+    );
     return {
       ...baseParams,
       aspectRatio: nextRatio,
       resolution: nextResolution,
-      size: resolveSize(nextRatio, nextResolution),
+      size: resolveRequestSize(nextRatio, nextResolution, apiConfig.protocol, selectedModel),
       quality: applyRecommendedParams && protocolDefinition.supportsQuality && result.suggestedParams.quality
         ? result.suggestedParams.quality
         : baseParams.quality,
@@ -4335,6 +4949,9 @@ export default function App() {
       status: "analyzing",
       mode,
       message: analysisModeLabel(mode),
+      streamPreview: "",
+      streamCharacters: 0,
+      streamChunks: 0,
     });
     try {
       const result = await runPromptAnalysis(mode, submittedPrompt);
@@ -4442,6 +5059,9 @@ export default function App() {
       status: "analyzing",
       mode: "send",
       message: options.agentContext ? "Agent 行业预检" : "发送前智能检查",
+      streamPreview: "",
+      streamCharacters: 0,
+      streamChunks: 0,
     });
     try {
       const result = await runPromptAnalysis("send", submittedPrompt, analysisParams, options.agentContext, analysisReferences);
@@ -4530,8 +5150,9 @@ export default function App() {
       !selectedModel ||
       !isAllowedImageModel(selectedModel) ||
       !models.includes(selectedModel) ||
+      !protocolMatchesImageModel(apiConfig.protocol, selectedModel) ||
       modelState.status !== "ready" ||
-      !isAspectRatioSupported(apiConfig.protocol, batchParams.aspectRatio)
+      !isAspectRatioSupported(apiConfig.protocol, batchParams.aspectRatio, selectedModel)
     ) {
       return;
     }
@@ -4544,8 +5165,17 @@ export default function App() {
       ...batchParams,
       batchCount: total,
       concurrency,
-      resolution: safeImageResolution(batchParams.resolution),
-      size: resolveSize(batchParams.aspectRatio, safeImageResolution(batchParams.resolution)),
+      resolution: normalizeResolutionForRequest(
+        safeImageResolution(batchParams.resolution),
+        apiConfig.protocol,
+        selectedModel,
+      ),
+      size: resolveRequestSize(
+        batchParams.aspectRatio,
+        normalizeResolutionForRequest(safeImageResolution(batchParams.resolution), apiConfig.protocol, selectedModel),
+        apiConfig.protocol,
+        selectedModel,
+      ),
     };
     const candidateReferenceImages = options.referenceImagesOverride ?? usableReferenceImages;
     const snapshotReferenceImages = getProtocolDefinition(apiConfig.protocol).supportsReferenceImages
@@ -4573,6 +5203,414 @@ export default function App() {
     }
   }
 
+  function buildAgentModeJobParams(spec: AgentModeJobSpec, baseParams = params): ImageParams {
+    const recommendedRatio = spec.aspectRatio || recommendAspectRatioForPrompt(spec.prompt, baseParams.aspectRatio);
+    const aspectRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio, selectedModel)
+      ? recommendedRatio
+      : getSupportedAspectRatios(apiConfig.protocol, selectedModel)[0] || baseParams.aspectRatio;
+    const resolution = normalizeResolutionForRequest(
+      spec.resolution ? safeImageResolution(spec.resolution) : safeImageResolution(baseParams.resolution),
+      apiConfig.protocol,
+      selectedModel,
+    );
+    return {
+      ...baseParams,
+      aspectRatio,
+      resolution,
+      size: spec.size || resolveRequestSize(aspectRatio, resolution, apiConfig.protocol, selectedModel),
+      quality: spec.quality || baseParams.quality,
+      batchCount: 1,
+      negativePrompt: spec.negativePrompt || baseParams.negativePrompt,
+    };
+  }
+
+  function enqueueAgentModeJobs(
+    specs: AgentModeJobSpec[],
+    options: {
+      analysisResult: AgentModeAnalysisResult;
+      clearComposer?: boolean;
+      scenarioLabel?: string;
+    },
+  ) {
+    const expandedSpecs = specs.flatMap((spec) =>
+      Array.from({ length: clampNumber(Number(spec.count) || 1, 1, 8) }, () => spec),
+    );
+    if (expandedSpecs.length === 0) return;
+    const snapshotConfig = { ...apiConfig };
+    const snapshotReferenceImages = getProtocolDefinition(apiConfig.protocol).supportsReferenceImages
+      ? usableReferenceImages
+      : [];
+    const batchId = uid();
+    const batchCreatedAt = Date.now();
+    const nextJobs = expandedSpecs.map((spec, index) => {
+      const baseJob = createJob(
+        index + 1,
+        expandedSpecs.length,
+        batchId,
+        apiConfig.protocol,
+        spec.prompt,
+        selectedModel,
+        buildAgentModeJobParams(spec),
+        snapshotReferenceImages,
+        batchCreatedAt - index / 1000,
+      );
+      return {
+        ...baseJob,
+        agentId: "agent-mode-a",
+        agentName: AGENT_MODE_NAME,
+        agentScenario: spec.title || options.scenarioLabel || options.analysisResult.intentType,
+      };
+    });
+    setHighlightedRecordId("");
+    setVisibleRecords((current) => sortGenerationRecords([...nextJobs, ...current]));
+    enqueueJobs(nextJobs, snapshotConfig);
+    setAgentModePendingPlan(null);
+    setAgentModeBrochureDraft(null);
+    setAgentModeState({ status: "idle", message: "" });
+    if (options.clearComposer !== false) {
+      setPrompt("");
+      setReferenceImages([]);
+      setLastAppliedAgent(null);
+    }
+  }
+
+  function buildBrochureStyleBoardPrompt(project: AgentModeBrochureProject, direction: string, boardIndex: number) {
+    const outlineText = project.outline
+      .slice(0, 12)
+      .map((page) => `${page.pageNo}. ${page.title}：${page.objective}`)
+      .join("；");
+    const company = project.companyName || project.title;
+    const industry = project.industry || "企业品牌";
+    const purpose = project.purpose || "公司宣传";
+    return [
+      `为「${company}」设计一张公司宣传画册模板板。`,
+      `项目类型：${industry} 行业的 ${purpose} 画册，共 ${project.pageCount} 页。`,
+      "请输出一张整本方案图，在同一张图中展示封面和全部内页的缩略版式，不需要真实小字，但必须让页面层级、主视觉和版式节奏清晰可见。",
+      `风格方向：${direction}。`,
+      `页面结构：${outlineText}。`,
+      "要求整本风格统一、封面辨识度高、内页节奏分明、适合商务宣传画册模板探索，像设计提案板而不是最终可印刷文件。",
+      `这是第 ${boardIndex + 1} 套候选方向，请拉开与其他方案的视觉差异。`,
+    ].join(" ");
+  }
+
+  function submitBrochureStyleBoards(project: AgentModeBrochureProject) {
+    const styleDirections = project.styleDirections.length > 0
+      ? project.styleDirections.slice(0, 4)
+      : ["科技蓝信息栅格", "高端杂志感", "制造业目录感", "招商海报感"];
+    const specs = styleDirections.map((direction, index) => ({
+      id: `brochure-style-${index + 1}`,
+      title: `模板板 ${index + 1} · ${direction}`,
+      prompt: buildBrochureStyleBoardPrompt(project, direction, index),
+      aspectRatio: "4:3",
+      resolution: "2K" as ImageResolution,
+      quality: "high",
+      count: 1,
+    }));
+    enqueueAgentModeJobs(specs, {
+      analysisResult: {
+        intentType: "brochure_project",
+        confidence: 1,
+        reasoningSummary: project.summary,
+        estimatedCostLevel: "medium",
+        requiresConfirmation: true,
+        autoExecute: false,
+        jobs: specs,
+        brochureProject: project,
+        source: "local",
+      },
+      clearComposer: false,
+      scenarioLabel: "宣传画册模板板",
+    });
+  }
+
+  function applyAgentModeAnalysisResult(
+    result: AgentModeAnalysisResult,
+    requestId: string | undefined,
+    submittedPrompt: string,
+  ) {
+    if (result.intentType === "brochure_project" && result.brochureProject) {
+      setAgentModePendingPlan(null);
+      setAgentModeBrochureDraft(result.brochureProject);
+      setAgentModeState({
+        status: "planned",
+        message: "已识别为宣传画册任务，请先确认页结构和模板方向。",
+        requestId,
+        result,
+        requestPrompt: submittedPrompt,
+      });
+      return;
+    }
+    if (result.requiresConfirmation || result.intentType === "multi_image_batch") {
+      setAgentModeBrochureDraft(null);
+      setAgentModePendingPlan(result);
+      setAgentModeState({
+        status: "needs_confirmation",
+        message: `已拆解出 ${result.jobs.length} 个独立任务，确认后进入队列。`,
+        requestId,
+        result,
+        requestPrompt: submittedPrompt,
+      });
+      return;
+    }
+    enqueueAgentModeJobs(result.jobs, {
+      analysisResult: result,
+      clearComposer: true,
+      scenarioLabel: "自动拆解任务",
+    });
+  }
+
+  async function requestAgentModeExecution(submittedPrompt: string) {
+    const analysisModel = preferredAnalysisModel;
+    const requestStartedAt = Date.now();
+    const payload = {
+      baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
+      apiKey: apiConfig.apiKey,
+      clientId: getClientId(),
+      analysisModel,
+      prompt: submittedPrompt,
+      protocol: apiConfig.protocol,
+      imageModel: selectedModel,
+      aspectRatio: params.aspectRatio,
+      size: params.size || resolveRequestSize(params.aspectRatio, selectedResolution, apiConfig.protocol, selectedModel),
+      resolution: selectedResolution,
+      quality: params.quality,
+      outputFormat: params.outputFormat,
+      count: params.batchCount,
+      referenceCount: usableReferenceImages.length,
+    };
+    setAgentModePendingPlan(null);
+    setAgentModeBrochureDraft(null);
+    setAgentModeState({
+      status: "analyzing",
+      message: `${AGENT_MODE_NAME} 正在理解你的任务并自动编排。`,
+      requestPrompt: submittedPrompt,
+      streamPreview: "",
+      streamCharacters: 0,
+      streamChunks: 0,
+    });
+    pushLocalLog({
+      type: "agent_analysis",
+      level: "info",
+      title: `${AGENT_MODE_NAME} 开始解析`,
+      message: "正在识别单图、多图还是宣传画册任务。",
+      endpoint: "/api/agent/analyze",
+      params: {
+        ...apiLogSnapshot(),
+        prompt: truncateForLog(submittedPrompt),
+        analysisModel,
+        referenceCount: usableReferenceImages.length,
+      },
+    });
+    try {
+      const response = await fetch("/api/agent/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok && response.headers.get("content-type")?.includes("text/event-stream") !== true) {
+        const payloadJson = await readApiJson<{ ok?: boolean; requestId?: string; analysis?: unknown; detail?: unknown }>(response, "/api/agent/analyze");
+        if (!response.ok || !payloadJson.ok) {
+          throw payloadJson.detail || payloadJson;
+        }
+        const result = normalizeAgentModeAnalysisResult(payloadJson.analysis, submittedPrompt);
+        pushLocalLog({
+          type: "agent_analysis",
+          level: "success",
+          title: `${AGENT_MODE_NAME} 解析完成`,
+          message: result.reasoningSummary,
+          endpoint: "/api/agent/analyze",
+          requestId: payloadJson.requestId,
+          durationMs: Date.now() - requestStartedAt,
+          params: {
+            ...apiLogSnapshot(),
+            prompt: truncateForLog(submittedPrompt),
+          },
+          response: sanitizeClientLogValue(result) as Record<string, unknown>,
+        });
+        applyAgentModeAnalysisResult(result, payloadJson.requestId, submittedPrompt);
+        return;
+      }
+
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("text/event-stream")) {
+        const payloadJson = await readApiJson<{ ok?: boolean; requestId?: string; analysis?: unknown; detail?: unknown }>(response, "/api/agent/analyze");
+        if (!response.ok || !payloadJson.ok) {
+          throw payloadJson.detail || payloadJson;
+        }
+        const result = normalizeAgentModeAnalysisResult(payloadJson.analysis, submittedPrompt);
+        pushLocalLog({
+          type: "agent_analysis",
+          level: "success",
+          title: `${AGENT_MODE_NAME} 解析完成`,
+          message: result.reasoningSummary,
+          endpoint: "/api/agent/analyze",
+          requestId: payloadJson.requestId,
+          durationMs: Date.now() - requestStartedAt,
+          params: {
+            ...apiLogSnapshot(),
+            prompt: truncateForLog(submittedPrompt),
+          },
+          response: sanitizeClientLogValue(result) as Record<string, unknown>,
+        });
+        applyAgentModeAnalysisResult(result, payloadJson.requestId, submittedPrompt);
+        return;
+      }
+
+      if (!response.body) throw new Error("分析响应体为空");
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw { error: `HTTP ${response.status}`, raw: truncateForLog(errorText, 1600) };
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let analysis: unknown = null;
+      let upstreamRequestId: string | undefined;
+      let chunkCount = 0;
+      let firstByteAt: number | undefined;
+      let receivingAt: number | undefined;
+      let lastError: unknown = null;
+      let totalLength = 0;
+      let streamPreview = "";
+
+      const flushFrame = (event: string, data: unknown) => {
+        switch (event) {
+          case "started":
+            upstreamRequestId = (data as { requestId?: string })?.requestId;
+            setAgentModeState((current) => ({
+              ...current,
+              status: "analyzing",
+              message: "已发送，等待模型响应...",
+            }));
+            break;
+          case "upstream_connected":
+            firstByteAt = Date.now();
+            setAgentModeState((current) => ({
+              ...current,
+              status: "analyzing",
+              message: "上游已连接，等待模型生成...",
+            }));
+            break;
+          case "receiving":
+            receivingAt = Date.now();
+            setAgentModeState((current) => ({
+              ...current,
+              status: "receiving",
+              message: "正在接收 AI 输出...",
+            }));
+            break;
+          case "chunk":
+            chunkCount += 1;
+            totalLength = (data as { totalLength?: number })?.totalLength ?? totalLength;
+            streamPreview = typeof (data as { preview?: unknown })?.preview === "string"
+              ? ((data as { preview?: string }).preview || "")
+              : streamPreview;
+            setAgentModeState((current) => ({
+              ...current,
+              status: "receiving",
+              message: `AI 输出中... 已接收 ${totalLength} 字符`,
+              streamPreview,
+              streamCharacters: totalLength,
+              streamChunks: chunkCount,
+            }));
+            break;
+          case "done":
+            analysis = (data as { analysis?: unknown })?.analysis ?? null;
+            break;
+          case "error":
+            lastError = (data as { detail?: unknown })?.detail ?? data;
+            break;
+        }
+      };
+
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let frame = "";
+          while ((frame = buffer.split("\n\n")[0] || "") && buffer.includes("\n\n")) {
+            const nextIndex = buffer.indexOf("\n\n");
+            const rawFrame = buffer.slice(0, nextIndex);
+            buffer = buffer.slice(nextIndex + 2);
+            let eventName = "message";
+            let dataText = "";
+            for (const line of rawFrame.split("\n")) {
+              if (line.startsWith("event:")) eventName = line.slice(6).trim();
+              if (line.startsWith("data:")) dataText += `${line.slice(5).trim()}\n`;
+            }
+            if (!dataText.trim()) continue;
+            try {
+              flushFrame(eventName, JSON.parse(dataText.trim()));
+            } catch {
+              flushFrame(eventName, { raw: dataText.trim() });
+            }
+          }
+        }
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+
+      if (!analysis && lastError) throw lastError;
+      if (!analysis) throw new Error("分析流结束但未收到 done 事件");
+
+      const result = normalizeAgentModeAnalysisResult(analysis, submittedPrompt);
+      pushLocalLog({
+        type: "agent_analysis",
+        level: "success",
+        title: `${AGENT_MODE_NAME} 解析完成`,
+        message: result.reasoningSummary,
+        endpoint: "/api/agent/analyze",
+        requestId: upstreamRequestId,
+        durationMs: Date.now() - requestStartedAt,
+        params: {
+          ...apiLogSnapshot(),
+          prompt: truncateForLog(submittedPrompt),
+        },
+        response: {
+          requestId: upstreamRequestId,
+          chunkCount,
+          totalLength,
+          firstByteMs: firstByteAt ? firstByteAt - requestStartedAt : null,
+          receivingMs: receivingAt ? receivingAt - requestStartedAt : null,
+          analysis: sanitizeClientLogValue(result),
+        },
+      });
+      applyAgentModeAnalysisResult(result, upstreamRequestId, submittedPrompt);
+    } catch (error) {
+      setAgentModeState({
+        status: "error",
+        message: "Agent 解析失败，请调整描述后重试。",
+        error: formatError(error),
+        requestPrompt: submittedPrompt,
+      });
+      pushLocalLog({
+        type: "agent_analysis",
+        level: "error",
+        title: `${AGENT_MODE_NAME} 解析失败`,
+        message: formatError(error),
+        endpoint: "/api/agent/analyze",
+        durationMs: Date.now() - requestStartedAt,
+        params: {
+          ...apiLogSnapshot(),
+          prompt: truncateForLog(submittedPrompt),
+        },
+        error: safeLogError(error),
+      });
+    }
+  }
+
+  async function requestAgentModeReanalysis() {
+    const submittedPrompt = prompt.trim() || agentModeState.requestPrompt || "";
+    if (!submittedPrompt) return;
+    const apiKeyReady = await verifyApiKeyBeforeGeneration();
+    if (!apiKeyReady) return;
+    triggerSendLaunchAnimation();
+    void requestAgentModeExecution(submittedPrompt);
+  }
+
   async function requestStartBatch() {
     if (!canRequestGenerate) return;
     const nextStart = performance.now();
@@ -4581,6 +5619,11 @@ export default function App() {
     const apiKeyReady = await verifyApiKeyBeforeGeneration();
     if (!apiKeyReady) return;
     const submittedPrompt = prompt.trim();
+    if (isAgentModeEnabled) {
+      triggerSendLaunchAnimation();
+      void requestAgentModeExecution(submittedPrompt);
+      return;
+    }
     const snapshotReferenceImages = getProtocolDefinition(apiConfig.protocol).supportsReferenceImages
       ? usableReferenceImages
       : [];
@@ -4680,13 +5723,17 @@ export default function App() {
     cancelAnalysisCountdown();
     setParams((current) => {
       const nextAspectRatio = patch.aspectRatio || current.aspectRatio;
-      const nextResolution = patch.resolution ? safeImageResolution(patch.resolution) : safeImageResolution(current.resolution);
+      const nextResolution = normalizeResolutionForRequest(
+        patch.resolution ? safeImageResolution(patch.resolution) : safeImageResolution(current.resolution),
+        apiConfig.protocol,
+        selectedModel,
+      );
       return {
         ...current,
         ...patch,
         aspectRatio: nextAspectRatio,
         resolution: nextResolution,
-        size: resolveSize(nextAspectRatio, nextResolution),
+        size: resolveRequestSize(nextAspectRatio, nextResolution, apiConfig.protocol, selectedModel),
         batchCount: patch.batchCount !== undefined
           ? clampNumber(Number(patch.batchCount), 1, 20)
           : current.batchCount,
@@ -4702,7 +5749,7 @@ export default function App() {
 
   function changeProtocol(protocol: ImageProtocol) {
     const nextDefinition = getProtocolDefinition(protocol);
-    const nextModels = filterAllowedImageModels(nextDefinition.defaultModels);
+    const nextModels = imageModelsForProtocol(protocol, nextDefinition.defaultModels);
     const nextAnalysisModels = filterAnalysisModels(nextDefinition.defaultModels);
     setApiConfig((current) => {
       return {
@@ -4718,9 +5765,54 @@ export default function App() {
     setModelFilter("");
     setModelState(
       nextModels.length > 0
-        ? { status: "ready", message: `${nextModels.length} 个预设 image-2 模型` }
-        : { status: "idle", message: "等待读取 image-2 模型" },
+        ? { status: "idle", message: `${nextModels.length} 个预设图片模型，等待验证` }
+        : { status: "idle", message: "等待读取图片模型" },
     );
+  }
+
+  function selectImageModel(model: string) {
+    const nextModel = model.trim();
+    if (!isAllowedImageModel(nextModel)) return;
+    const nextProtocol = protocolForImageModel(nextModel, apiConfig.protocol);
+    const protocolChanged = nextProtocol !== apiConfig.protocol;
+    const nextDefinition = getProtocolDefinition(nextProtocol);
+    const nextModels = imageModelsForProtocol(nextProtocol, [...models, nextModel]);
+    const nextAnalysisModels = filterAnalysisModels(nextDefinition.defaultModels);
+    if (protocolChanged) {
+      setVerifiedModelKey("");
+      setVerifiedModelAt(0);
+      setAnalysisModels(nextAnalysisModels);
+      setSelectedAnalysisModel((current) => preferAnalysisModel(nextAnalysisModels, current));
+      setModelState({
+        status: "idle",
+        message: `已切换到 ${nextDefinition.shortLabel} 通道，等待自动验证`,
+      });
+    }
+    setApiConfig((current) => {
+      if (current.protocol === nextProtocol) return current;
+      return {
+        ...current,
+        protocol: nextProtocol,
+        baseUrl: normalizeApiBaseUrl(current.baseUrl),
+      };
+    });
+    setModels(nextModels);
+    setSelectedModel(nextModel);
+    setModelFilter("");
+    setParams((current) => {
+      const nextSupportedRatios = getSupportedAspectRatios(nextProtocol, nextModel);
+      const nextAspectRatio = nextSupportedRatios.includes(current.aspectRatio)
+        ? current.aspectRatio
+        : nextSupportedRatios[0] || "1:1";
+      const canScale = isGptImage2ProModel(nextModel) || !usesOfficialGptImageSizing(nextProtocol, nextModel);
+      const nextResolution = canScale ? current.resolution : "1K" as ImageResolution;
+      return {
+        ...current,
+        aspectRatio: nextAspectRatio,
+        resolution: nextResolution,
+        size: resolveRequestSize(nextAspectRatio, nextResolution, nextProtocol, nextModel),
+      };
+    });
   }
 
   function downloadCurrent(job: Job | HistoryRecord) {
@@ -4735,17 +5827,112 @@ export default function App() {
     successfulVisibleRecords.forEach((job) => downloadCurrent(job));
   }
 
+  function clearAgentModeDrafts() {
+    setAgentModePendingPlan(null);
+    setAgentModeBrochureDraft(null);
+    setAgentModeState((current) =>
+      current.status === "idle"
+        ? current
+        : { status: "idle", message: isAgentModeEnabled ? "输入已更新，等待重新理解需求。" : "" },
+    );
+  }
+
   function copyPrompt(text: string) {
     void navigator.clipboard.writeText(text);
   }
 
+  async function imageSourceToDataUrl(item: Job | PreviewItem) {
+    const blob = "imageBlob" in item ? item.imageBlob : undefined;
+    if (blob) return blobToDataUrl(blob);
+    const url = (item as Job).imageUrl || (item as PreviewItem).url;
+    if (!url) throw new Error("没有可推荐的图片");
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("无法读取图片用于推荐");
+    return blobToDataUrl(await response.blob());
+  }
+
+  async function recommendToSquare(item: Job | PreviewItem) {
+    if (!canUseSquareIdentity) {
+      setSquareRecommendState((current) => ({
+        ...current,
+        [item.id]: { status: "error", message: "配置 API Key 后可推荐到广场" },
+      }));
+      return;
+    }
+    if (item.status !== "success") return;
+    setSquareRecommendState((current) => ({
+      ...current,
+      [item.id]: { status: "submitting", message: "正在压缩并推荐到广场..." },
+    }));
+    try {
+      const imageDataUrl = await imageSourceToDataUrl(item);
+      const thumbnail = await createSquareThumbnail(imageDataUrl, 1024);
+      const sourceType = item.agentId === "agent-mode-a"
+        ? "agent_mode"
+        : item.agentName
+          ? "industry_agent"
+          : "local_history";
+      const response = await fetch("/api/square/recommend", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiKey: apiConfig.apiKey,
+          imageId: item.id,
+          thumbnailDataUrl: thumbnail.dataUrl,
+          sourceImageMeta: {
+            imageId: item.id,
+            requestId: item.requestId,
+            model: item.model,
+            width: item.width || thumbnail.width,
+            height: item.height || thumbnail.height,
+            aspectRatio: item.params.aspectRatio,
+            pageLabel: item.agentScenario,
+          },
+          prompt: item.prompt,
+          params: item.params,
+          caption: item.agentScenario || item.prompt.replace(/\s+/g, " ").slice(0, 120),
+          sourceType,
+          reasonPlan: {
+            agentName: item.agentName,
+            agentScenario: item.agentScenario,
+            promptVariant: item.promptVariant,
+            compressedTo: "1K",
+          },
+        }),
+      });
+      const payload = await readApiJson<SquareRecommendResponse>(response, "/api/square/recommend");
+      if (!response.ok || !payload.ok) throw payload;
+      const message = payload.action === "replaced"
+        ? `已推荐，替换最早展示位 · 今日剩余 ${payload.remainingDailyQuota ?? 0}`
+        : `已推荐到广场 · 今日剩余 ${payload.remainingDailyQuota ?? 0}`;
+      setSquareRecommendState((current) => ({
+        ...current,
+        [item.id]: {
+          status: "success",
+          message,
+          itemId: payload.item?.id,
+        },
+      }));
+    } catch (error) {
+      setSquareRecommendState((current) => ({
+        ...current,
+        [item.id]: {
+          status: "error",
+          message: formatError(error),
+        },
+      }));
+    }
+  }
+
   function removeReference(id: string) {
     cancelAnalysisCountdown();
+    clearAgentModeDrafts();
     setReferenceImages((current) => current.filter((image) => image.id !== id));
   }
 
   function applyPromptStarter(nextPrompt: string) {
     cancelAnalysisCountdown();
+    clearAgentModeDrafts();
     setIsComposerCollapsed(false);
     setPrompt((current) => (current.trim() ? `${current.trim()}\n${nextPrompt}` : nextPrompt));
     setShowPromptPresets(false);
@@ -4754,6 +5941,7 @@ export default function App() {
 
   function updatePromptValue(nextPrompt: string) {
     cancelAnalysisCountdown();
+    clearAgentModeDrafts();
     setIsComposerCollapsed(false);
     setPrompt(nextPrompt);
   }
@@ -4833,13 +6021,18 @@ export default function App() {
     const recommendedRatio = typeof plan.recommendedParams.aspectRatio === "string"
       ? plan.recommendedParams.aspectRatio
       : params.aspectRatio;
-    const nextRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio)
+    const nextRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio, selectedModel)
       ? recommendedRatio
       : params.aspectRatio;
     return {
       ...params,
       aspectRatio: nextRatio,
-      size: resolveSize(nextRatio, safeImageResolution(params.resolution)),
+      size: resolveRequestSize(
+        nextRatio,
+        normalizeResolutionForRequest(safeImageResolution(params.resolution), apiConfig.protocol, selectedModel),
+        apiConfig.protocol,
+        selectedModel,
+      ),
       negativePrompt: plan.negativePrompt || params.negativePrompt,
     } as ImageParams;
   }
@@ -4929,6 +6122,13 @@ export default function App() {
     }
   }
 
+  function enterSquare() {
+    setActivePage("square");
+    if (window.location.hash !== "#square") {
+      window.history.pushState(null, "", "#square");
+    }
+  }
+
   function returnHome() {
     setActivePage("home");
     if (window.location.hash) {
@@ -4944,7 +6144,11 @@ export default function App() {
 
   const analysisResult = analysisState.result;
   const suggestedRatio = analysisResult?.suggestedParams.aspectRatio;
-  const suggestedSize = analysisResult?.suggestedParams.size || (suggestedRatio ? resolveSize(suggestedRatio, selectedResolution) : "");
+  const suggestedSize = analysisResult?.suggestedParams.size || (
+    suggestedRatio
+      ? resolveRequestSize(suggestedRatio, selectedResolution, apiConfig.protocol, selectedModel)
+      : ""
+  );
   const suggestedCount = analysisResult?.suggestedParams.count;
   const analysisSourceLabel = analysisResult?.source === "ai"
     ? `AI · ${analysisResult.analysisModel || preferredAnalysisModel}`
@@ -4961,7 +6165,20 @@ export default function App() {
     return (
       <>
         {frontendUpdateNotice}
-        <HomePage onEnter={enterStudio} onAdmin={enterAdmin} />
+        <HomePage onEnter={enterStudio} onSquare={enterSquare} onAdmin={enterAdmin} />
+      </>
+    );
+  }
+
+  if (activePage === "square") {
+    return (
+      <>
+        {frontendUpdateNotice}
+        <SquarePage
+          apiKey={apiConfig.apiKey}
+          onBackHome={returnHome}
+          onEnterStudio={enterStudio}
+        />
       </>
     );
   }
@@ -5077,6 +6294,10 @@ export default function App() {
             <button type="button" className="topbar-home-button" onClick={returnHome}>
               <WandSparkles size={15} />
               首页
+            </button>
+            <button type="button" className="topbar-home-button" onClick={enterSquare}>
+              <ExternalLink size={15} />
+              广场
             </button>
             <div className={`status-pill ${modelState.status}`}>
               {modelState.status === "ready" ? <Wifi size={16} /> : <Settings2 size={16} />}
@@ -5230,6 +6451,9 @@ export default function App() {
                       onPreview={() => previewCurrent(job)}
                       onDownload={() => downloadCurrent(job)}
                       onCopyPrompt={() => copyPrompt(job.prompt)}
+                      onRecommend={() => void recommendToSquare(job)}
+                      recommendState={squareRecommendState[job.id]}
+                      canRecommend={canUseSquareIdentity}
                     />
                   ))}
                 </div>
@@ -5246,6 +6470,7 @@ export default function App() {
             isPromptAnalyzing ? "is-analyzing" : "",
             isComposerCollapsed ? "is-collapsed" : "",
             isAgentPanelOpen ? "has-agent-panel" : "",
+            isAgentModeEnabled ? "is-agent-mode" : "",
           ].filter(Boolean).join(" ")}
           data-onboarding-target="composer"
           onSubmit={(event) => {
@@ -5270,97 +6495,104 @@ export default function App() {
               <Send size={16} />
             </button>
           )}
-          <div className="agent-quickbar">
-            <button
-              type="button"
-              className={[
-                "agent-entry-button",
-                lastAppliedAgent ? "is-active" : isAgentEnabled ? "is-enabled" : "is-muted",
-                !isAgentHintSeen ? "needs-attention" : "",
-              ].filter(Boolean).join(" ")}
-              title={
-                lastAppliedAgent
-                  ? `${lastAppliedAgent.plan.agentName} · ${PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]} 已应用到当前提示词`
-                  : isAgentEnabled
-                    ? "已选行业，点开面板应用 variant"
-                    : "打开行业 Agent 选择器"
-              }
-              onClick={() => openAgentPanel()}
-            >
-              <WandSparkles size={15} />
-              {lastAppliedAgent
-                ? `${lastAppliedAgent.plan.agentName} · ${PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]} 已应用`
-                : isAgentEnabled
-                  ? `${selectedAgent?.name || "行业 Agent"} · 已选`
-                  : "行业 Agent · 未启用"}
-              <ChevronRight size={14} />
-              <small>
-                {lastAppliedAgent ? "送出后清" : isAgentEnabled ? "可应用" : "可开启"}
-              </small>
-            </button>
-            {isAgentEnabled && (
+          <AgentModeSwitch
+            enabled={isAgentModeEnabled}
+            status={agentModeState.status}
+            onToggle={() => setIsAgentModeEnabled((value) => !value)}
+          />
+          {!isAgentModeEnabled && (
+            <div className="agent-quickbar">
               <button
                 type="button"
-                className="agent-disable-button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  disableAgent();
-                }}
-                title="停用行业 Agent"
-                aria-label="停用行业 Agent"
+                className={[
+                  "agent-entry-button",
+                  lastAppliedAgent ? "is-active" : isAgentEnabled ? "is-enabled" : "is-muted",
+                  !isAgentHintSeen ? "needs-attention" : "",
+                ].filter(Boolean).join(" ")}
+                title={
+                  lastAppliedAgent
+                    ? `${lastAppliedAgent.plan.agentName} · ${PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]} 已应用到当前提示词`
+                    : isAgentEnabled
+                      ? "已选行业，点开面板应用 variant"
+                      : "打开行业 Agent 选择器"
+                }
+                onClick={() => openAgentPanel()}
               >
-                <X size={13} />
+                <WandSparkles size={15} />
+                {lastAppliedAgent
+                  ? `${lastAppliedAgent.plan.agentName} · ${PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]} 已应用`
+                  : isAgentEnabled
+                    ? `${selectedAgent?.name || "行业 Agent"} · 已选`
+                    : "行业 Agent · 未启用"}
+                <ChevronRight size={14} />
+                <small>
+                  {lastAppliedAgent ? "送出后清" : isAgentEnabled ? "可应用" : "可开启"}
+                </small>
               </button>
-            )}
-            {lastAppliedAgent && (
-              <div className="agent-applied-chip" role="status">
-                <WandSparkles size={12} />
-                <span>{lastAppliedAgent.plan.agentName} · {PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]}</span>
+              {isAgentEnabled && (
                 <button
                   type="button"
-                  className="agent-applied-chip-clear"
-                  onClick={() => setLastAppliedAgent(null)}
-                  title="清除 Agent 标签（保留提示词）"
-                  aria-label="清除 Agent 标签"
+                  className="agent-disable-button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    disableAgent();
+                  }}
+                  title="停用行业 Agent"
+                  aria-label="停用行业 Agent"
                 >
-                  <X size={11} />
+                  <X size={13} />
                 </button>
-              </div>
-            )}
-            <button
-              type="button"
-              className="agent-expand-button"
-              onClick={() => setIsAgentQuickbarExpanded((value) => !value)}
-              aria-expanded={isAgentQuickbarExpanded}
-              title={isAgentQuickbarExpanded ? "收起行业 Agent 快捷入口" : "展开行业 Agent 快捷入口"}
-            >
-              {isAgentQuickbarExpanded ? "收起" : "展开"}
-              <ChevronRight size={13} />
-            </button>
-            {isAgentHintVisible && (
-              <div className="agent-entry-hint" role="status">
-                选择行业工作流，不填也能生成标准图
-              </div>
-            )}
-            {isAgentQuickbarExpanded && (
-              <div className="agent-chip-row" aria-label="行业 Agent 快捷入口">
-                {INDUSTRY_AGENTS.slice(0, 8).map((agent) => (
+              )}
+              {lastAppliedAgent && (
+                <div className="agent-applied-chip" role="status">
+                  <WandSparkles size={12} />
+                  <span>{lastAppliedAgent.plan.agentName} · {PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]}</span>
                   <button
                     type="button"
-                    key={agent.id}
-                    className={`agent-chip ${selectedAgentId === agent.id ? "active" : ""}`}
-                    title={agent.clickHint}
-                    onClick={() => openAgentPanel(agent.id)}
+                    className="agent-applied-chip-clear"
+                    onClick={() => setLastAppliedAgent(null)}
+                    title="清除 Agent 标签（保留提示词）"
+                    aria-label="清除 Agent 标签"
                   >
-                    <span>{agent.icon}</span>
-                    {agent.name}
-                    <small>{selectedAgentId === agent.id ? "已选" : "开启"}</small>
-                    <ChevronRight size={12} />
+                    <X size={11} />
                   </button>
-                ))}
-              </div>
-            )}
-          </div>
+                </div>
+              )}
+              <button
+                type="button"
+                className="agent-expand-button"
+                onClick={() => setIsAgentQuickbarExpanded((value) => !value)}
+                aria-expanded={isAgentQuickbarExpanded}
+                title={isAgentQuickbarExpanded ? "收起行业 Agent 快捷入口" : "展开行业 Agent 快捷入口"}
+              >
+                {isAgentQuickbarExpanded ? "收起" : "展开"}
+                <ChevronRight size={13} />
+              </button>
+              {isAgentHintVisible && (
+                <div className="agent-entry-hint" role="status">
+                  选择行业工作流，不填也能生成标准图
+                </div>
+              )}
+              {isAgentQuickbarExpanded && (
+                <div className="agent-chip-row" aria-label="行业 Agent 快捷入口">
+                  {INDUSTRY_AGENTS.slice(0, 8).map((agent) => (
+                    <button
+                      type="button"
+                      key={agent.id}
+                      className={`agent-chip ${selectedAgentId === agent.id ? "active" : ""}`}
+                      title={agent.clickHint}
+                      onClick={() => openAgentPanel(agent.id)}
+                    >
+                      <span>{agent.icon}</span>
+                      {agent.name}
+                      <small>{selectedAgentId === agent.id ? "已选" : "开启"}</small>
+                      <ChevronRight size={12} />
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {isAgentPanelOpen && (
             <div className="agent-modal">
               <button
@@ -5537,7 +6769,18 @@ export default function App() {
               </section>
             </div>
           )}
-          {showPromptPresets && (
+          {isAgentModeEnabled && (
+            <AgentModeStatusPanel
+              state={agentModeState}
+              onClear={() => {
+                setAgentModePendingPlan(null);
+                setAgentModeBrochureDraft(null);
+                setAgentModeState({ status: "idle", message: "" });
+              }}
+              onReanalyze={() => void requestAgentModeReanalysis()}
+            />
+          )}
+          {!isAgentModeEnabled && showPromptPresets && (
             <div className="prompt-presets-panel">
               <div className="prompt-presets-head">
                 <div>
@@ -5599,7 +6842,7 @@ export default function App() {
               ))}
             </div>
           )}
-          {analysisState.status !== "idle" && (
+          {!isAgentModeEnabled && analysisState.status !== "idle" && (
             <div className={`prompt-analysis-panel ${analysisState.status} risk-${analysisResult?.riskLevel || "low"}`}>
               <div className="analysis-panel-head">
                 <div className="analysis-orb" aria-hidden="true">
@@ -5620,6 +6863,11 @@ export default function App() {
                           ? `${analysisSourceLabel} · 评分 ${analysisResult.score}`
                           : analysisState.error || "可以稍后重试"}
                   </span>
+                  {(analysisState.streamChunks || analysisState.streamCharacters) && (
+                    <small className="analysis-stream-progress">
+                      {`进度 · ${analysisState.streamChunks || 0} 段 / ${analysisState.streamCharacters || 0} 字`}
+                    </small>
+                  )}
                 </div>
                 <button
                   type="button"
@@ -5655,6 +6903,10 @@ export default function App() {
                   <span />
                   <span />
                 </div>
+              )}
+
+              {analysisState.streamPreview && (analysisState.status === "analyzing" || analysisState.status === "receiving") && (
+                <pre className="analysis-stream-preview">{analysisState.streamPreview}</pre>
               )}
 
               {analysisState.status === "error" && (
@@ -5761,7 +7013,7 @@ export default function App() {
               )}
             </div>
           )}
-          <div className="composer-main">
+          <div className={`composer-main ${isAgentModeEnabled ? "is-agent-mode" : ""}`}>
             <button
               type="button"
               className="icon-button upload-button"
@@ -5770,16 +7022,18 @@ export default function App() {
             >
               <UploadCloud size={19} />
             </button>
-            <button
-              type="button"
-              className={`icon-button preset-toggle-button ${!showPromptPresets && !prompt.trim() ? "is-guiding" : ""}`}
-              title={showPromptPresets ? "收起预设提示词" : "查看预设提示词"}
-              aria-expanded={showPromptPresets}
-              onClick={() => setShowPromptPresets((value) => !value)}
-            >
-              <WandSparkles size={18} />
-              <span>预设</span>
-            </button>
+            {!isAgentModeEnabled && (
+              <button
+                type="button"
+                className={`icon-button preset-toggle-button ${!showPromptPresets && !prompt.trim() ? "is-guiding" : ""}`}
+                title={showPromptPresets ? "收起预设提示词" : "查看预设提示词"}
+                aria-expanded={showPromptPresets}
+                onClick={() => setShowPromptPresets((value) => !value)}
+              >
+                <WandSparkles size={18} />
+                <span>预设</span>
+              </button>
+            )}
             <textarea
               ref={promptTextareaRef}
               value={prompt}
@@ -5791,27 +7045,41 @@ export default function App() {
                   requestStartBatch();
                 }
               }}
-              placeholder="描述你想生成的图片..."
+              placeholder={
+                isAgentModeEnabled
+                  ? "上传参考图后，直接描述你想做一张图、一组不同图片，或一本宣传画册..."
+                  : "描述你想生成的图片..."
+              }
               aria-label="提示词"
               rows={1}
             />
-            <button
-              type="button"
-              className={`composer-config-button ${isSettingsOpen ? "active" : ""}`}
-              title={`打开生成配置：${composerConfigSummary} · ${composerConfigDetail}`}
-              aria-label={`打开生成配置，当前 ${composerConfigSummary}`}
-              onClick={() => setIsSettingsOpen(true)}
-            >
-              <Settings2 size={15} />
-              <span>{params.batchCount}张</span>
-              <span>{params.aspectRatio}</span>
-              <span>{selectedResolution}</span>
-            </button>
+            {!isAgentModeEnabled && (
+              <button
+                type="button"
+                className={`composer-config-button ${isSettingsOpen ? "active" : ""}`}
+                title={`打开生成配置：${composerConfigSummary} · ${composerConfigDetail}`}
+                aria-label={`打开生成配置，当前 ${composerConfigSummary}`}
+                onClick={() => setIsSettingsOpen(true)}
+              >
+                <Settings2 size={15} />
+                <span>{params.batchCount}张</span>
+                <span>{params.aspectRatio}</span>
+                <span>{selectedResolution}</span>
+              </button>
+            )}
             <button
               type="button"
               className={`send-button${isSendLaunching ? " is-launching" : ""}`}
-              title={isPromptAnalyzing ? "正在分析提示词" : "生成"}
-              aria-label="生成图片"
+              title={
+                isAgentModeEnabled
+                  ? agentModeState.status === "analyzing"
+                    ? "正在理解任务"
+                    : "开始由 Agent 自动编排"
+                  : isPromptAnalyzing
+                    ? "正在分析提示词"
+                    : "生成"
+              }
+              aria-label={isAgentModeEnabled ? "开始 Agent 编排" : "生成图片"}
               disabled={!canRequestGenerate}
               onPointerDown={(event) => {
                 if (event.button !== 0) return;
@@ -5831,41 +7099,45 @@ export default function App() {
               </span>
             </button>
           </div>
-          <div className="prompt-assist-bar" aria-label="智能创作工具">
-            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("optimize")}>
-              <WandSparkles size={14} />
-              优化提示词
-            </button>
-            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("params")}>
-              <Settings2 size={14} />
-              参数推荐
-            </button>
-            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("risk")}>
-              <ShieldCheck size={14} />
-              失败预判
-            </button>
-            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("style")}>
-              <WandSparkles size={14} />
-              风格增强
-            </button>
-          </div>
-          <div className="composer-meta">
-            <span className={referenceIssueCount > 0 ? "has-error" : referenceWarningCount > 0 ? "has-warning" : ""}>
-              {referenceMetaLabel}
-            </span>
-            <span className={`composer-config-meta ${aspectRatioSupported ? "" : "has-error"}`}>
-              {composerConfigSummary} · {resolvedRequestSize} · {params.outputFormat.toUpperCase()}
-            </span>
-            <label className="composer-auto-toggle" title="发送前自动优化提示词">
-              <input
-                type="checkbox"
-                checked={isAutoPromptAnalysisEnabled}
-                onChange={(event) => setIsAutoPromptAnalysisEnabled(event.target.checked)}
-              />
-              <span>发送前优化</span>
-            </label>
-            <span>{prompt.trim().length} 字</span>
-          </div>
+          {!isAgentModeEnabled && (
+            <>
+              <div className="prompt-assist-bar" aria-label="智能创作工具">
+                <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("optimize")}>
+                  <WandSparkles size={14} />
+                  优化提示词
+                </button>
+                <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("params")}>
+                  <Settings2 size={14} />
+                  参数推荐
+                </button>
+                <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("risk")}>
+                  <ShieldCheck size={14} />
+                  失败预判
+                </button>
+                <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("style")}>
+                  <WandSparkles size={14} />
+                  风格增强
+                </button>
+              </div>
+              <div className="composer-meta">
+                <span className={referenceIssueCount > 0 ? "has-error" : referenceWarningCount > 0 ? "has-warning" : ""}>
+                  {referenceMetaLabel}
+                </span>
+                <span className={`composer-config-meta ${aspectRatioSupported ? "" : "has-error"}`}>
+                  {composerConfigSummary} · {resolvedRequestSize} · {params.outputFormat.toUpperCase()}
+                </span>
+                <label className="composer-auto-toggle" title="发送前自动优化提示词">
+                  <input
+                    type="checkbox"
+                    checked={isAutoPromptAnalysisEnabled}
+                    onChange={(event) => setIsAutoPromptAnalysisEnabled(event.target.checked)}
+                  />
+                  <span>发送前优化</span>
+                </label>
+                <span>{prompt.trim().length} 字</span>
+              </div>
+            </>
+          )}
           <input
             ref={fileInputRef}
             className="hidden-input"
@@ -5875,6 +7147,38 @@ export default function App() {
             onChange={onReferenceInput}
           />
         </form>
+        {agentModePendingPlan && (
+          <AgentModePlanModal
+            plan={agentModePendingPlan}
+            onCancel={() => {
+              setAgentModePendingPlan(null);
+              setAgentModeState({
+                status: "idle",
+                message: "已取消自动拆解，请继续修改需求。",
+              });
+            }}
+            onReanalyze={() => void requestAgentModeReanalysis()}
+            onConfirm={() => enqueueAgentModeJobs(agentModePendingPlan.jobs, {
+              analysisResult: agentModePendingPlan,
+              clearComposer: true,
+              scenarioLabel: "自动拆解任务",
+            })}
+          />
+        )}
+        {agentModeBrochureDraft && (
+          <BrochurePlannerModal
+            project={agentModeBrochureDraft}
+            onCancel={() => {
+              setAgentModeBrochureDraft(null);
+              setAgentModeState({
+                status: "idle",
+                message: "已取消画册规划，请继续补充你的要求。",
+              });
+            }}
+            onReanalyze={() => void requestAgentModeReanalysis()}
+            onGenerateBoards={() => submitBrochureStyleBoards(agentModeBrochureDraft)}
+          />
+        )}
       </main>
 
       <aside className={`settings-panel ${isSettingsOpen ? "open" : "closed"}`}>
@@ -6003,7 +7307,7 @@ export default function App() {
         <section className="settings-section" data-onboarding-target="model">
           <div className="section-label with-note">
             <span>可用生图模型</span>
-            <small>仅显示 gpt-image-2、gpt-5.4-image-2 或包含 image-2 的模型</small>
+            <small>支持 GPT Image 2 与 Gemini 3 Pro Image Preview，选择后自动切换接口格式</small>
           </div>
           <div className="search-input">
             <Search size={16} />
@@ -6016,7 +7320,7 @@ export default function App() {
           <div className="model-list">
             {filteredModels.length === 0 ? (
               <div className="muted-box">
-                {models.length === 0 ? "暂无可用 image-2 模型" : "无匹配模型"}
+                {selectableImageModels.length === 0 ? "暂无可用图片模型" : "无匹配模型"}
               </div>
             ) : (
               filteredModels.map((model) => (
@@ -6024,9 +7328,10 @@ export default function App() {
                   type="button"
                   key={model}
                   className={selectedModel === model ? "selected" : ""}
-                  onClick={() => setSelectedModel(model)}
+                  onClick={() => selectImageModel(model)}
                 >
-                  {model}
+                  <span>{model}</span>
+                  <small>{imageModelLaneLabel(model)}</small>
                 </button>
               ))
             )}
@@ -6040,11 +7345,10 @@ export default function App() {
               value={params.aspectRatio}
               onChange={(event) => updateParams({ aspectRatio: event.target.value })}
             >
-              {ASPECT_RATIOS.map((ratio) => (
+              {supportedAspectOptions.map((ratio) => (
                 <option
                   key={ratio.value}
                   value={ratio.value}
-                  disabled={!isAspectRatioSupported(apiConfig.protocol, ratio.value)}
                 >
                   {ratio.label}
                 </option>
@@ -6053,17 +7357,18 @@ export default function App() {
           </label>
           <div className={`ratio-preview ${aspectRatioSupported ? "" : "unsupported"}`}>
             <strong>{selectedAspectRatio.value}</strong>
-            <span>{selectedAspectRatio.hint}</span>
+            <span>{selectedAspectHint}</span>
             <small>{aspectRatioSupported ? `${selectedResolution} · 请求尺寸 ${resolvedRequestSize}` : "当前协议不支持此比例"}</small>
           </div>
           <label>
             <span>分辨率</span>
             <select
               value={selectedResolution}
+              disabled={isOfficialGptImageSizeMode}
               onChange={(event) => updateParams({ resolution: event.target.value as ImageResolution })}
             >
               {IMAGE_RESOLUTIONS.map((item) => (
-                <option key={item.value} value={item.value}>
+                <option key={item.value} value={item.value} disabled={isOfficialGptImageSizeMode && item.value !== "1K"}>
                   {item.label}
                 </option>
               ))}
@@ -6072,7 +7377,7 @@ export default function App() {
           <div className="ratio-preview">
             <strong>{selectedResolution}</strong>
             <span>{selectedResolutionDefinition.hint}</span>
-            <small>尺寸会随宽高比自动换算</small>
+            <small>{isOfficialGptImageSizeMode ? "GPT Image 2 仅使用官方固定尺寸，选择 Pro 模型可用 2K/4K" : isGemini3ProImageModel(selectedModel) ? "Gemini 3 Pro 会以 imageSize 传递 1K/2K/4K" : isGptImage2ProModel(selectedModel) ? "Pro 模型支持 2K/4K 高分辨率输出" : "尺寸会随宽高比自动换算"}</small>
           </div>
           <label>
             <span>质量</span>
@@ -6160,6 +7465,9 @@ export default function App() {
             );
           }}
           onCopyPrompt={() => copyPrompt(previewItem.prompt)}
+          onRecommend={() => void recommendToSquare(previewItem)}
+          recommendState={squareRecommendState[previewItem.id]}
+          canRecommend={canUseSquareIdentity}
         />
       )}
       {pendingDeleteIds && (
@@ -6202,10 +7510,12 @@ function AdminApp({
   const [passwordForm, setPasswordForm] = useState({ oldPassword: "", newPassword: "", confirmPassword: "" });
   const [adminError, setAdminError] = useState("");
   const [stats, setStats] = useState<AdminStats | null>(null);
+  const [squareOverview, setSquareOverview] = useState<SquareAdminOverview | null>(null);
   const [logs, setLogs] = useState<AdminRequestLog[]>([]);
   const [logStatus, setLogStatus] = useState("");
   const [logQuery, setLogQuery] = useState("");
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
+  const [isExportingSquare, setIsExportingSquare] = useState(false);
   const [expandedLogId, setExpandedLogId] = useState("");
 
   useEffect(() => {
@@ -6221,6 +7531,22 @@ function AdminApp({
 
   async function adminFetch<T>(path: string, init: RequestInit = {}) {
     const response = await fetch(`/api/admin${path}`, {
+      ...init,
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        ...(init.headers || {}),
+      },
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) {
+      throw payload;
+    }
+    return payload as T;
+  }
+
+  async function squareAdminFetch<T>(path: string, init: RequestInit = {}) {
+    const response = await fetch(`/api/square/admin${path}`, {
       ...init,
       credentials: "same-origin",
       headers: {
@@ -6254,6 +7580,31 @@ function AdminApp({
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (error) {
       setAdminError(formatError(error));
+    }
+  }
+
+  async function exportSquareLogs(format: "json" | "csv" = "json") {
+    setAdminError("");
+    setIsExportingSquare(true);
+    try {
+      const response = await fetch(`/api/square/admin/export?format=${format}`, {
+        method: "GET",
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw detail || new Error(`HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      const dispositionFilename = response.headers.get("content-disposition")?.match(/filename="([^"]+)"/)?.[1];
+      const filename = dispositionFilename || `imagehub-square-audit-${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`;
+      const url = URL.createObjectURL(blob);
+      downloadUrl(url, filename);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setAdminError(formatError(error));
+    } finally {
+      setIsExportingSquare(false);
     }
   }
 
@@ -6318,12 +7669,14 @@ function AdminApp({
       const query = new URLSearchParams();
       if (logStatus) query.set("status", logStatus);
       if (logQuery.trim()) query.set("q", logQuery.trim());
-      const [statsPayload, logsPayload] = await Promise.all([
+      const [statsPayload, logsPayload, squarePayload] = await Promise.all([
         adminFetch<{ ok: true; stats: AdminStats }>("/stats"),
         adminFetch<{ ok: true; logs: AdminRequestLog[] }>(`/requests?${query.toString()}`),
+        squareAdminFetch<{ ok: true; overview: SquareAdminOverview }>("/overview"),
       ]);
       setStats(statsPayload.stats);
       setLogs(logsPayload.logs);
+      setSquareOverview(squarePayload.overview);
       setExpandedLogId((current) =>
         logsPayload.logs.some((log) => log.requestId === current) ? current : "",
       );
@@ -6343,6 +7696,7 @@ function AdminApp({
     } finally {
       setUser(null);
       setStats(null);
+      setSquareOverview(null);
       setLogs([]);
       setAdminError("");
     }
@@ -6356,6 +7710,9 @@ function AdminApp({
     () => Object.entries(stats?.errorCounts || {}).sort((a, b) => b[1] - a[1]).slice(0, 4),
     [stats],
   );
+  const squareLastTrend = squareOverview?.trend[squareOverview.trend.length - 1];
+  const squareTopReasons = squareOverview?.rejectedReasonTop.slice(0, 4) || [];
+  const squareRiskEvents = squareOverview?.riskEvents.slice(0, 4) || [];
 
   if (isChecking) {
     return (
@@ -6491,6 +7848,10 @@ function AdminApp({
         <AdminStatCard label="成功率" value={`${stats?.successRate ?? 0}%`} tone="success" />
         <AdminStatCard label="失败" value={stats?.error ?? 0} tone="error" />
         <AdminStatCard label="平均耗时" value={formatCompactDuration(stats?.avgDurationMs ?? 0)} />
+        <AdminStatCard label="广场展示" value={squareOverview?.activeItems ?? 0} />
+        <AdminStatCard label="推荐尝试" value={squareOverview?.totalRecommendAttempts ?? 0} />
+        <AdminStatCard label="替换率" value={`${squareOverview?.replacementRate ?? 0}%`} />
+        <AdminStatCard label="广场点赞" value={squareOverview?.totalLikes ?? 0} tone="success" />
       </section>
 
       <section className="admin-insight-grid">
@@ -6525,6 +7886,67 @@ function AdminApp({
               </div>
             ))
           )}
+        </article>
+        <article className="admin-panel admin-square-panel">
+          <div className="admin-panel-title admin-panel-title-spread">
+            <div>
+              <Star size={17} />
+              <strong>广场治理</strong>
+            </div>
+            <div className="admin-panel-actions">
+              <button type="button" className="subtle-button" onClick={() => void exportSquareLogs("csv")} disabled={isExportingSquare}>
+                {isExportingSquare ? <Loader2 size={15} className="spin" /> : <DownloadCloud size={15} />}
+                导出今日 CSV
+              </button>
+              <button type="button" className="subtle-button" onClick={() => void exportSquareLogs("json")} disabled={isExportingSquare}>
+                <DownloadCloud size={15} />
+                导出今日 JSON
+              </button>
+            </div>
+          </div>
+          <div className="admin-square-grid">
+            <div>
+              <strong>今日趋势</strong>
+              <div className="admin-rank-row">
+                <span>{squareLastTrend?.dateKey || "今日"}</span>
+                <strong>{squareLastTrend ? `${squareLastTrend.recommendAttempts} 推荐 · ${squareLastTrend.likes} 赞` : "-"}</strong>
+              </div>
+              <div className="admin-rank-row">
+                <span>新增 / 替换 / 拒绝</span>
+                <strong>{squareLastTrend ? `${squareLastTrend.added} / ${squareLastTrend.replaced} / ${squareLastTrend.rejected}` : "0 / 0 / 0"}</strong>
+              </div>
+              <div className="admin-rank-row">
+                <span>平均点赞</span>
+                <strong>{squareOverview?.likeRate ?? 0}</strong>
+              </div>
+            </div>
+            <div>
+              <strong>拒绝原因 Top</strong>
+              {squareTopReasons.length === 0 ? (
+                <p className="admin-muted">暂无拒绝记录</p>
+              ) : (
+                squareTopReasons.map((reason) => (
+                  <div className="admin-rank-row" key={reason.reasonCode}>
+                    <span title={reason.reasonCode}>{reason.reasonCode}</span>
+                    <strong>{reason.count}</strong>
+                  </div>
+                ))
+              )}
+            </div>
+            <div>
+              <strong>风控事件</strong>
+              {squareRiskEvents.length === 0 ? (
+                <p className="admin-muted">暂无风控事件</p>
+              ) : (
+                squareRiskEvents.map((event) => (
+                  <div className="admin-rank-row" key={event.id}>
+                    <span title={`${event.event} · ${event.reasonCode}`}>{event.severity} · {event.reasonCode}</span>
+                    <strong>{formatFullDate(event.timestamp)}</strong>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
         </article>
       </section>
 
@@ -6699,7 +8121,7 @@ function AdminJsonBlock({ title, value }: { title: string; value: unknown }) {
   );
 }
 
-function HomePage({ onEnter, onAdmin }: { onEnter: () => void; onAdmin: () => void }) {
+function HomePage({ onEnter, onSquare, onAdmin }: { onEnter: () => void; onSquare: () => void; onAdmin: () => void }) {
   const featureBands = [
     {
       title: "统一记录流",
@@ -6754,6 +8176,9 @@ function HomePage({ onEnter, onAdmin }: { onEnter: () => void; onAdmin: () => vo
             <button type="button" onClick={() => scrollToSection("home-agents")}>
               行业 Agent
             </button>
+            <button type="button" onClick={onSquare}>
+              广场
+            </button>
             <button type="button" onClick={() => scrollToSection("home-local")}>
               本地优先
             </button>
@@ -6761,6 +8186,9 @@ function HomePage({ onEnter, onAdmin }: { onEnter: () => void; onAdmin: () => vo
           <div className="home-nav-actions">
             <button type="button" className="home-nav-action" onClick={onEnter}>
               打开工作台
+            </button>
+            <button type="button" className="home-nav-action" onClick={onSquare}>
+              进入广场
             </button>
             <button type="button" className="home-admin-link" onClick={onAdmin}>
               <ShieldCheck size={16} />
@@ -6782,6 +8210,9 @@ function HomePage({ onEnter, onAdmin }: { onEnter: () => void; onAdmin: () => vo
             </button>
             <button type="button" className="home-secondary" onClick={() => scrollToSection("home-flow")}>
               了解流程
+            </button>
+            <button type="button" className="home-secondary" onClick={onSquare}>
+              浏览广场
             </button>
           </div>
           <div className="home-metric-row" aria-label="产品能力摘要">
@@ -6887,6 +8318,443 @@ function HomePage({ onEnter, onAdmin }: { onEnter: () => void; onAdmin: () => vo
         </button>
       </section>
     </main>
+  );
+}
+
+function SquarePage({
+  apiKey,
+  onBackHome,
+  onEnterStudio,
+}: {
+  apiKey: string;
+  onBackHome: () => void;
+  onEnterStudio: () => void;
+}) {
+  const [tab, setTab] = useState<SquareFeedTab>("latest");
+  const [items, setItems] = useState<SquareFeedItem[]>([]);
+  const [cursor, setCursor] = useState("");
+  const [hasMore, setHasMore] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [quota, setQuota] = useState<SquareQuotaResponse | null>(null);
+  const [pendingLikeIds, setPendingLikeIds] = useState<Set<string>>(() => new Set());
+  const [previewItem, setPreviewItem] = useState<SquareFeedItem | null>(null);
+  const pageRef = useRef<HTMLElement | null>(null);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const apiKeyReady = apiKey.trim().length >= API_KEY_MIN_LENGTH;
+
+  async function fetchQuota() {
+    if (!apiKeyReady) {
+      setQuota(null);
+      return;
+    }
+    try {
+      const response = await fetch("/api/square/quota", {
+        headers: { "x-imagehub-api-key": apiKey },
+      });
+      const payload = await readApiJson<SquareQuotaResponse>(response, "/api/square/quota");
+      if (!response.ok || !payload.ok) throw payload;
+      setQuota(payload);
+    } catch {
+      setQuota(null);
+    }
+  }
+
+  async function loadFeed(reset = false) {
+    if (isLoading) return;
+    if (!reset && !hasMore) return;
+    setIsLoading(true);
+    setError("");
+    try {
+      const query = new URLSearchParams({
+        tab,
+        limit: String(SQUARE_PAGE_SIZE),
+      });
+      if (!reset && cursor) query.set("cursor", cursor);
+      const headers: Record<string, string> = {};
+      if (apiKeyReady) headers["x-imagehub-api-key"] = apiKey;
+      const response = await fetch(`/api/square/feed?${query.toString()}`, { headers });
+      const payload = await readApiJson<SquareFeedResponse>(response, "/api/square/feed");
+      if (!response.ok || !payload.ok) throw payload;
+      setItems((current) => reset ? payload.items : mergeSquareItems(current, payload.items));
+      setCursor(payload.nextCursor || "");
+      setHasMore(payload.hasMore);
+    } catch (loadError) {
+      setError(formatError(loadError));
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    setItems([]);
+    setCursor("");
+    setHasMore(true);
+    void loadFeed(true);
+    void fetchQuota();
+  }, [tab, apiKey]);
+
+  const loadFeedRef = useRef(loadFeed);
+  loadFeedRef.current = loadFeed;
+  const canLoadMore = hasMore && !isLoading;
+
+  useEffect(() => {
+    const marker = loadMoreRef.current;
+    const root = pageRef.current;
+    if (!marker || !root || !canLoadMore) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) void loadFeedRef.current(false);
+      },
+      { root, rootMargin: "420px 0px", threshold: 0 },
+    );
+    observer.observe(marker);
+    return () => observer.disconnect();
+  }, [canLoadMore]);
+
+  useEffect(() => {
+    if (!previewItem) return;
+    const updated = items.find((item) => item.id === previewItem.id);
+    if (updated && updated !== previewItem) setPreviewItem(updated);
+  }, [items, previewItem]);
+
+  async function toggleLike(item: SquareFeedItem) {
+    if (!apiKeyReady) {
+      setError("配置 API Key 后可点赞");
+      return;
+    }
+    setPendingLikeIds((current) => new Set(current).add(item.id));
+    setError("");
+    try {
+      const action = item.likedByRequester ? "unlike" : "like";
+      const response = await fetch("/api/square/like", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey, itemId: item.id, action }),
+      });
+      const payload = await readApiJson<SquareLikeResponse>(response, "/api/square/like");
+      if (!response.ok || !payload.ok) throw payload;
+      setItems((current) => current.map((candidate) =>
+        candidate.id === item.id
+          ? {
+            ...candidate,
+            likeCount: typeof payload.likeCount === "number" ? payload.likeCount : candidate.likeCount,
+            likedByRequester: payload.status === "liked" ? true : payload.status === "unliked" ? false : candidate.likedByRequester,
+          }
+          : candidate,
+      ));
+      void fetchQuota();
+    } catch (likeError) {
+      setError(formatError(likeError));
+    } finally {
+      setPendingLikeIds((current) => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
+    }
+  }
+
+  return (
+    <main className="square-page" ref={pageRef}>
+      <header className="square-topbar">
+        <button type="button" className="home-brand square-brand" onClick={onBackHome}>
+          <span>
+            <img src={imageStudioLogo} alt="" />
+          </span>
+          <strong>ImageHub Square</strong>
+        </button>
+        <div className="square-topbar-actions">
+          <button type="button" className="subtle-button" onClick={onEnterStudio}>
+            <WandSparkles size={16} />
+            工作台
+          </button>
+          <button type="button" className="subtle-button" onClick={onBackHome}>
+            首页
+          </button>
+        </div>
+      </header>
+
+      <section className="square-hero">
+        <div className="square-hero-copy">
+          <span className="home-kicker">Square</span>
+          <h1>广场</h1>
+          <p>创作者推荐的 AI 生成作品在这里展示。点赞你喜欢的创作，或者推荐你的得意之作。</p>
+          {items.length > 0 && (
+            <div className="square-metric-row">
+              <div className="square-metric">
+                <strong>{quota ? `${quota.shelfCount}/${quota.shelfLimit}` : "-/4"}</strong>
+                <span>我的展示位</span>
+              </div>
+              <div className="square-metric">
+                <strong>{quota ? quota.dailyRecommendLeft : "-"}</strong>
+                <span>今日推荐</span>
+              </div>
+              <div className="square-metric">
+                <strong>{quota ? quota.dailyLikeLeft : "-"}</strong>
+                <span>今日点赞</span>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="square-controls">
+        <div className="square-tabs" role="tablist" aria-label="广场排序">
+          {SQUARE_FEED_TABS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.value}
+                type="button"
+                role="tab"
+                aria-selected={tab === item.value}
+                className={tab === item.value ? "active" : ""}
+                onClick={() => setTab(item.value)}
+              >
+                <Icon size={15} />
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
+        <button type="button" className="subtle-button" onClick={() => void loadFeed(true)} disabled={isLoading}>
+          {isLoading ? <Loader2 size={15} className="spin" /> : <RefreshCw size={15} />}
+          刷新
+        </button>
+      </section>
+
+      {error && (
+        <div className="square-alert">
+          <AlertCircle size={16} />
+          <span>{error}</span>
+        </div>
+      )}
+
+      <section className="square-grid" aria-label="广场作品">
+        {items.map((item) => (
+          <SquareCard
+            key={item.id}
+            item={item}
+            apiKeyReady={apiKeyReady}
+            pendingLike={pendingLikeIds.has(item.id)}
+            onLike={() => void toggleLike(item)}
+            onCopyPrompt={() => void navigator.clipboard.writeText(item.prompt)}
+            onPreview={() => setPreviewItem(item)}
+          />
+        ))}
+        {isLoading && Array.from({ length: Math.max(4, SQUARE_PAGE_SIZE / 4) }, (_, index) => (
+          <div className="square-card square-skeleton" key={`square-skeleton-${index}`}>
+            <span />
+            <div />
+          </div>
+        ))}
+      </section>
+
+      {!isLoading && items.length === 0 && (
+        <div className="square-onboarding">
+          <div className="square-onboarding-header">
+            <h2>还没有作品，成为第一个推荐者</h2>
+            <p>只需三步，你的创作就会出现在广场上。</p>
+          </div>
+          <div className="square-steps">
+            <article className="square-step">
+              <span className="square-step-icon"><WandSparkles size={22} /></span>
+              <strong>生成作品</strong>
+              <p>在工作台输入提示词，选择模型和参数，提交生成。</p>
+            </article>
+            <span className="square-step-arrow"><ArrowRight size={18} /></span>
+            <article className="square-step">
+              <span className="square-step-icon"><ImagePlus size={22} /></span>
+              <strong>点击推荐</strong>
+              <p>生成成功后，点击结果左下角的「推荐广场」按钮。</p>
+            </article>
+            <span className="square-step-arrow"><ArrowRight size={18} /></span>
+            <article className="square-step">
+              <span className="square-step-icon"><Star size={22} /></span>
+              <strong>展示与互动</strong>
+              <p>作品出现在广场，其他创作者可以浏览和点赞。</p>
+            </article>
+          </div>
+          <button type="button" className="square-onboarding-cta" onClick={onEnterStudio}>
+            开始创作
+            <ArrowRight size={18} />
+          </button>
+          <div className="square-ghost-grid" aria-hidden="true">
+            {Array.from({ length: 4 }, (_, i) => (
+              <div className="square-ghost-card" key={i}>
+                <div className="square-ghost-image" />
+                <div className="square-ghost-body">
+                  <div className="square-ghost-line wide" />
+                  <div className="square-ghost-line narrow" />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {hasMore && <div ref={loadMoreRef} className="load-more-sentinel" />}
+      {isLoading && <div className="load-more-state">加载中...</div>}
+      {!hasMore && items.length > 0 && <div className="load-more-state">已经到底了</div>}
+      {previewItem && (
+        <SquarePreviewModal
+          item={previewItem}
+          apiKeyReady={apiKeyReady}
+          pendingLike={pendingLikeIds.has(previewItem.id)}
+          onClose={() => setPreviewItem(null)}
+          onLike={() => void toggleLike(previewItem)}
+          onCopyPrompt={() => void navigator.clipboard.writeText(previewItem.prompt)}
+          onDownload={() => downloadUrl(previewItem.thumbnailUrl, `${sanitizeFilename(previewItem.caption || previewItem.id)}.png`)}
+        />
+      )}
+    </main>
+  );
+}
+
+function mergeSquareItems(current: SquareFeedItem[], incoming: SquareFeedItem[]) {
+  const seen = new Set(current.map((item) => item.id));
+  return [...current, ...incoming.filter((item) => !seen.has(item.id))];
+}
+
+function SquareCard({
+  item,
+  apiKeyReady,
+  pendingLike,
+  onLike,
+  onCopyPrompt,
+  onPreview,
+}: {
+  item: SquareFeedItem;
+  apiKeyReady: boolean;
+  pendingLike: boolean;
+  onLike: () => void;
+  onCopyPrompt: () => void;
+  onPreview: () => void;
+}) {
+  const params = item.params || {};
+  const sizeLabel = item.width && item.height ? `${item.width} x ${item.height}` : String(params.size || "-");
+  return (
+    <article className="square-card">
+      <button className="square-card-image" type="button" title="预览作品" onClick={onPreview}>
+        <img src={item.thumbnailUrl} alt={item.caption || item.prompt} loading="lazy" decoding="async" />
+        <span>{item.pageLabel || item.recommenderLabel}</span>
+        <strong>
+          <Maximize2 size={15} />
+          预览
+        </strong>
+      </button>
+      <div className="square-card-body">
+        <div className="square-card-title">
+          <strong title={item.caption || item.prompt}>{item.caption || "未命名作品"}</strong>
+          <small>{formatDate(item.createdAt)} · {item.recommenderLabel}</small>
+        </div>
+        <div className="square-card-tags">
+          <span>{item.model}</span>
+          <span>{String(params.aspectRatio || item.aspectRatio || "-")}</span>
+          <span>{String(params.resolution || DEFAULT_IMAGE_RESOLUTION)}</span>
+          <span>{sizeLabel}</span>
+        </div>
+        <p title={item.prompt}>{item.prompt}</p>
+        <div className="square-card-actions">
+          <button
+            type="button"
+            className={`square-like-button ${item.likedByRequester ? "liked" : ""}`}
+            disabled={!apiKeyReady || pendingLike}
+            title={apiKeyReady ? item.likedByRequester ? "取消点赞" : "点赞" : "配置 API Key 后可点赞"}
+            onClick={onLike}
+          >
+            {pendingLike ? <Loader2 size={15} className="spin" /> : <Heart size={15} />}
+            <span>{item.likeCount}</span>
+          </button>
+          <button type="button" className="icon-button" title="复制提示词" onClick={onCopyPrompt}>
+            <Copy size={15} />
+          </button>
+          <button type="button" className="icon-button" title="预览作品" onClick={onPreview}>
+            <Maximize2 size={15} />
+          </button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function SquarePreviewModal({
+  item,
+  apiKeyReady,
+  pendingLike,
+  onClose,
+  onLike,
+  onCopyPrompt,
+  onDownload,
+}: {
+  item: SquareFeedItem;
+  apiKeyReady: boolean;
+  pendingLike: boolean;
+  onClose: () => void;
+  onLike: () => void;
+  onCopyPrompt: () => void;
+  onDownload: () => void;
+}) {
+  const params = item.params || {};
+  const sizeLabel = item.width && item.height ? `${item.width} x ${item.height}` : String(params.size || "-");
+  const promptTitle = item.caption || "广场作品";
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="square-preview-modal" role="dialog" aria-modal="true" aria-label="广场作品预览">
+      <button className="preview-backdrop" type="button" aria-label="关闭预览" onClick={onClose} />
+      <div className="square-preview-shell">
+        <div className="square-preview-stage">
+          <img src={item.thumbnailUrl} alt={promptTitle} />
+        </div>
+        <aside className="square-preview-side">
+          <div className="preview-head">
+            <div>
+              <strong title={promptTitle}>{promptTitle}</strong>
+              <span>{formatDate(item.createdAt)} · {item.recommenderLabel}</span>
+            </div>
+            <button type="button" className="icon-button" onClick={onClose} title="关闭">
+              <X size={17} />
+            </button>
+          </div>
+          <div className="square-preview-meta">
+            <span>{item.model}</span>
+            <span>{String(params.aspectRatio || item.aspectRatio || "-")}</span>
+            <span>{String(params.resolution || DEFAULT_IMAGE_RESOLUTION)}</span>
+            <span>{sizeLabel}</span>
+            {item.pageLabel && <span>{item.pageLabel}</span>}
+          </div>
+          <div className="square-preview-prompt">{item.prompt}</div>
+          <div className="square-preview-actions">
+            <button
+              type="button"
+              className={`square-like-button ${item.likedByRequester ? "liked" : ""}`}
+              disabled={!apiKeyReady || pendingLike}
+              title={apiKeyReady ? item.likedByRequester ? "取消点赞" : "点赞" : "配置 API Key 后可点赞"}
+              onClick={onLike}
+            >
+              {pendingLike ? <Loader2 size={15} className="spin" /> : <Heart size={15} />}
+              <span>{item.likeCount}</span>
+            </button>
+            <button type="button" className="subtle-button" onClick={onCopyPrompt}>
+              <Copy size={15} />
+              复制提示词
+            </button>
+            <button type="button" className="subtle-button" onClick={onDownload}>
+              <Download size={15} />
+              下载预览图
+            </button>
+          </div>
+        </aside>
+      </div>
+    </div>
   );
 }
 
@@ -7063,6 +8931,9 @@ const JobCard = memo(function JobCard({
   onPreview,
   onDownload,
   onCopyPrompt,
+  onRecommend,
+  recommendState,
+  canRecommend,
 }: {
   job: Job;
   highlighted: boolean;
@@ -7075,6 +8946,9 @@ const JobCard = memo(function JobCard({
   onPreview: () => void;
   onDownload: () => void;
   onCopyPrompt: () => void;
+  onRecommend: () => void;
+  recommendState?: SquareRecommendStatus;
+  canRecommend: boolean;
 }) {
   const [tickNow, setTickNow] = useState(() => Date.now());
   useEffect(() => {
@@ -7150,6 +9024,21 @@ const JobCard = memo(function JobCard({
             </div>
           </div>
         )}
+        {job.status === "success" && job.imageUrl && (
+          <button
+            type="button"
+            className={`tile-square-action ${recommendState?.status || ""}`}
+            title={canRecommend ? recommendState?.message || "推荐到广场" : "配置 API Key 后可推荐到广场"}
+            disabled={!canRecommend || recommendState?.status === "submitting"}
+            onClick={(event) => {
+              event.stopPropagation();
+              onRecommend();
+            }}
+          >
+            {recommendState?.status === "submitting" ? <Loader2 size={13} className="spin" /> : <ExternalLink size={13} />}
+            <span>{recommendState?.status === "success" ? "已推荐" : recommendState?.status === "submitting" ? "推荐中" : "推荐广场"}</span>
+          </button>
+        )}
       </div>
 
       <div className="tile-body">
@@ -7224,7 +9113,9 @@ const JobCard = memo(function JobCard({
   previous.highlighted === next.highlighted &&
   previous.selected === next.selected &&
   previous.selectionMode === next.selectionMode &&
-  previous.selectable === next.selectable
+  previous.selectable === next.selectable &&
+  previous.recommendState === next.recommendState &&
+  previous.canRecommend === next.canRecommend
 );
 
 function SidebarToggleButton({
@@ -7356,6 +9247,226 @@ function ConfirmDialog({
           <button type="button" className="subtle-button danger solid" onClick={onConfirm}>
             <Trash2 size={16} />
             {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AgentModeSwitch({
+  enabled,
+  status,
+  onToggle,
+}: {
+  enabled: boolean;
+  status: AgentModeStatus;
+  onToggle: () => void;
+}) {
+  return (
+    <div className={`agent-mode-switch ${enabled ? "is-on" : "is-off"} status-${status}`}>
+      <div className="agent-mode-switch-copy">
+        <strong>{AGENT_MODE_NAME}</strong>
+        <span>{enabled ? "理解任务并自动拆解" : "自动编排单图、多图与宣传画册"}</span>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={enabled}
+        className={`agent-mode-toggle ${enabled ? "is-on" : "is-off"}`}
+        onClick={onToggle}
+        title={enabled ? "关闭 Agent 模式 A" : "开启 Agent 模式 A"}
+      >
+        <span className="agent-mode-toggle-track">
+          <span className="agent-mode-toggle-thumb">
+            {enabled ? <Bot size={14} /> : <WandSparkles size={14} />}
+          </span>
+        </span>
+      </button>
+    </div>
+  );
+}
+
+function AgentModeStatusPanel({
+  state,
+  onClear,
+  onReanalyze,
+}: {
+  state: AgentModeState;
+  onClear: () => void;
+  onReanalyze: () => void;
+}) {
+  if (!state.message && state.status === "idle") return null;
+  const icon = state.status === "analyzing" || state.status === "receiving" || state.status === "executing"
+    ? <Loader2 size={16} className="spin" />
+    : state.status === "error"
+      ? <AlertCircle size={16} />
+      : state.status === "planned"
+        ? <Bot size={16} />
+        : <CheckCircle2 size={16} />;
+  return (
+    <div className={`agent-mode-status-panel ${state.status}`} role="status" aria-live="polite">
+      <div className="agent-mode-status-head">
+        <div className="agent-mode-status-mark">{icon}</div>
+        <div>
+          <strong>
+            {state.status === "analyzing"
+              ? "正在理解任务"
+              : state.status === "receiving"
+                ? "AI 输出中"
+              : state.status === "needs_confirmation"
+                ? "等待确认"
+                : state.status === "planned"
+                  ? "画册规划已准备好"
+                  : state.status === "executing"
+                    ? "任务已进入队列"
+                    : state.status === "error"
+                      ? "解析失败"
+                      : AGENT_MODE_NAME}
+          </strong>
+          <span>{state.message}</span>
+          {(state.streamChunks || state.streamCharacters) && (
+            <small className="agent-mode-status-progress">
+              {`进度 · ${state.streamChunks || 0} 段 / ${state.streamCharacters || 0} 字`}
+            </small>
+          )}
+          {state.streamPreview && (
+            <pre className="agent-mode-status-stream">{state.streamPreview}</pre>
+          )}
+          {state.error && <small>{state.error}</small>}
+        </div>
+      </div>
+      <div className="agent-mode-status-actions">
+        {(state.status === "planned" || state.status === "needs_confirmation" || state.status === "error") && (
+          <button type="button" className="subtle-button" title="重新分析当前需求" onClick={onReanalyze}>
+            <RefreshCw size={15} />
+            重新分析
+          </button>
+        )}
+        {state.status !== "analyzing" && state.status !== "receiving" && (
+          <button type="button" className="icon-button" title="清除 Agent 状态" onClick={onClear}>
+            <X size={15} />
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AgentModePlanModal({
+  plan,
+  onCancel,
+  onConfirm,
+  onReanalyze,
+}: {
+  plan: AgentModeAnalysisResult;
+  onCancel: () => void;
+  onConfirm: () => void;
+  onReanalyze: () => void;
+}) {
+  return (
+    <div className="confirm-modal" role="dialog" aria-modal="true" aria-label="Agent 任务拆解">
+      <button className="confirm-backdrop" type="button" aria-label="关闭 Agent 任务拆解" onClick={onCancel} />
+      <div className="confirm-card agent-plan-modal">
+        <div className="agent-plan-modal-head">
+          <div>
+            <strong>{AGENT_MODE_NAME} 任务拆解</strong>
+            <p>{plan.reasoningSummary}</p>
+          </div>
+          <span className={`risk-badge ${plan.estimatedCostLevel === "high" ? "high" : plan.estimatedCostLevel === "medium" ? "medium" : "low"}`}>
+            {plan.estimatedCostLevel === "high" ? "高消耗" : plan.estimatedCostLevel === "medium" ? "中消耗" : "低消耗"}
+          </span>
+        </div>
+        <div className="agent-plan-modal-list">
+          {plan.jobs.map((job, index) => (
+            <article className="agent-plan-job-card" key={job.id || `${job.title}-${index}`}>
+              <div className="agent-plan-job-head">
+                <strong>{job.title}</strong>
+                <small>{job.count || 1} 张 · {job.aspectRatio || "自动比例"} · {job.resolution || "自动清晰度"}</small>
+              </div>
+              {job.objective && <span className="agent-plan-job-objective">{job.objective}</span>}
+              <p>{job.prompt}</p>
+            </article>
+          ))}
+        </div>
+        <div className="confirm-actions">
+          <button type="button" className="subtle-button" onClick={onReanalyze}>
+            <RefreshCw size={15} />
+            重新分析
+          </button>
+          <button type="button" className="subtle-button" onClick={onCancel}>
+            返回编辑
+          </button>
+          <button type="button" className="primary-action compact" onClick={onConfirm}>
+            <ArrowRight size={15} />
+            确认并生成 {plan.jobs.reduce((sum, job) => sum + (job.count || 1), 0)} 张
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BrochurePlannerModal({
+  project,
+  onCancel,
+  onGenerateBoards,
+  onReanalyze,
+}: {
+  project: AgentModeBrochureProject;
+  onCancel: () => void;
+  onGenerateBoards: () => void;
+  onReanalyze: () => void;
+}) {
+  return (
+    <div className="confirm-modal" role="dialog" aria-modal="true" aria-label="宣传画册规划">
+      <button className="confirm-backdrop" type="button" aria-label="关闭宣传画册规划" onClick={onCancel} />
+      <div className="confirm-card brochure-plan-modal">
+        <div className="agent-plan-modal-head">
+          <div>
+            <strong>{project.title}</strong>
+            <p>{project.summary}</p>
+          </div>
+          <span className="brochure-plan-count">{project.pageCount} 页</span>
+        </div>
+        <div className="brochure-plan-meta">
+          <span>{project.companyName || "未指定公司名"}</span>
+          <span>{project.industry || "行业待细化"}</span>
+          <span>{project.purpose || "公司宣传"}</span>
+        </div>
+        <div className="brochure-plan-section">
+          <strong>页结构</strong>
+          <div className="brochure-outline-list">
+            {project.outline.map((page) => (
+              <div className="brochure-outline-item" key={`${page.pageNo}-${page.role}`}>
+                <span>#{page.pageNo}</span>
+                <div>
+                  <strong>{page.title}</strong>
+                  <small>{page.objective}</small>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="brochure-plan-section">
+          <strong>推荐模板方向</strong>
+          <div className="brochure-style-chip-row">
+            {project.styleDirections.map((direction) => (
+              <span key={direction}>{direction}</span>
+            ))}
+          </div>
+        </div>
+        <div className="confirm-actions">
+          <button type="button" className="subtle-button" onClick={onReanalyze}>
+            <RefreshCw size={15} />
+            重新分析
+          </button>
+          <button type="button" className="subtle-button" onClick={onCancel}>
+            稍后再说
+          </button>
+          <button type="button" className="primary-action compact" onClick={onGenerateBoards}>
+            <WandSparkles size={15} />
+            生成整本模板板
           </button>
         </div>
       </div>
@@ -7532,11 +9643,17 @@ function ImagePreviewModal({
   onClose,
   onDownload,
   onCopyPrompt,
+  onRecommend,
+  recommendState,
+  canRecommend,
 }: {
   item: PreviewItem;
   onClose: () => void;
   onDownload: () => void;
   onCopyPrompt: () => void;
+  onRecommend: () => void;
+  recommendState?: SquareRecommendStatus;
+  canRecommend: boolean;
 }) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const previewClass = aspectClass(item.width, item.height, item.params.aspectRatio);
@@ -7581,6 +9698,21 @@ function ImagePreviewModal({
               <button type="button" className="icon-button" onClick={() => setIsFullscreen(false)} title="退出全屏">
                 <X size={17} />
               </button>
+            </div>
+          )}
+          {hasImage && (
+            <div className="preview-square-toolbar">
+              <button
+                type="button"
+                className={`subtle-button ${recommendState?.status === "success" ? "square-success" : ""}`}
+                title={canRecommend ? recommendState?.message || "推荐到广场" : "配置 API Key 后可推荐到广场"}
+                disabled={!canRecommend || recommendState?.status === "submitting"}
+                onClick={onRecommend}
+              >
+                {recommendState?.status === "submitting" ? <Loader2 size={15} className="spin" /> : <ExternalLink size={15} />}
+                {recommendState?.status === "success" ? "已推荐到广场" : recommendState?.status === "submitting" ? "推荐中" : "推荐到广场"}
+              </button>
+              {recommendState?.message && <span>{recommendState.message}</span>}
             </div>
           )}
         </div>

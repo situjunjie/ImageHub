@@ -7,7 +7,7 @@ import {
   scryptSync,
   timingSafeEqual,
 } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 import { defineConfig, type PluginOption, type ViteDevServer } from "vite";
@@ -82,7 +82,7 @@ type AdminUser = {
 };
 
 type RequestLogStatus = "running" | "success" | "error";
-type RequestLogType = "image_generation" | "prompt_analysis";
+type RequestLogType = "image_generation" | "prompt_analysis" | "agent_analysis";
 
 type RequestLog = {
   requestId: string;
@@ -150,17 +150,135 @@ type AdminStore = {
   auditLogs: AdminAuditLog[];
 };
 
+type SquareFeedTab = "latest" | "hot" | "top_day" | "top_week" | "top_month";
+type SquareActionResult = "added" | "replaced" | "rejected" | "liked" | "unliked" | "noop";
+
+type SquareItem = {
+  id: string;
+  imageId: string;
+  requestId?: string;
+  thumbnailDataUrl: string;
+  imageHash: string;
+  prompt: string;
+  caption: string;
+  model: string;
+  params: Record<string, unknown>;
+  width?: number;
+  height?: number;
+  aspectRatio?: string;
+  sourceType: string;
+  reasonPlan?: unknown;
+  recommenderHash: string;
+  recommenderLabel: string;
+  pageLabel?: string;
+  active: boolean;
+  featured?: boolean;
+  likeCount: number;
+  qualityScore: number;
+  trustScore: number;
+  createdAt: number;
+  updatedAt: number;
+  replacedById?: string;
+};
+
+type SquareRecommendLog = {
+  id: string;
+  requestId: string;
+  apiKeyHash: string;
+  imageId?: string;
+  itemId?: string;
+  action: SquareActionResult;
+  result: "success" | "rejected" | "error";
+  reasonCode: string;
+  replacedItemId?: string;
+  remainingDailyQuota: number;
+  remainingShelfSlots: number;
+  ipHash: string;
+  uaHash: string;
+  promptHash?: string;
+  imageHash?: string;
+  sourceType?: string;
+  timestamp: number;
+};
+
+type SquareLikeLog = {
+  id: string;
+  requestId: string;
+  apiKeyHash: string;
+  itemId: string;
+  action: "like" | "unlike";
+  result: "success" | "rejected" | "noop" | "error";
+  reasonCode: string;
+  likeCount: number;
+  remainingLikeQuota: number;
+  ipHash: string;
+  uaHash: string;
+  timestamp: number;
+};
+
+type SquareLikeState = {
+  apiKeyHash: string;
+  itemId: string;
+  liked: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type SquareQuotaDaily = {
+  apiKeyHash: string;
+  dateKey: string;
+  dailyRecommendUsed: number;
+  dailyLikeUsed: number;
+  firstSeenAt: number;
+  updatedAt: number;
+};
+
+type SquareModerationAudit = {
+  id: string;
+  requestId: string;
+  apiKeyHash: string;
+  itemId?: string;
+  imageId?: string;
+  event: string;
+  reasonCode: string;
+  severity: "low" | "medium" | "high";
+  ipHash: string;
+  uaHash: string;
+  timestamp: number;
+  detail?: unknown;
+};
+
+type SquareStore = {
+  items: SquareItem[];
+  recommendLogs: SquareRecommendLog[];
+  likeLogs: SquareLikeLog[];
+  likes: SquareLikeState[];
+  quotas: SquareQuotaDaily[];
+  moderationAudits: SquareModerationAudit[];
+};
+
 const API_TIMEOUT_MS = 300_000;
 const MAX_REQUEST_BYTES = 60 * 1024 * 1024;
 const DEFAULT_PROTOCOL: ImageProtocol = "custom-openai";
+const GPT_IMAGE_2_MODEL = "gpt-image-2";
+const GPT_IMAGE_2_PRO_MODEL = "gpt-image-2-pro";
+const GPT_IMAGE_2_FAMILY_MODEL = "gpt-5.4-image-2";
+const GEMINI_3_PRO_IMAGE_MODEL = "gemini-3-pro-image-preview";
+const GEMINI_NATIVE_API_PREFIX = "/v1beta";
 const ALLOWED_API_BASE_URLS = ["https://ai.gigimed.cn/"];
 const SESSION_COOKIE = "image_studio_admin_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const DATA_DIR = join(process.cwd(), ".data");
 const ADMIN_STORE_PATH = join(DATA_DIR, "admin-store.json");
-const FRONTEND_VERSION_PATHS = ["src", "index.html", "package.json", "vite.config.ts"];
+const SQUARE_STORE_PATH = join(DATA_DIR, "square-store.json");
 const REFERENCE_TEMP_TTL_MS = 1000 * 60 * 10;
 const PUBLIC_REFERENCE_BASE_URL = "https://imagehub.taijiai.online";
+const SQUARE_TIME_ZONE = "Asia/Shanghai";
+const SQUARE_SHELF_LIMIT = 4;
+const SQUARE_DAILY_RECOMMEND_LIMIT = 10;
+const SQUARE_DAILY_LIKE_LIMIT = 10;
+const SQUARE_MAX_FEED_LIMIT = 20;
+const SQUARE_MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
 const temporaryReferences = new Map<string, {
   bytes: Buffer;
@@ -169,51 +287,67 @@ const temporaryReferences = new Map<string, {
   expiresAt: number;
 }>();
 
-function formatFrontendVersion(value: number) {
-  const date = new Date(value);
+const FRONTEND_BUILD_TIME_ZONE = "Asia/Shanghai";
+const FRONTEND_BUILD_DATE = new Date();
+
+function frontendDateParts(date: Date) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: FRONTEND_BUILD_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+  return Object.fromEntries(
+    formatter.formatToParts(date)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  ) as Record<"year" | "month" | "day" | "hour" | "minute" | "second", string>;
+}
+
+function formatFrontendVersion(date: Date) {
+  const parts = frontendDateParts(date);
   const pad = (item: number, length = 2) => String(item).padStart(length, "0");
   return [
-    date.getFullYear(),
-    pad(date.getMonth() + 1),
-    pad(date.getDate()),
-    pad(date.getHours()),
-    pad(date.getMinutes()),
-    pad(date.getSeconds()),
+    parts.year,
+    parts.month,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
     pad(date.getMilliseconds(), 3),
   ].join("");
 }
 
-function latestModifiedAt(path: string): number {
-  if (!existsSync(path)) return 0;
-  const stat = statSync(path);
-  if (!stat.isDirectory()) return stat.mtimeMs;
-  return readdirSync(path)
-    .filter((item) => !item.startsWith("."))
-    .reduce((latest, item) => Math.max(latest, latestModifiedAt(join(path, item))), stat.mtimeMs);
+function formatFrontendBuiltAtLocal(date: Date) {
+  const parts = frontendDateParts(date);
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}.${String(date.getMilliseconds()).padStart(3, "0")} ${FRONTEND_BUILD_TIME_ZONE}`;
 }
 
 function createFrontendBuildVersion() {
-  if (process.env.FRONTEND_BUILD_VERSION) return process.env.FRONTEND_BUILD_VERSION;
-  const latest = FRONTEND_VERSION_PATHS.reduce(
-    (maxTime, path) => Math.max(maxTime, latestModifiedAt(join(process.cwd(), path))),
-    0,
-  );
-  return formatFrontendVersion(latest || Date.now());
+  const explicitVersion = process.env.FRONTEND_BUILD_VERSION?.trim();
+  if (explicitVersion) return explicitVersion.replace(/[^a-zA-Z0-9._-]/g, "");
+  return formatFrontendVersion(FRONTEND_BUILD_DATE);
 }
 
 const FRONTEND_BUILD_VERSION = createFrontendBuildVersion();
 const FRONTEND_BUILD_INFO = {
   version: FRONTEND_BUILD_VERSION,
-  builtAt: new Date().toISOString(),
+  builtAt: FRONTEND_BUILD_DATE.toISOString(),
+  builtAtLocal: formatFrontendBuiltAtLocal(FRONTEND_BUILD_DATE),
+  timeZone: FRONTEND_BUILD_TIME_ZONE,
 };
 
 const adminSessions = new Map<string, { username: string; expiresAt: number }>();
 
 const DEFAULT_MODELS: Record<ImageProtocol, string[]> = {
-  "custom-openai": ["gpt-image-2", "gpt-5.4-image-2"],
-  "openai-images": ["gpt-image-2", "gpt-5.4-image-2"],
+  "custom-openai": [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_PRO_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
+  "openai-images": [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_PRO_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
   "openai-responses": ["gpt-4.1", "gpt-4.1-mini"],
-  "gemini-native": ["gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"],
+  "gemini-native": [GEMINI_3_PRO_IMAGE_MODEL, "gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"],
   "gemini-openai": ["gemini-2.5-flash-image"],
   "google-imagen": ["imagen-4.0-generate-001", "imagen-4.0-ultra-generate-001", "imagen-3.0-generate-002"],
   "stability-core": ["stable-image-core", "stable-image-ultra"],
@@ -318,6 +452,54 @@ function writeAdminStore(store: AdminStore) {
   writeFileSync(ADMIN_STORE_PATH, JSON.stringify(store, null, 2));
 }
 
+function emptySquareStore(): SquareStore {
+  return {
+    items: [],
+    recommendLogs: [],
+    likeLogs: [],
+    likes: [],
+    quotas: [],
+    moderationAudits: [],
+  };
+}
+
+function ensureSquareStore() {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  if (!existsSync(SQUARE_STORE_PATH)) {
+    writeFileSync(SQUARE_STORE_PATH, JSON.stringify(emptySquareStore(), null, 2));
+  }
+}
+
+function readSquareStore(): SquareStore {
+  ensureSquareStore();
+  try {
+    const parsed = JSON.parse(readFileSync(SQUARE_STORE_PATH, "utf8"));
+    return {
+      ...emptySquareStore(),
+      ...parsed,
+      items: Array.isArray(parsed.items) ? parsed.items : [],
+      recommendLogs: Array.isArray(parsed.recommendLogs) ? parsed.recommendLogs : [],
+      likeLogs: Array.isArray(parsed.likeLogs) ? parsed.likeLogs : [],
+      likes: Array.isArray(parsed.likes) ? parsed.likes : [],
+      quotas: Array.isArray(parsed.quotas) ? parsed.quotas : [],
+      moderationAudits: Array.isArray(parsed.moderationAudits) ? parsed.moderationAudits : [],
+    };
+  } catch {
+    return emptySquareStore();
+  }
+}
+
+function writeSquareStore(store: SquareStore) {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  store.items = store.items.slice(0, 2500);
+  store.recommendLogs = store.recommendLogs.slice(0, 5000);
+  store.likeLogs = store.likeLogs.slice(0, 8000);
+  store.likes = store.likes.slice(0, 12000);
+  store.quotas = store.quotas.slice(0, 5000);
+  store.moderationAudits = store.moderationAudits.slice(0, 5000);
+  writeFileSync(SQUARE_STORE_PATH, JSON.stringify(store, null, 2));
+}
+
 function appendAuditLog(username: string, action: string, detail?: string) {
   const store = readAdminStore();
   store.auditLogs.unshift({
@@ -365,6 +547,75 @@ function clearSessionCookie(res: ServerResponse) {
 function hashClientIp(req: IncomingMessage) {
   const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "");
   return createHash("sha256").update(ip).digest("hex").slice(0, 16);
+}
+
+function hashText(value: unknown, length = 32) {
+  return createHash("sha256").update(String(value ?? "")).digest("hex").slice(0, length);
+}
+
+function hashApiKey(apiKey: string) {
+  return createHash("sha256").update(apiKey.trim()).digest("hex");
+}
+
+function squareDayKey(value = Date.now()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: SQUARE_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(value));
+  const record = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${record.year}-${record.month}-${record.day}`;
+}
+
+function getSquareQuota(store: SquareStore, apiKeyHash: string, dateKey = squareDayKey()) {
+  let quota = store.quotas.find((item) => item.apiKeyHash === apiKeyHash && item.dateKey === dateKey);
+  if (!quota) {
+    const now = Date.now();
+    quota = {
+      apiKeyHash,
+      dateKey,
+      dailyRecommendUsed: 0,
+      dailyLikeUsed: 0,
+      firstSeenAt: now,
+      updatedAt: now,
+    };
+    store.quotas.unshift(quota);
+  }
+  return quota;
+}
+
+function squareRemainingRecommendQuota(quota: SquareQuotaDaily) {
+  return Math.max(0, SQUARE_DAILY_RECOMMEND_LIMIT - quota.dailyRecommendUsed);
+}
+
+function squareRemainingLikeQuota(quota: SquareQuotaDaily) {
+  return Math.max(0, SQUARE_DAILY_LIKE_LIMIT - quota.dailyLikeUsed);
+}
+
+function squareClientMeta(req: IncomingMessage) {
+  return {
+    ipHash: hashClientIp(req),
+    uaHash: hashText(req.headers["user-agent"] || "", 16),
+  };
+}
+
+function getSquareAdminAuth(req: IncomingMessage): { ok: true; user: AdminUser } | { ok: false; status: number; error: string; mustChangePassword?: boolean } {
+  const session = getAdminSession(req);
+  const adminStore = readAdminStore();
+  const user = session ? adminStore.admins.find((admin) => admin.username === session.username) : undefined;
+  if (!session || !user) {
+    return { ok: false, status: 401, error: "未登录" };
+  }
+  if (user.mustChangePassword) {
+    return { ok: false, status: 403, error: "首次登录必须修改密码", mustChangePassword: true };
+  }
+  return { ok: true, user };
+}
+
+function squareItemForExport(item: SquareItem) {
+  const { thumbnailDataUrl, ...safeItem } = item;
+  return safeItem;
 }
 
 function truncateText(value: unknown, max = 2000) {
@@ -530,7 +781,7 @@ function updateRequestLog(requestId: string, patch: Partial<RequestLog>) {
 
 function generationEndpointLabel(protocol: ImageProtocol, model = "", referenceCount = 0) {
   if (protocol === "openai-responses") return "/v1/responses";
-  if (protocol === "gemini-native") return `/models/${modelName(model)}:generateContent`;
+  if (protocol === "gemini-native") return `${GEMINI_NATIVE_API_PREFIX}/models/${modelName(model)}:generateContent`;
   if (protocol === "google-imagen") return `/models/${modelName(model)}:predict`;
   if (protocol === "stability-core") {
     return String(model).includes("ultra")
@@ -573,6 +824,174 @@ function getProtocol(value: unknown): ImageProtocol {
   return typeof value === "string" && PROTOCOLS.includes(value as ImageProtocol)
     ? (value as ImageProtocol)
     : DEFAULT_PROTOCOL;
+}
+
+function getRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function getNestedString(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function getNestedNumber(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function imageBytesFromDataUrl(dataUrl: string) {
+  const base64 = dataUrl.match(/^data:[^;]+;base64,(.*)$/)?.[1] || dataUrl;
+  return Math.round((base64.replace(/\s+/g, "").length * 3) / 4);
+}
+
+function hashImageDataUrl(dataUrl: string) {
+  const base64 = dataUrl.match(/^data:[^;]+;base64,(.*)$/)?.[1] || dataUrl;
+  return createHash("sha256").update(base64.replace(/\s+/g, "")).digest("hex");
+}
+
+function normalizeSquareFeedTab(value: string | null): SquareFeedTab {
+  if (value === "hot" || value === "top_day" || value === "top_week" || value === "top_month") return value;
+  return "latest";
+}
+
+function squareCursorOffset(value: string | null) {
+  if (!value) return 0;
+  const parsedDirect = Number(value);
+  if (Number.isFinite(parsedDirect) && parsedDirect >= 0) return Math.floor(parsedDirect);
+  try {
+    const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    const offset = typeof decoded.offset === "number" ? decoded.offset : 0;
+    return Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function squareNextCursor(offset: number) {
+  return Buffer.from(JSON.stringify({ offset }), "utf8").toString("base64url");
+}
+
+function squareActiveItems(store: SquareStore) {
+  return store.items.filter((item) => item.active !== false);
+}
+
+function squareShelfCount(store: SquareStore, apiKeyHash: string) {
+  return squareActiveItems(store).filter((item) => item.recommenderHash === apiKeyHash).length;
+}
+
+function squareQualityScore(width?: number, height?: number, prompt = "") {
+  const longest = Math.max(width || 0, height || 0);
+  const dimensionScore = longest >= 1024 ? 86 : longest >= 768 ? 74 : 62;
+  const promptScore = prompt.trim().length >= 20 ? 82 : 68;
+  return Math.round(dimensionScore * 0.72 + promptScore * 0.28);
+}
+
+function squareRankScore(item: SquareItem, tab: SquareFeedTab, now = Date.now()) {
+  const periodMs = tab === "top_day"
+    ? 24 * 60 * 60 * 1000
+    : tab === "top_week"
+      ? 7 * 24 * 60 * 60 * 1000
+      : 30 * 24 * 60 * 60 * 1000;
+  const hotPeriodMs = tab === "hot" ? 3 * 24 * 60 * 60 * 1000 : periodMs;
+  const ageMs = Math.max(0, now - item.createdAt);
+  const recencyScore = Math.max(0, Math.round(100 * Math.exp(-ageMs / hotPeriodMs)));
+  const likeScore = Math.min(100, Math.round(Math.log1p(item.likeCount || 0) * 32));
+  const qualityScore = Math.max(0, Math.min(100, item.qualityScore || 70));
+  const trustScore = Math.max(0, Math.min(100, item.trustScore || 70));
+  const manualBoost = item.featured ? 8 : 0;
+  return Math.round((recencyScore * 0.45 + likeScore * 0.35 + qualityScore * 0.15 + trustScore * 0.05 + manualBoost) * 100) / 100;
+}
+
+let squareRankScoreCache = new WeakMap<SquareItem, number>();
+
+function sortSquareItems(items: SquareItem[], tab: SquareFeedTab) {
+  const now = Date.now();
+  squareRankScoreCache = new WeakMap();
+  if (tab === "latest") {
+    for (const item of items) squareRankScoreCache.set(item, squareRankScore(item, tab, now));
+    return [...items].sort((a, b) => b.createdAt - a.createdAt);
+  }
+  const periodMs = tab === "top_day"
+    ? 24 * 60 * 60 * 1000
+    : tab === "top_week"
+      ? 7 * 24 * 60 * 60 * 1000
+      : tab === "top_month"
+        ? 30 * 24 * 60 * 60 * 1000
+        : 0;
+  const scoped = periodMs > 0
+    ? items.filter((item) => item.createdAt >= now - periodMs)
+    : items;
+  for (const item of scoped) squareRankScoreCache.set(item, squareRankScore(item, tab, now));
+  return [...scoped].sort((a, b) => {
+    const scoreDiff = (squareRankScoreCache.get(b) ?? 0) - (squareRankScoreCache.get(a) ?? 0);
+    return scoreDiff || b.createdAt - a.createdAt;
+  });
+}
+
+function isLikedBy(store: SquareStore, apiKeyHash: string, itemId: string) {
+  return Boolean(store.likes.find((like) => like.apiKeyHash === apiKeyHash && like.itemId === itemId && like.liked));
+}
+
+function squareFeedItem(item: SquareItem, store: SquareStore, tab: SquareFeedTab, viewerApiKeyHash = "", cachedRankScore?: number) {
+  return {
+    id: item.id,
+    imageId: item.imageId,
+    requestId: item.requestId,
+    thumbnailUrl: `/api/square/image/${item.id}`,
+    prompt: item.prompt,
+    caption: item.caption,
+    model: item.model,
+    params: item.params,
+    width: item.width,
+    height: item.height,
+    aspectRatio: item.aspectRatio,
+    sourceType: item.sourceType,
+    reasonPlan: item.reasonPlan,
+    recommenderLabel: item.recommenderLabel,
+    pageLabel: item.pageLabel,
+    likeCount: item.likeCount || 0,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    rankScore: cachedRankScore ?? squareRankScore(item, tab),
+    likedByRequester: viewerApiKeyHash ? isLikedBy(store, viewerApiKeyHash, item.id) : false,
+  };
+}
+
+function appendSquareRecommendLog(store: SquareStore, log: Omit<SquareRecommendLog, "id" | "timestamp">) {
+  store.recommendLogs.unshift({
+    id: randomUUID(),
+    timestamp: Date.now(),
+    ...log,
+  });
+}
+
+function appendSquareLikeLog(store: SquareStore, log: Omit<SquareLikeLog, "id" | "timestamp">) {
+  store.likeLogs.unshift({
+    id: randomUUID(),
+    timestamp: Date.now(),
+    ...log,
+  });
+}
+
+function appendSquareModerationAudit(store: SquareStore, audit: Omit<SquareModerationAudit, "id" | "timestamp">) {
+  store.moderationAudits.unshift({
+    id: randomUUID(),
+    timestamp: Date.now(),
+    ...audit,
+  });
+}
+
+function moderationReasonForSquareText(prompt: string, caption = "") {
+  const text = `${prompt}\n${caption}`.toLowerCase();
+  if (/(nsfw|nude|porn|sex|色情|裸露|裸体|成人内容)/i.test(text)) return "blocked_sensitive_content";
+  if (prompt.length > 8000 || caption.length > 1000) return "abnormal_text_length";
+  return "";
+}
+
+function recentSquareRecommendCount(store: SquareStore, apiKeyHash: string, withinMs: number) {
+  const threshold = Date.now() - withinMs;
+  return store.recommendLogs.filter((log) => log.apiKeyHash === apiKeyHash && log.timestamp >= threshold).length;
 }
 
 function endpoint(baseUrl: string, path: string) {
@@ -797,14 +1216,40 @@ const SIZE_BY_RATIO: Record<string, string> = {
   "1:1": "1024x1024",
   "4:5": "1024x1280",
   "5:4": "1280x1024",
-  "3:4": "1024x1365",
-  "4:3": "1365x1024",
+  "3:4": "1152x1536",
+  "4:3": "1536x1152",
   "2:3": "1024x1536",
   "3:2": "1536x1024",
   "9:16": "1024x1792",
   "16:9": "1792x1024",
-  "21:9": "1792x768",
-  "9:21": "768x1792",
+  "21:9": "2016x864",
+  "9:21": "864x2016",
+};
+
+const PRO_2K_SIZE_BY_RATIO: Record<string, string> = {
+  "1:1": "2048x2048",
+  "4:5": "2048x2560",
+  "5:4": "2560x2048",
+  "3:4": "2304x3072",
+  "4:3": "3072x2304",
+  "2:3": "2048x3072",
+  "3:2": "3072x2048",
+  "9:16": "2160x3840",
+  "16:9": "3840x2160",
+  "21:9": "3840x1646",
+};
+
+const PRO_4K_SIZE_BY_RATIO: Record<string, string> = {
+  "1:1": "3840x3840",
+  "4:5": "3072x3840",
+  "5:4": "3840x3072",
+  "3:4": "2880x3840",
+  "4:3": "3840x2880",
+  "2:3": "2560x3840",
+  "3:2": "3840x2560",
+  "9:16": "2160x3840",
+  "16:9": "3840x2160",
+  "21:9": "3840x1646",
 };
 
 const RESOLUTION_MULTIPLIER: Record<string, number> = {
@@ -822,24 +1267,48 @@ function scaleSize(size: string, resolution = "1K") {
   if (multiplier === 1) return size;
   const [width, height] = size.split("x").map((item) => Number(item));
   if (!Number.isFinite(width) || !Number.isFinite(height)) return size;
-  return `${Math.round(width * multiplier)}x${Math.round(height * multiplier)}`;
+  const MAX_EDGE = 3840;
+  let w = Math.round(width * multiplier);
+  let h = Math.round(height * multiplier);
+  const longest = Math.max(w, h);
+  if (longest > MAX_EDGE) {
+    const factor = MAX_EDGE / longest;
+    w = Math.round(width * multiplier * factor);
+    h = Math.round(height * multiplier * factor);
+  }
+  return `${w}x${h}`;
 }
 
 function imageSizeForProtocol(request: GenerateRequest, protocol: ImageProtocol) {
-  if (protocol === "custom-openai" && isImage2Model(request.model) && request.aspectRatio) return request.aspectRatio;
+  if (isGptImage2Model(request.model) && !isGptImage2ProModel(request.model) && request.aspectRatio) {
+    return SIZE_BY_RATIO[request.aspectRatio] || SIZE_BY_RATIO["1:1"];
+  }
+  if (isGptImage2ProModel(request.model) && request.aspectRatio) {
+    const res = normalizeResolution(request.resolution);
+    if (res === "4K") return PRO_4K_SIZE_BY_RATIO[request.aspectRatio] || PRO_4K_SIZE_BY_RATIO["1:1"];
+    if (res === "2K") return PRO_2K_SIZE_BY_RATIO[request.aspectRatio] || PRO_2K_SIZE_BY_RATIO["1:1"];
+    return SIZE_BY_RATIO[request.aspectRatio] || SIZE_BY_RATIO["1:1"];
+  }
   return request.aspectRatio
     ? scaleSize(SIZE_BY_RATIO[request.aspectRatio] || SIZE_BY_RATIO["1:1"], request.resolution)
     : request.size || "auto";
 }
 
-function isImage2Model(model = "") {
-  const normalized = model.toLowerCase();
-  return normalized === "gpt-image-2" || normalized === "gpt-5.4-image-2" || normalized.includes("image-2");
+function normalizedModelId(model = "") {
+  return model.replace(/^models\//, "").trim().toLowerCase();
 }
 
-function imageGenerationSize(request: GenerateRequest) {
-  if (isImage2Model(request.model) && request.aspectRatio) return request.aspectRatio;
-  return request.size || request.aspectRatio || "auto";
+function isGptImage2Model(model = "") {
+  const normalized = normalizedModelId(model);
+  return normalized === GPT_IMAGE_2_MODEL || normalized === GPT_IMAGE_2_FAMILY_MODEL || normalized.includes("image-2");
+}
+
+function isGptImage2ProModel(model = "") {
+  return normalizedModelId(model) === GPT_IMAGE_2_PRO_MODEL;
+}
+
+function isGemini3ProImageModel(model = "") {
+  return normalizedModelId(model) === GEMINI_3_PRO_IMAGE_MODEL;
 }
 
 function dataUrlToGeminiPart(image: ReferenceImage) {
@@ -986,6 +1455,756 @@ function normalizeAnalysisPayload(value: unknown, analysisModel: string) {
     analysisModel,
     source: "ai",
   };
+}
+
+type AgentModeIntentType = "single_image" | "multi_image_batch" | "brochure_project" | "page_refine" | "unknown";
+type AgentModeCostLevel = "low" | "medium" | "high";
+type AgentModeJobSpec = {
+  id: string;
+  title: string;
+  prompt: string;
+  objective?: string;
+  negativePrompt?: string;
+  aspectRatio?: string;
+  size?: string;
+  resolution?: "1K" | "2K" | "4K";
+  quality?: string;
+  count?: number;
+};
+type AgentModeBrochurePage = {
+  pageNo: number;
+  role: string;
+  title: string;
+  objective: string;
+};
+type AgentModeBrochureProject = {
+  title: string;
+  companyName?: string;
+  industry?: string;
+  purpose?: string;
+  pageCount: number;
+  summary: string;
+  outline: AgentModeBrochurePage[];
+  styleDirections: string[];
+  requestPrompt?: string;
+};
+type AgentModeAnalysisResult = {
+  intentType: AgentModeIntentType;
+  confidence: number;
+  reasoningSummary: string;
+  estimatedCostLevel: AgentModeCostLevel;
+  requiresConfirmation: boolean;
+  autoExecute: boolean;
+  jobs: AgentModeJobSpec[];
+  brochureProject?: AgentModeBrochureProject;
+  analysisModel?: string;
+  source?: "ai" | "local";
+};
+
+const CHINESE_DIGITS: Record<string, number> = {
+  零: 0,
+  一: 1,
+  二: 2,
+  两: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+  六: 6,
+  七: 7,
+  八: 8,
+  九: 9,
+};
+
+function clampCount(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function parseNaturalCountToken(value = "") {
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  const arabic = normalized.match(/\d+/)?.[0];
+  if (arabic) return Number(arabic);
+  if (normalized === "十") return 10;
+  if (normalized.includes("十")) {
+    const [left, right] = normalized.split("十");
+    const leftValue = left ? (CHINESE_DIGITS[left] ?? 1) : 1;
+    const rightValue = right ? (CHINESE_DIGITS[right] ?? 0) : 0;
+    return leftValue * 10 + rightValue;
+  }
+  return CHINESE_DIGITS[normalized];
+}
+
+function normalizeAgentModeIntentType(value: unknown, fallback: AgentModeIntentType = "unknown"): AgentModeIntentType {
+  return value === "single_image"
+    || value === "multi_image_batch"
+    || value === "brochure_project"
+    || value === "page_refine"
+    || value === "unknown"
+    ? value
+    : fallback;
+}
+
+function normalizeAgentModeCostLevel(value: unknown, fallback: AgentModeCostLevel = "low"): AgentModeCostLevel {
+  return value === "low" || value === "medium" || value === "high" ? value : fallback;
+}
+
+function normalizeAgentModeJobSpec(
+  value: unknown,
+  fallback?: Partial<AgentModeJobSpec>,
+): AgentModeJobSpec {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const prompt = typeof record.prompt === "string" && record.prompt.trim()
+    ? record.prompt.trim()
+    : fallback?.prompt || "";
+  const id = typeof record.id === "string" && record.id.trim()
+    ? record.id.trim()
+    : fallback?.id || `job_${randomUUID().slice(0, 8)}`;
+  const count = typeof record.count === "number" && Number.isFinite(record.count)
+    ? clampCount(Math.round(record.count), 1, 8)
+    : clampCount(Math.round(fallback?.count || 1), 1, 8);
+  const resolution = record.resolution === "1K" || record.resolution === "2K" || record.resolution === "4K"
+    ? record.resolution
+    : fallback?.resolution;
+  return {
+    id,
+    title: typeof record.title === "string" && record.title.trim()
+      ? record.title.trim()
+      : fallback?.title || "图片任务",
+    prompt,
+    objective: typeof record.objective === "string" && record.objective.trim()
+      ? record.objective.trim()
+      : fallback?.objective,
+    negativePrompt: typeof record.negativePrompt === "string" && record.negativePrompt.trim()
+      ? record.negativePrompt.trim()
+      : fallback?.negativePrompt,
+    aspectRatio: typeof record.aspectRatio === "string" && record.aspectRatio.trim()
+      ? record.aspectRatio.trim()
+      : fallback?.aspectRatio,
+    size: typeof record.size === "string" && record.size.trim()
+      ? record.size.trim()
+      : fallback?.size,
+    resolution,
+    quality: typeof record.quality === "string" && record.quality.trim()
+      ? record.quality.trim()
+      : fallback?.quality,
+    count,
+  };
+}
+
+function normalizeAgentModeBrochurePage(
+  value: unknown,
+  index: number,
+): AgentModeBrochurePage {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const parsedPageNo = typeof record.pageNo === "number" && Number.isFinite(record.pageNo)
+    ? Math.max(1, Math.round(record.pageNo))
+    : index + 1;
+  return {
+    pageNo: parsedPageNo,
+    role: typeof record.role === "string" && record.role.trim() ? record.role.trim() : `page_${parsedPageNo}`,
+    title: typeof record.title === "string" && record.title.trim() ? record.title.trim() : `第 ${parsedPageNo} 页`,
+    objective: typeof record.objective === "string" && record.objective.trim()
+      ? record.objective.trim()
+      : "延续整本风格，完成本页的关键信息表达。",
+  };
+}
+
+function normalizeAgentModeBrochureProject(
+  value: unknown,
+  fallback?: Partial<AgentModeBrochureProject>,
+): AgentModeBrochureProject {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const fallbackOutline = Array.isArray(fallback?.outline) ? fallback.outline : [];
+  const outline = Array.isArray(record.outline)
+    ? record.outline
+      .map((item, index) => normalizeAgentModeBrochurePage(item, index))
+      .filter((item) => item.title)
+    : fallbackOutline;
+  const styleDirections = Array.isArray(record.styleDirections)
+    ? record.styleDirections
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(0, 6)
+    : (fallback?.styleDirections || []);
+  const pageCount = typeof record.pageCount === "number" && Number.isFinite(record.pageCount)
+    ? clampCount(Math.round(record.pageCount), 2, 20)
+    : clampCount(Math.round(fallback?.pageCount || outline.length || 8), 2, 20);
+  return {
+    title: typeof record.title === "string" && record.title.trim()
+      ? record.title.trim()
+      : fallback?.title || "宣传画册方案",
+    companyName: typeof record.companyName === "string" && record.companyName.trim()
+      ? record.companyName.trim()
+      : fallback?.companyName,
+    industry: typeof record.industry === "string" && record.industry.trim()
+      ? record.industry.trim()
+      : fallback?.industry,
+    purpose: typeof record.purpose === "string" && record.purpose.trim()
+      ? record.purpose.trim()
+      : fallback?.purpose,
+    pageCount,
+    summary: typeof record.summary === "string" && record.summary.trim()
+      ? record.summary.trim()
+      : fallback?.summary || `共 ${pageCount} 页的宣传画册规划。`,
+    outline: outline.length > 0 ? outline : fallbackOutline,
+    styleDirections: styleDirections.length > 0 ? styleDirections : (fallback?.styleDirections || []),
+    requestPrompt: typeof record.requestPrompt === "string" && record.requestPrompt.trim()
+      ? record.requestPrompt.trim()
+      : fallback?.requestPrompt,
+  };
+}
+
+function normalizeAgentModeAnalysisPayload(
+  value: unknown,
+  fallback: AgentModeAnalysisResult,
+  analysisModel: string,
+): AgentModeAnalysisResult {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const intentType = normalizeAgentModeIntentType(record.intentType, fallback.intentType);
+  const jobs = Array.isArray(record.jobs)
+    ? record.jobs
+      .map((item, index) => normalizeAgentModeJobSpec(item, fallback.jobs[index] || fallback.jobs[0]))
+      .filter((job) => Boolean(job.prompt))
+    : fallback.jobs;
+  const brochureProjectSource = record.brochureProject ?? record.project;
+  const brochureProject = brochureProjectSource
+    ? normalizeAgentModeBrochureProject(brochureProjectSource, fallback.brochureProject)
+    : fallback.brochureProject;
+  return {
+    intentType,
+    confidence: typeof record.confidence === "number" && Number.isFinite(record.confidence)
+      ? Math.max(0, Math.min(1, record.confidence))
+      : fallback.confidence,
+    reasoningSummary: typeof record.reasoningSummary === "string" && record.reasoningSummary.trim()
+      ? record.reasoningSummary.trim()
+      : fallback.reasoningSummary,
+    estimatedCostLevel: normalizeAgentModeCostLevel(record.estimatedCostLevel, fallback.estimatedCostLevel),
+    requiresConfirmation: typeof record.requiresConfirmation === "boolean"
+      ? record.requiresConfirmation
+      : fallback.requiresConfirmation,
+    autoExecute: typeof record.autoExecute === "boolean" ? record.autoExecute : fallback.autoExecute,
+    jobs: jobs.length > 0 ? jobs : fallback.jobs,
+    brochureProject: intentType === "brochure_project" || brochureProject ? brochureProject : undefined,
+    analysisModel,
+    source: "ai",
+  };
+}
+
+function countAgentModeImages(jobs: AgentModeJobSpec[]) {
+  return jobs.reduce((sum, job) => sum + Math.max(1, Math.round(job.count || 1)), 0);
+}
+
+function recommendedAgentAspectRatio(prompt: string, fallback = "1:1") {
+  if (/(封面|海报|竖版|人物全身|彩页封面)/.test(prompt)) return "3:4";
+  if (/(画册|宣传册|内页|横版|跨页|目录|手册)/.test(prompt)) return "4:3";
+  if (/(横幅|banner|页眉|头图|展板|宽屏)/i.test(prompt)) return "16:9";
+  if (/(logo|图标|头像|方图|方形)/i.test(prompt)) return "1:1";
+  return fallback;
+}
+
+function recommendedAgentResolution(prompt: string) {
+  if (/(宣传册|画册|海报|展板|印刷|高清|高分辨率|封面)/.test(prompt)) return "2K" as const;
+  return "1K" as const;
+}
+
+function detectRequestedImageCount(prompt: string, fallback = 1) {
+  const patterns = [
+    /(?:做|生成|出|要|需要|想要|帮我做)\s*([0-9一二三四五六七八九十两]+)\s*张/,
+    /([0-9一二三四五六七八九十两]+)\s*张(?:图|图片|海报|方案|视觉|kv)?/,
+    /一共\s*([0-9一二三四五六七八九十两]+)\s*张/,
+  ];
+  for (const pattern of patterns) {
+    const matched = prompt.match(pattern)?.[1];
+    const count = parseNaturalCountToken(matched || "");
+    if (count && count > 0) return clampCount(count, 1, 8);
+  }
+  return fallback;
+}
+
+function detectRequestedPageCount(prompt: string, fallback = 8) {
+  const patterns = [
+    /([0-9一二三四五六七八九十两]+)\s*页/,
+    /共\s*([0-9一二三四五六七八九十两]+)\s*页/,
+    /包含\s*([0-9一二三四五六七八九十两]+)\s*页/,
+  ];
+  for (const pattern of patterns) {
+    const matched = prompt.match(pattern)?.[1];
+    const count = parseNaturalCountToken(matched || "");
+    if (count && count > 0) return clampCount(count, 2, 20);
+  }
+  return fallback;
+}
+
+function extractCompanyName(prompt: string) {
+  const patterns = [
+    /(?:为|给|帮|替)\s*[「“"]?([^，。,.；;\s]{2,24}?公司)[」”"]?/,
+    /([A-Za-z0-9\u4e00-\u9fa5]{2,24}?公司)/,
+  ];
+  for (const pattern of patterns) {
+    const matched = prompt.match(pattern)?.[1]?.trim();
+    if (!matched) continue;
+    if (/^(我|你|他|她|它|帮我|给我|做一个|做个|一个|一家|某家|某个|这个|那个)/.test(matched)) continue;
+    if (/^(制造业公司|科技公司|公司|企业公司)$/.test(matched)) continue;
+    if (/(一个|一家|某家|某个).{0,8}公司$/.test(matched)) continue;
+    return matched;
+  }
+  return "";
+}
+
+function detectIndustry(prompt: string) {
+  const keywordMap: Array<{ pattern: RegExp; value: string }> = [
+    { pattern: /(科技|SaaS|软件|AI|人工智能|云服务|数据)/i, value: "科技" },
+    { pattern: /(制造|工业|工厂|设备|机械|供应链)/, value: "制造" },
+    { pattern: /(医疗|医药|生物|健康|医院)/, value: "医疗" },
+    { pattern: /(教育|培训|学校|课程)/, value: "教育" },
+    { pattern: /(地产|建筑|空间|园区|楼盘)/, value: "地产" },
+    { pattern: /(金融|银行|证券|投资|保险)/, value: "金融" },
+    { pattern: /(美妆|护肤|时尚|服饰|珠宝)/, value: "消费品牌" },
+    { pattern: /(餐饮|食品|饮品|咖啡|酒水)/, value: "餐饮消费" },
+  ];
+  return keywordMap.find((item) => item.pattern.test(prompt))?.value || "企业品牌";
+}
+
+function detectBrochurePurpose(prompt: string) {
+  if (/(宣传画册|宣传册|公司介绍|企业介绍|企业宣传|品牌手册)/.test(prompt)) return "公司宣传";
+  if (/(招商|加盟|投资人)/.test(prompt)) return "招商宣传";
+  if (/(产品|目录|样本|产品册)/.test(prompt)) return "产品目录";
+  if (/(品牌|企业形象)/.test(prompt)) return "品牌介绍";
+  if (/(年度|年报|总结)/.test(prompt)) return "年度介绍";
+  return "公司宣传";
+}
+
+function brochureStyleDirectionsFor(industry: string, prompt: string) {
+  if (industry === "科技") {
+    return ["科技蓝信息栅格", "极简白底产品提案感", "深色发布会视觉", "未来感数据界面风"];
+  }
+  if (industry === "制造") {
+    return ["工业蓝目录感", "黑银设备质感", "白底参数样本册", "展会招商海报感"];
+  }
+  if (industry === "医疗") {
+    return ["洁净白蓝专业感", "高可信研究型版式", "温和品牌手册感", "器械产品目录感"];
+  }
+  if (/(高端|奢华|精品|时尚)/.test(prompt)) {
+    return ["高端杂志感", "黑金品牌提案感", "留白大片感", "Editorial 视觉陈列风"];
+  }
+  return ["科技蓝信息栅格", "高端杂志感", "制造业目录感", "招商海报感"];
+}
+
+function splitPromptIntoSegments(prompt: string) {
+  const prepared = prompt
+    .replace(/\r/g, "")
+    .replace(/(?=第\s*[0-9一二三四五六七八九十两]+\s*(?:张|幅|图|页))/g, "\n")
+    .replace(/(?=\d+\s*[\.、\)]\s*)/g, "\n");
+  return prepared
+    .split(/\n+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function stripSegmentMarker(value: string) {
+  return value
+    .replace(/^\s*(?:[-*•]\s*)/, "")
+    .replace(/^\s*\d+\s*[\.、\)]\s*/, "")
+    .replace(/^\s*第\s*[0-9一二三四五六七八九十两]+\s*(?:张|幅|图|页)\s*[:：]?\s*/, "")
+    .trim();
+}
+
+function extractBrochureTopics(prompt: string) {
+  const candidates: Array<{ pattern: RegExp; role: string; title: string; objective: string }> = [
+    { pattern: /(品牌导语|品牌介绍|前言|导语)/, role: "intro", title: "品牌导语", objective: "概括品牌定位与主张，建立阅读预期。" },
+    { pattern: /(公司介绍|企业简介|企业介绍|公司简介)/, role: "profile", title: "企业简介", objective: "说明公司背景、规模、发展历程与核心业务。" },
+    { pattern: /(核心优势|优势介绍|竞争优势)/, role: "advantages", title: "核心优势", objective: "突出技术、团队、供应链或服务的差异化优势。" },
+    { pattern: /(产品展示|产品介绍|产品矩阵|服务矩阵|服务介绍)/, role: "products", title: "产品/服务矩阵", objective: "梳理主要产品线、解决方案或服务模块。" },
+    { pattern: /(应用场景|解决方案|场景展示)/, role: "scenarios", title: "应用场景", objective: "展示产品或服务在真实业务场景中的价值。" },
+    { pattern: /(案例|客户案例|项目案例|成功案例)/, role: "cases", title: "案例展示", objective: "通过项目案例强化可信度与落地能力。" },
+    { pattern: /(团队|资质|荣誉|认证)/, role: "team", title: "团队与资质", objective: "呈现团队实力、认证资质、荣誉和合作资源。" },
+    { pattern: /(合作方式|联系我们|联系方式|合作流程)/, role: "cta", title: "合作方式", objective: "明确合作流程、联系入口与行动指引。" },
+  ];
+  return candidates
+    .map((item) => ({ ...item, index: prompt.search(item.pattern) }))
+    .filter((item) => item.index >= 0)
+    .sort((a, b) => a.index - b.index)
+    .map(({ role, title, objective }) => ({ role, title, objective }));
+}
+
+function buildLocalBrochureProject(prompt: string): AgentModeBrochureProject {
+  const pageCount = detectRequestedPageCount(prompt, 8);
+  const companyName = extractCompanyName(prompt);
+  const industry = detectIndustry(prompt);
+  const purpose = detectBrochurePurpose(prompt);
+  const middleTemplates: Array<{ role: string; title: string; objective: string }> = [
+    { role: "intro", title: "品牌导语", objective: "概括品牌定位与主张，建立阅读预期。" },
+    { role: "profile", title: "企业简介", objective: "说明公司背景、规模、发展历程与核心业务。" },
+    { role: "advantages", title: "核心优势", objective: "突出技术、团队、供应链或服务的差异化优势。" },
+    { role: "products", title: "产品/服务矩阵", objective: "梳理主要产品线、解决方案或服务模块。" },
+    { role: "scenarios", title: "应用场景", objective: "展示产品或服务在真实业务场景中的价值。" },
+    { role: "cases", title: "案例展示", objective: "通过项目案例强化可信度与落地能力。" },
+    { role: "team", title: "团队与资质", objective: "呈现团队实力、认证资质、荣誉和合作资源。" },
+    { role: "cta", title: "合作方式", objective: "明确合作流程、联系入口与行动指引。" },
+  ];
+  const detectedTopics = extractBrochureTopics(prompt);
+  const mergedTemplates = [
+    ...detectedTopics,
+    ...middleTemplates.filter((template) => !detectedTopics.some((item) => item.role === template.role)),
+  ];
+  const outline: AgentModeBrochurePage[] = [{
+    pageNo: 1,
+    role: "cover",
+    title: "封面",
+    objective: "建立品牌第一印象，突出公司名、主视觉与宣传主题。",
+  }];
+  const middleCount = Math.max(0, pageCount - 2);
+  for (let index = 0; index < middleCount; index += 1) {
+    const template = mergedTemplates[index % mergedTemplates.length];
+    outline.push({
+      pageNo: index + 2,
+      role: template.role,
+      title: template.title,
+      objective: template.objective,
+    });
+  }
+  if (pageCount > 1) {
+    outline.push({
+      pageNo: pageCount,
+      role: "back_cover",
+      title: "封底",
+      objective: "收束品牌形象，保留联系方式或行动号召。",
+    });
+  }
+  const titleBase = companyName || `${industry}企业`;
+  const title = `${titleBase}${purpose === "产品目录" ? "产品画册" : "宣传画册"}`;
+  return {
+    title,
+    companyName: companyName || undefined,
+    industry,
+    purpose,
+    pageCount,
+    summary: `识别为 ${pageCount} 页的${purpose}画册需求，建议先生成整本模板板，再逐页细化。`,
+    outline,
+    styleDirections: brochureStyleDirectionsFor(industry, prompt),
+    requestPrompt: prompt,
+  };
+}
+
+function buildLocalAgentModeAnalysis(body: ProxyBody): AgentModeAnalysisResult {
+  const prompt = getString(body, "prompt");
+  const aspectRatio = getString(body, "aspectRatio") || "1:1";
+  const size = getString(body, "size") || undefined;
+  const quality = getString(body, "quality") || "auto";
+  const negativePrompt = getString(body, "negativePrompt") || undefined;
+  const pageRefineMatch = prompt.match(/第\s*([0-9一二三四五六七八九十两]+)\s*页.*(?:修改|改成|重做|调整|优化|替换|单独再改)/);
+  const brochureKeywordScore = [
+    /(画册|宣传册|宣传画册|彩页|brochure)/i.test(prompt),
+    /(封底|内页|页结构|页数|整本|版式模板)/.test(prompt),
+    /第\s*[0-9一二三四五六七八九十两]+\s*页/.test(prompt),
+  ].filter(Boolean).length;
+  if (pageRefineMatch && brochureKeywordScore > 0) {
+    const pageNo = parseNaturalCountToken(pageRefineMatch[1]) || 1;
+    return {
+      intentType: "page_refine",
+      confidence: 0.86,
+      reasoningSummary: `识别为宣传画册的单页调整需求，将按第 ${pageNo} 页单独重做。`,
+      estimatedCostLevel: "low",
+      requiresConfirmation: false,
+      autoExecute: true,
+      jobs: [{
+        id: `page-refine-${pageNo}`,
+        title: `第 ${pageNo} 页精修`,
+        prompt: `为宣传画册单独重做第 ${pageNo} 页，保持整本视觉体系统一。用户要求：${prompt}`,
+        objective: `优化第 ${pageNo} 页的版式、主视觉和信息层级。`,
+        aspectRatio: "4:3",
+        size,
+        resolution: "2K",
+        quality,
+        negativePrompt,
+        count: 1,
+      }],
+      analysisModel: "local-agent-heuristic",
+      source: "local",
+    };
+  }
+  if (brochureKeywordScore >= 2) {
+    return {
+      intentType: "brochure_project",
+      confidence: 0.94,
+      reasoningSummary: "识别为公司宣传画册任务，建议先生成整本模板板，再进入逐页细化。",
+      estimatedCostLevel: "medium",
+      requiresConfirmation: true,
+      autoExecute: false,
+      jobs: [],
+      brochureProject: buildLocalBrochureProject(prompt),
+      analysisModel: "local-agent-heuristic",
+      source: "local",
+    };
+  }
+
+  const segments = splitPromptIntoSegments(prompt);
+  const explicitImageSegments = segments
+    .filter((segment) => /^([-*•]|\d+\s*[\.、\)]|第\s*[0-9一二三四五六七八九十两]+\s*(?:张|幅|图))/.test(segment))
+    .map(stripSegmentMarker)
+    .filter(Boolean);
+  if (explicitImageSegments.length >= 2) {
+    const jobs = explicitImageSegments.map((segment, index) => ({
+      id: `multi-${index + 1}`,
+      title: `第 ${index + 1} 张`,
+      prompt: segment,
+      objective: "生成一张与其他任务明显区分的独立图片。",
+      aspectRatio: recommendedAgentAspectRatio(segment, aspectRatio),
+      size,
+      resolution: recommendedAgentResolution(segment),
+      quality,
+      negativePrompt,
+      count: 1,
+    }));
+    return {
+      intentType: "multi_image_batch",
+      confidence: 0.92,
+      reasoningSummary: `识别到 ${jobs.length} 条独立图片需求，已按每张图分别拆解。`,
+      estimatedCostLevel: countAgentModeImages(jobs) >= 5 ? "high" : "medium",
+      requiresConfirmation: true,
+      autoExecute: false,
+      jobs,
+      analysisModel: "local-agent-heuristic",
+      source: "local",
+    };
+  }
+
+  const requestedCount = detectRequestedImageCount(prompt, 1);
+  if (requestedCount > 1) {
+    const jobs: AgentModeJobSpec[] = [{
+      id: "multi-count-1",
+      title: requestedCount > 1 ? `同主题多图 · ${requestedCount} 张` : "图片任务",
+      prompt,
+      objective: "按同一主题生成多张候选图，可后续继续细分每张图的差异要求。",
+      aspectRatio: recommendedAgentAspectRatio(prompt, aspectRatio),
+      size,
+      resolution: recommendedAgentResolution(prompt),
+      quality,
+      negativePrompt,
+      count: requestedCount,
+    }];
+    return {
+      intentType: "multi_image_batch",
+      confidence: 0.8,
+      reasoningSummary: `识别到需要 ${requestedCount} 张图片，但未拆出逐张描述，先按同主题多图方案处理。`,
+      estimatedCostLevel: requestedCount >= 5 ? "high" : "medium",
+      requiresConfirmation: true,
+      autoExecute: false,
+      jobs,
+      analysisModel: "local-agent-heuristic",
+      source: "local",
+    };
+  }
+
+  return {
+    intentType: "single_image",
+    confidence: 0.96,
+    reasoningSummary: "识别为单张图片需求，已准备直接进入生成。",
+    estimatedCostLevel: "low",
+    requiresConfirmation: false,
+    autoExecute: true,
+    jobs: [{
+      id: "single-1",
+      title: "主图生成",
+      prompt,
+      objective: "根据提示词直接生成单张主图。",
+      aspectRatio: recommendedAgentAspectRatio(prompt, aspectRatio),
+      size,
+      resolution: recommendedAgentResolution(prompt),
+      quality,
+      negativePrompt,
+      count: 1,
+    }],
+    analysisModel: "local-agent-heuristic",
+    source: "local",
+  };
+}
+
+async function analyzeAgentModeWithGpt(
+  baseUrl: string,
+  apiKey: string,
+  body: ProxyBody,
+  requestId?: string,
+  callbacks: AnalyzeStreamCallbacks = {},
+) {
+  const analysisModel = getString(body, "analysisModel");
+  const prompt = getString(body, "prompt");
+  if (!analysisModel) throw new Error("分析模型不能为空");
+  if (!prompt) throw new Error("提示词不能为空");
+  if (!apiKey) throw new Error("API Key 不能为空");
+
+  const localFallback = buildLocalAgentModeAnalysis(body);
+  const context = {
+    prompt,
+    protocol: getString(body, "protocol"),
+    imageModel: getString(body, "imageModel"),
+    aspectRatio: getString(body, "aspectRatio"),
+    size: getString(body, "size"),
+    resolution: getString(body, "resolution"),
+    quality: getString(body, "quality"),
+    outputFormat: getString(body, "outputFormat"),
+    count: getNumber(body.count),
+    referenceCount: getNumber(body.referenceCount) || 0,
+  };
+  const systemPrompt = [
+    "你是一个图片生成 Agent 的任务拆解器。",
+    "你要识别用户当前输入属于 single_image、multi_image_batch、brochure_project 或 page_refine 哪一种。",
+    "如果是多图任务，要尽量拆成逐张独立 job；如果只是说明总张数但没有逐张差异，也可以返回 1 个 job 并把 count 设为总数。",
+    "如果是宣传画册任务，不要直接输出 jobs，而是返回 brochureProject，包含 title, companyName, industry, purpose, pageCount, summary, outline, styleDirections, requestPrompt。",
+    "outline 每项包含 pageNo, role, title, objective。styleDirections 返回 3 到 6 个方向。",
+    "如果是 page_refine，需要输出 1 个 job，说明是某一页单独重做。",
+    "只返回 JSON，不要使用 Markdown。",
+    "JSON 顶层字段必须包含 intentType, confidence, reasoningSummary, estimatedCostLevel, requiresConfirmation, autoExecute, jobs, brochureProject。",
+    "estimatedCostLevel 只能是 low、medium、high。confidence 范围 0 到 1。",
+    "每个 job 可包含 id, title, prompt, objective, negativePrompt, aspectRatio, size, resolution, quality, count。",
+  ].join("\n");
+
+  const upstreamPayload = {
+    model: analysisModel,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: JSON.stringify(context, null, 2) },
+    ],
+    temperature: 0.1,
+    response_format: { type: "json_object" },
+    stream: true,
+  };
+  if (requestId) {
+    updateRequestLog(requestId, {
+      upstreamPayloadKeys: Object.keys(upstreamPayload),
+      upstreamRequest: sanitizeForLog(upstreamPayload),
+    });
+  }
+
+  const response = await fetchWithTimeout(endpoint(baseUrl, "/v1/chat/completions"), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify(upstreamPayload),
+  }, 60_000);
+  callbacks.onUpstreamConnected?.(response.status);
+  if (!response.ok) {
+    const bodyText = await response.text();
+    const detail = detailFromUpstream(response.status, bodyText);
+    if (requestId) {
+      updateRequestLog(requestId, {
+        responseBody: sanitizeForLog({
+          ok: false,
+          status: response.status,
+          detail,
+          rawContent: truncateText(bodyText, 4000),
+        }),
+      });
+    }
+    throw detail;
+  }
+  if (!response.body) {
+    throw new Error("上游返回空响应体");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let accumulated = "";
+  let firstByteReported = false;
+  let finishReason: string | undefined;
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!firstByteReported) {
+        callbacks.onFirstByte?.();
+        firstByteReported = true;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const rawLine of lines) {
+        const line = rawLine.replace(/\r$/, "");
+        if (!line.startsWith("data:")) continue;
+        const dataStr = line.slice(5).trim();
+        if (!dataStr || dataStr === "[DONE]") continue;
+        let chunk: unknown;
+        try {
+          chunk = JSON.parse(dataStr);
+        } catch {
+          continue;
+        }
+        const choice = chunk && typeof chunk === "object"
+          ? ((chunk as { choices?: unknown }).choices as Array<Record<string, unknown>> | undefined)?.[0]
+          : undefined;
+        const delta = choice && typeof choice === "object" ? (choice.delta as Record<string, unknown> | undefined) : undefined;
+        const deltaContent = delta && typeof delta.content === "string" ? delta.content : "";
+        if (deltaContent) {
+          accumulated += deltaContent;
+          callbacks.onChunk?.(deltaContent, accumulated);
+        }
+        if (typeof choice?.finish_reason === "string") {
+          finishReason = choice.finish_reason as string;
+        }
+      }
+    }
+    if (buffer.startsWith("data:")) {
+      const tail = buffer.slice(5).trim();
+      if (tail && tail !== "[DONE]") {
+        try {
+          const chunk = JSON.parse(tail);
+          const deltaContent = (chunk?.choices?.[0]?.delta?.content as string) || "";
+          if (deltaContent) {
+            accumulated += deltaContent;
+            callbacks.onChunk?.(deltaContent, accumulated);
+          }
+        } catch {
+          // ignore trailing partial
+        }
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+
+  if (!accumulated.trim()) {
+    if (requestId) {
+      updateRequestLog(requestId, {
+        responseBody: sanitizeForLog({ ok: false, status: response.status, error: "Agent 分析 stream 没有返回任何内容", finishReason }),
+      });
+    }
+    throw new Error("分析模型返回空内容");
+  }
+
+  const analysis = parseMaybeJson(extractJsonObject(accumulated));
+  if (!analysis || typeof analysis !== "object") {
+    if (requestId) {
+      updateRequestLog(requestId, {
+        responseBody: sanitizeForLog({
+          ok: false,
+          status: response.status,
+          error: "Agent 分析模型没有返回可解析的 JSON",
+          finishReason,
+          rawContent: truncateText(accumulated, 4000),
+        }),
+      });
+    }
+    throw new Error("Agent 分析结果不是有效 JSON");
+  }
+  const normalized = normalizeAgentModeAnalysisPayload(analysis, localFallback, analysisModel);
+  if (requestId) {
+    updateRequestLog(requestId, {
+      responseBody: sanitizeForLog({
+        ok: true,
+        status: response.status,
+        finishReason,
+        rawContent: truncateText(accumulated, 4000),
+        analysis: normalized,
+      }),
+    });
+  }
+  return normalized;
 }
 
 type AnalyzeStreamCallbacks = {
@@ -1356,8 +2575,8 @@ async function generateOpenAiCompatible(baseUrl: string, apiKey: string, request
   if (requestSize && requestSize !== "auto") payload.size = requestSize;
   if (request.quality && request.quality !== "auto") payload.quality = request.quality;
   if (outputFormat && outputFormat !== "png") payload.output_format = outputFormat;
-  if (request.aspectRatio && protocol === "custom-openai") payload.aspect_ratio = request.aspectRatio;
-  if (protocol === "custom-openai" && isImage2Model(request.model) && request.resolution && request.resolution !== "1K") {
+  if (request.aspectRatio && protocol === "custom-openai" && !isGptImage2Model(request.model)) payload.aspect_ratio = request.aspectRatio;
+  if (protocol === "custom-openai" && !isGptImage2Model(request.model) && request.resolution && request.resolution !== "1K") {
     payload.resolution = request.resolution;
   }
   if (request.seed) payload.seed = Number.isFinite(Number(request.seed)) ? Number(request.seed) : request.seed;
@@ -1480,25 +2699,30 @@ async function generateGeminiNative(baseUrl: string, apiKey: string, request: Ge
     { text: fullPrompt(request) },
     ...references.map(dataUrlToGeminiPart),
   ];
+  const imageConfig: Record<string, unknown> = {
+    aspectRatio: request.aspectRatio || "1:1",
+  };
+  if (isGemini3ProImageModel(request.model)) {
+    imageConfig.imageSize = normalizeResolution(request.resolution);
+  }
   const upstreamPayload = {
     contents: [{ role: "user", parts }],
     generationConfig: {
       responseModalities: ["TEXT", "IMAGE"],
-      imageConfig: {
-        aspectRatio: request.aspectRatio || "1:1",
-      },
+      imageConfig,
     },
   };
   if (requestId) {
     updateRequestLog(requestId, {
-      endpoint: `/models/${modelName(request.model)}:generateContent`,
+      endpoint: `${GEMINI_NATIVE_API_PREFIX}/models/${modelName(request.model)}:generateContent`,
       upstreamPayloadKeys: Object.keys(upstreamPayload),
       upstreamReferenceCount: references.length,
       upstreamReferenceMode: references.length ? "gemini:parts:inline_data" : "none",
+      upstreamSize: typeof imageConfig.imageSize === "string" ? imageConfig.imageSize : undefined,
       upstreamRequest: sanitizeForLog(upstreamPayload),
     });
   }
-  const response = await fetchWithTimeout(endpoint(baseUrl, `/models/${modelName(request.model)}:generateContent`), {
+  const response = await fetchWithTimeout(endpoint(baseUrl, `${GEMINI_NATIVE_API_PREFIX}/models/${modelName(request.model)}:generateContent`), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1607,7 +2831,8 @@ async function loadUpstreamModels(protocol: ImageProtocol, baseUrl: string, apiK
   }
 
   if (protocol === "gemini-native" || protocol === "google-imagen") {
-    const response = await fetchWithTimeout(endpoint(baseUrl, "/models"), {
+    const path = protocol === "gemini-native" ? `${GEMINI_NATIVE_API_PREFIX}/models` : "/models";
+    const response = await fetchWithTimeout(endpoint(baseUrl, path), {
       headers: { "x-goog-api-key": apiKey },
     });
     const text = await response.text();
@@ -1617,7 +2842,7 @@ async function loadUpstreamModels(protocol: ImageProtocol, baseUrl: string, apiK
     if (protocol === "google-imagen") {
       models = models.filter((model) => model.toLowerCase().includes("imagen"));
     }
-    return { models: models.length > 0 ? models : DEFAULT_MODELS[protocol], raw: payload };
+    return { models: [...new Set([...DEFAULT_MODELS[protocol], ...models])], raw: payload };
   }
 
   const path = protocol === "gemini-openai" ? "/models" : "/v1/models";
@@ -1628,7 +2853,557 @@ async function loadUpstreamModels(protocol: ImageProtocol, baseUrl: string, apiK
   if (!response.ok) throw detailFromUpstream(response.status, text);
   const payload = parseMaybeJson(text);
   const models = extractModelIds(payload, "data");
-  return { models: models.length > 0 ? models : DEFAULT_MODELS[protocol], raw: payload };
+  return { models: [...new Set([...DEFAULT_MODELS[protocol], ...models])], raw: payload };
+}
+
+async function handleSquareFeed(req: IncomingMessage, res: ServerResponse) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { ok: false, error: "Method not allowed" });
+    return;
+  }
+  const url = new URL(req.url || "/", "http://localhost");
+  const tab = normalizeSquareFeedTab(url.searchParams.get("tab"));
+  const limit = Math.max(1, Math.min(SQUARE_MAX_FEED_LIMIT, Number(url.searchParams.get("limit")) || SQUARE_MAX_FEED_LIMIT));
+  const offset = squareCursorOffset(url.searchParams.get("cursor"));
+  const apiKey = String(req.headers["x-imagehub-api-key"] || "").trim();
+  const viewerHash = apiKey ? hashApiKey(apiKey) : "";
+  const store = readSquareStore();
+  const sorted = sortSquareItems(squareActiveItems(store), tab);
+  const items = sorted.slice(offset, offset + limit);
+  const nextOffset = offset + items.length;
+  sendJson(res, 200, {
+    ok: true,
+    tab,
+    items: items.map((item) => squareFeedItem(item, store, tab, viewerHash, squareRankScoreCache.get(item))),
+    nextCursor: nextOffset < sorted.length ? squareNextCursor(nextOffset) : "",
+    hasMore: nextOffset < sorted.length,
+  });
+}
+
+async function handleSquareQuota(req: IncomingMessage, res: ServerResponse) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { ok: false, error: "Method not allowed" });
+    return;
+  }
+  const apiKey = String(req.headers["x-imagehub-api-key"] || "").trim();
+  if (!apiKey) {
+    sendJson(res, 401, { ok: false, error: "推荐和点赞需要先配置 API Key" });
+    return;
+  }
+  const apiKeyHash = hashApiKey(apiKey);
+  const store = readSquareStore();
+  const quota = getSquareQuota(store, apiKeyHash);
+  writeSquareStore(store);
+  sendJson(res, 200, {
+    ok: true,
+    dailyRecommendUsed: quota.dailyRecommendUsed,
+    dailyRecommendLeft: squareRemainingRecommendQuota(quota),
+    dailyLikeUsed: quota.dailyLikeUsed,
+    dailyLikeLeft: squareRemainingLikeQuota(quota),
+    shelfCount: squareShelfCount(store, apiKeyHash),
+    shelfLimit: SQUARE_SHELF_LIMIT,
+    dayKey: quota.dateKey,
+  });
+}
+
+async function handleSquareRecommend(req: IncomingMessage, res: ServerResponse) {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { ok: false, error: "Method not allowed" });
+    return;
+  }
+  const requestId = randomUUID();
+  const clientMeta = squareClientMeta(req);
+  try {
+    const body = await readJsonBody(req);
+    const apiKey = getString(body, "apiKey");
+    if (!apiKey) {
+      sendJson(res, 401, { ok: false, status: "rejected", action: "rejected", error: "推荐到广场需要先配置 API Key" });
+      return;
+    }
+    const apiKeyHash = hashApiKey(apiKey);
+    const store = readSquareStore();
+    const quota = getSquareQuota(store, apiKeyHash);
+    const reject = (status: number, reasonCode: string, error: string, extra: Partial<SquareRecommendLog> = {}) => {
+      appendSquareRecommendLog(store, {
+        requestId,
+        apiKeyHash,
+        action: "rejected",
+        result: "rejected",
+        reasonCode,
+        remainingDailyQuota: squareRemainingRecommendQuota(quota),
+        remainingShelfSlots: Math.max(0, SQUARE_SHELF_LIMIT - squareShelfCount(store, apiKeyHash)),
+        ...clientMeta,
+        ...extra,
+      });
+      writeSquareStore(store);
+      sendJson(res, status, {
+        ok: false,
+        status: "rejected",
+        action: "rejected",
+        reasonCode,
+        error,
+        remainingDailyQuota: squareRemainingRecommendQuota(quota),
+        remainingShelfSlots: Math.max(0, SQUARE_SHELF_LIMIT - squareShelfCount(store, apiKeyHash)),
+      });
+    };
+
+    if (quota.dailyRecommendUsed >= SQUARE_DAILY_RECOMMEND_LIMIT) {
+      reject(429, "daily_recommend_quota_exceeded", "今日推荐额度已满");
+      return;
+    }
+    quota.dailyRecommendUsed += 1;
+    quota.updatedAt = Date.now();
+
+    const sourceImageMeta = getRecord(body.sourceImageMeta);
+    const params = getRecord(body.params);
+    const thumbnailDataUrl = getString(body, "thumbnailDataUrl")
+      || getNestedString(sourceImageMeta, "thumbnailDataUrl")
+      || getNestedString(sourceImageMeta, "imageDataUrl");
+    const imageId = getString(body, "imageId") || getNestedString(sourceImageMeta, "imageId") || randomUUID();
+    const prompt = getString(body, "prompt");
+    const caption = getString(body, "caption") || truncateText(prompt.replace(/\s+/g, " "), 140);
+    const sourceType = getString(body, "sourceType") || "local_history";
+    const model = getString(body, "model") || getNestedString(sourceImageMeta, "model") || "unknown";
+    const width = getNumber(body.width) || getNestedNumber(sourceImageMeta, "width");
+    const height = getNumber(body.height) || getNestedNumber(sourceImageMeta, "height");
+    const reasonPlan = body.reasonPlan;
+    const promptHash = prompt ? hashText(prompt, 32) : undefined;
+
+    if (!thumbnailDataUrl) {
+      reject(400, "missing_square_thumbnail", "缺少广场展示图", { imageId, promptHash, sourceType });
+      return;
+    }
+    if (!/^data:image\/[a-zA-Z+.-]+;base64,/.test(thumbnailDataUrl)) {
+      reject(400, "invalid_square_thumbnail", "广场展示图格式无效", { imageId, promptHash, sourceType });
+      return;
+    }
+    const thumbnailBytes = imageBytesFromDataUrl(thumbnailDataUrl);
+    if (thumbnailBytes <= 0 || thumbnailBytes > SQUARE_MAX_IMAGE_BYTES) {
+      reject(413, "square_thumbnail_too_large", "广场展示图过大，请压缩后再推荐", { imageId, promptHash, sourceType });
+      return;
+    }
+    if (!prompt) {
+      reject(400, "missing_prompt", "推荐到广场需要保留提示词", { imageId, sourceType });
+      return;
+    }
+    const moderationReason = moderationReasonForSquareText(prompt, caption);
+    if (moderationReason) {
+      appendSquareModerationAudit(store, {
+        requestId,
+        apiKeyHash,
+        imageId,
+        event: "recommend_rejected",
+        reasonCode: moderationReason,
+        severity: "high",
+        ...clientMeta,
+        detail: sanitizeForLog({ prompt, caption }),
+      });
+      reject(422, moderationReason, "内容需要人工复核，暂不进入广场", { imageId, promptHash, sourceType });
+      return;
+    }
+    if (recentSquareRecommendCount(store, apiKeyHash, 60_000) >= 8) {
+      appendSquareModerationAudit(store, {
+        requestId,
+        apiKeyHash,
+        imageId,
+        event: "recommend_backoff",
+        reasonCode: "rapid_submit_backoff",
+        severity: "medium",
+        ...clientMeta,
+      });
+      reject(429, "rapid_submit_backoff", "提交过于频繁，请稍后再试", { imageId, promptHash, sourceType });
+      return;
+    }
+
+    const imageHash = hashImageDataUrl(thumbnailDataUrl);
+    const duplicatedBySelf = squareActiveItems(store).find((item) => item.recommenderHash === apiKeyHash && item.imageHash === imageHash);
+    if (duplicatedBySelf) {
+      appendSquareModerationAudit(store, {
+        requestId,
+        apiKeyHash,
+        itemId: duplicatedBySelf.id,
+        imageId,
+        event: "duplicate_content",
+        reasonCode: "duplicate_active_item",
+        severity: "low",
+        ...clientMeta,
+      });
+      reject(409, "duplicate_active_item", "这张图已经在你的广场展示位中", { imageId, itemId: duplicatedBySelf.id, imageHash, promptHash, sourceType });
+      return;
+    }
+
+    const now = Date.now();
+    const activeByKey = squareActiveItems(store)
+      .filter((item) => item.recommenderHash === apiKeyHash)
+      .sort((a, b) => a.createdAt - b.createdAt);
+    const action: "added" | "replaced" = activeByKey.length >= SQUARE_SHELF_LIMIT ? "replaced" : "added";
+    const replaced = action === "replaced" ? activeByKey[0] : undefined;
+    const itemId = randomUUID();
+    if (replaced) {
+      replaced.active = false;
+      replaced.replacedById = itemId;
+      replaced.updatedAt = now;
+    }
+
+    const item: SquareItem = {
+      id: itemId,
+      imageId,
+      requestId: getNestedString(sourceImageMeta, "requestId") || undefined,
+      thumbnailDataUrl,
+      imageHash,
+      prompt: truncateText(prompt, 4000),
+      caption: truncateText(caption || prompt, 240),
+      model: truncateText(model, 240),
+      params: sanitizeForLog(params) as Record<string, unknown>,
+      width,
+      height,
+      aspectRatio: getNestedString(sourceImageMeta, "aspectRatio") || (typeof params.aspectRatio === "string" ? params.aspectRatio : undefined),
+      sourceType,
+      reasonPlan: sanitizeForLog(reasonPlan),
+      recommenderHash: apiKeyHash,
+      recommenderLabel: `创作者 ${apiKeyHash.slice(0, 6)}`,
+      pageLabel: getNestedString(sourceImageMeta, "pageLabel") || undefined,
+      active: true,
+      featured: Boolean(body.featured),
+      likeCount: 0,
+      qualityScore: squareQualityScore(width, height, prompt),
+      trustScore: 72,
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.items.unshift(item);
+
+    const sameImageFromOthers = squareActiveItems(store).find((candidate) => candidate.id !== item.id && candidate.imageHash === imageHash);
+    if (sameImageFromOthers) {
+      appendSquareModerationAudit(store, {
+        requestId,
+        apiKeyHash,
+        itemId,
+        imageId,
+        event: "duplicate_content_warning",
+        reasonCode: "same_image_hash_seen",
+        severity: "low",
+        ...clientMeta,
+      });
+    }
+
+    appendSquareRecommendLog(store, {
+      requestId,
+      apiKeyHash,
+      imageId,
+      itemId,
+      action,
+      result: "success",
+      reasonCode: action === "replaced" ? "shelf_limit_replaced_oldest" : "added_to_square",
+      replacedItemId: replaced?.id,
+      remainingDailyQuota: squareRemainingRecommendQuota(quota),
+      remainingShelfSlots: Math.max(0, SQUARE_SHELF_LIMIT - squareShelfCount(store, apiKeyHash)),
+      ...clientMeta,
+      promptHash,
+      imageHash,
+      sourceType,
+    });
+    writeSquareStore(store);
+    sendJson(res, 200, {
+      ok: true,
+      status: "accepted",
+      action,
+      item: squareFeedItem(item, store, "latest", apiKeyHash),
+      remainingDailyQuota: squareRemainingRecommendQuota(quota),
+      remainingShelfSlots: Math.max(0, SQUARE_SHELF_LIMIT - squareShelfCount(store, apiKeyHash)),
+      replacedItemId: replaced?.id,
+    });
+  } catch (error) {
+    sendJson(res, 500, { ok: false, requestId, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function handleSquareLike(req: IncomingMessage, res: ServerResponse) {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { ok: false, error: "Method not allowed" });
+    return;
+  }
+  const requestId = randomUUID();
+  const clientMeta = squareClientMeta(req);
+  try {
+    const body = await readJsonBody(req);
+    const apiKey = getString(body, "apiKey");
+    const itemId = getString(body, "itemId");
+    const action = getString(body, "action") === "unlike" ? "unlike" : "like";
+    if (!apiKey) {
+      sendJson(res, 401, { ok: false, status: "rejected", error: "点赞需要先配置 API Key" });
+      return;
+    }
+    const apiKeyHash = hashApiKey(apiKey);
+    const store = readSquareStore();
+    const quota = getSquareQuota(store, apiKeyHash);
+    const item = store.items.find((candidate) => candidate.id === itemId && candidate.active !== false);
+    if (!item) {
+      sendJson(res, 404, { ok: false, status: "rejected", error: "广场作品不存在或已被替换" });
+      return;
+    }
+    const existing = store.likes.find((like) => like.apiKeyHash === apiKeyHash && like.itemId === itemId);
+    const log = (result: SquareLikeLog["result"], reasonCode: string) => {
+      appendSquareLikeLog(store, {
+        requestId,
+        apiKeyHash,
+        itemId,
+        action,
+        result,
+        reasonCode,
+        likeCount: item.likeCount || 0,
+        remainingLikeQuota: squareRemainingLikeQuota(quota),
+        ...clientMeta,
+      });
+    };
+
+    if (action === "like") {
+      if (existing?.liked) {
+        log("noop", "already_liked");
+        writeSquareStore(store);
+        sendJson(res, 200, {
+          ok: true,
+          status: "liked",
+          action: "noop",
+          likeCount: item.likeCount || 0,
+          remainingLikeQuota: squareRemainingLikeQuota(quota),
+        });
+        return;
+      }
+      if (quota.dailyLikeUsed >= SQUARE_DAILY_LIKE_LIMIT) {
+        log("rejected", "daily_like_quota_exceeded");
+        writeSquareStore(store);
+        sendJson(res, 429, {
+          ok: false,
+          status: "rejected",
+          action: "rejected",
+          reasonCode: "daily_like_quota_exceeded",
+          error: "今日点赞额度已满",
+          likeCount: item.likeCount || 0,
+          remainingLikeQuota: 0,
+        });
+        return;
+      }
+      quota.dailyLikeUsed += 1;
+      quota.updatedAt = Date.now();
+      if (existing) {
+        existing.liked = true;
+        existing.updatedAt = Date.now();
+      } else {
+        store.likes.unshift({
+          apiKeyHash,
+          itemId,
+          liked: true,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      }
+      item.likeCount = Math.max(0, (item.likeCount || 0) + 1);
+      item.updatedAt = Date.now();
+      log("success", "liked");
+      writeSquareStore(store);
+      sendJson(res, 200, {
+        ok: true,
+        status: "liked",
+        action: "liked",
+        likeCount: item.likeCount,
+        remainingLikeQuota: squareRemainingLikeQuota(quota),
+      });
+      return;
+    }
+
+    let didUnlike = false;
+    if (existing?.liked) {
+      existing.liked = false;
+      existing.updatedAt = Date.now();
+      item.likeCount = Math.max(0, (item.likeCount || 0) - 1);
+      item.updatedAt = Date.now();
+      log("success", "unliked");
+      didUnlike = true;
+    } else {
+      if (!existing) {
+        store.likes.unshift({
+          apiKeyHash,
+          itemId,
+          liked: false,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      }
+      log("noop", "already_unliked");
+    }
+    writeSquareStore(store);
+    sendJson(res, 200, {
+      ok: true,
+      status: "unliked",
+      action: didUnlike ? "unliked" : "noop",
+      likeCount: item.likeCount || 0,
+      remainingLikeQuota: squareRemainingLikeQuota(quota),
+    });
+  } catch (error) {
+    sendJson(res, 500, { ok: false, requestId, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function handleSquareAdminOverview(req: IncomingMessage, res: ServerResponse) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { ok: false, error: "Method not allowed" });
+    return;
+  }
+  const auth = getSquareAdminAuth(req);
+  if (!auth.ok) {
+    sendJson(res, auth.status, { ok: false, error: auth.error, mustChangePassword: auth.mustChangePassword });
+    return;
+  }
+  const store = readSquareStore();
+  const now = Date.now();
+  const oneDay = 24 * 60 * 60 * 1000;
+  const trend = Array.from({ length: 14 }, (_, index) => {
+    const dateKey = squareDayKey(now - (13 - index) * oneDay);
+    const recommendLogs = store.recommendLogs.filter((log) => squareDayKey(log.timestamp) === dateKey);
+    const likeLogs = store.likeLogs.filter((log) => squareDayKey(log.timestamp) === dateKey);
+    return {
+      dateKey,
+      recommendAttempts: recommendLogs.length,
+      added: recommendLogs.filter((log) => log.action === "added").length,
+      replaced: recommendLogs.filter((log) => log.action === "replaced").length,
+      rejected: recommendLogs.filter((log) => log.result === "rejected").length,
+      likes: likeLogs.filter((log) => log.result === "success" && log.action === "like").length,
+      unlikes: likeLogs.filter((log) => log.result === "success" && log.action === "unlike").length,
+    };
+  });
+  const rejectedReasons = store.recommendLogs
+    .filter((log) => log.result === "rejected")
+    .reduce<Record<string, number>>((acc, log) => {
+      acc[log.reasonCode || "unknown"] = (acc[log.reasonCode || "unknown"] || 0) + 1;
+      return acc;
+    }, {});
+  const activeItems = squareActiveItems(store);
+  const totalPublished = store.recommendLogs.filter((log) => log.action === "added" || log.action === "replaced").length;
+  const totalReplaced = store.recommendLogs.filter((log) => log.action === "replaced").length;
+  sendJson(res, 200, {
+    ok: true,
+    overview: {
+      activeItems: activeItems.length,
+      totalItems: store.items.length,
+      totalRecommendAttempts: store.recommendLogs.length,
+      totalLikes: store.likeLogs.filter((log) => log.result === "success" && log.action === "like").length,
+      replacementRate: totalPublished ? Math.round((totalReplaced / totalPublished) * 1000) / 10 : 0,
+      likeRate: activeItems.length ? Math.round((activeItems.reduce((sum, item) => sum + (item.likeCount || 0), 0) / activeItems.length) * 10) / 10 : 0,
+      trend,
+      rejectedReasonTop: Object.entries(rejectedReasons)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8)
+        .map(([reasonCode, count]) => ({ reasonCode, count })),
+      riskEvents: store.moderationAudits.slice(0, 80),
+    },
+  });
+}
+
+async function handleSquareAdminExport(req: IncomingMessage, res: ServerResponse) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { ok: false, error: "Method not allowed" });
+    return;
+  }
+  const auth = getSquareAdminAuth(req);
+  if (!auth.ok) {
+    sendJson(res, auth.status, { ok: false, error: auth.error, mustChangePassword: auth.mustChangePassword });
+    return;
+  }
+  const url = new URL(req.url || "/", "http://localhost");
+  const format = url.searchParams.get("format") || "json";
+  const dateKey = url.searchParams.get("dateKey") || squareDayKey();
+  const store = readSquareStore();
+  const exportedAt = new Date().toISOString();
+  const recommendLogs = store.recommendLogs.filter((log) => squareDayKey(log.timestamp) === dateKey);
+  const likeLogs = store.likeLogs.filter((log) => squareDayKey(log.timestamp) === dateKey);
+  const moderationAudits = store.moderationAudits.filter((audit) => squareDayKey(audit.timestamp) === dateKey);
+  const relatedItemIds = new Set<string>();
+  recommendLogs.forEach((log) => {
+    if (log.itemId) relatedItemIds.add(log.itemId);
+    if (log.replacedItemId) relatedItemIds.add(log.replacedItemId);
+  });
+  likeLogs.forEach((log) => relatedItemIds.add(log.itemId));
+  moderationAudits.forEach((audit) => {
+    if (audit.itemId) relatedItemIds.add(audit.itemId);
+  });
+  const items = store.items.filter((item) => squareDayKey(item.createdAt) === dateKey || relatedItemIds.has(item.id));
+  if (format === "csv") {
+    const rows = [
+      ["type", "timestamp", "requestId", "apiKeyHash", "itemId", "imageId", "action", "result", "reasonCode", "replacedItemId", "remainingDailyQuota", "remainingShelfSlots", "likeCount", "remainingLikeQuota", "ipHash", "uaHash"],
+      ...recommendLogs.map((log) => [
+        "recommend",
+        new Date(log.timestamp).toISOString(),
+        log.requestId,
+        log.apiKeyHash,
+        log.itemId || "",
+        log.imageId || "",
+        log.action,
+        log.result,
+        log.reasonCode,
+        log.replacedItemId || "",
+        String(log.remainingDailyQuota),
+        String(log.remainingShelfSlots),
+        "",
+        "",
+        log.ipHash,
+        log.uaHash,
+      ]),
+      ...likeLogs.map((log) => [
+        "like",
+        new Date(log.timestamp).toISOString(),
+        log.requestId,
+        log.apiKeyHash,
+        log.itemId,
+        "",
+        log.action,
+        log.result,
+        log.reasonCode,
+        "",
+        "",
+        "",
+        String(log.likeCount),
+        String(log.remainingLikeQuota),
+        log.ipHash,
+        log.uaHash,
+      ]),
+    ];
+    const csv = rows
+      .map((row) => row.map((cell) => `"${String(cell).replace(/"/g, "\"\"")}"`).join(","))
+      .join("\n");
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Content-Disposition", `attachment; filename="imagehub-square-audit-${dateKey}-${exportedAt.replace(/[:.]/g, "-")}.csv"`);
+    res.end(csv);
+    appendAuditLog(auth.user.username, "admin_export_square_logs", `dateKey=${dateKey} format=csv count=${recommendLogs.length + likeLogs.length}`);
+    return;
+  }
+  const payload = {
+    exportedAt,
+    exportedBy: auth.user.username,
+    schemaVersion: 1,
+    dateKey,
+    items: items.map(squareItemForExport),
+    recommendLogs,
+    likeLogs,
+    quotas: store.quotas.filter((quota) => quota.dateKey === dateKey),
+    moderationAudits,
+    counts: {
+      items: items.length,
+      activeItems: items.filter((item) => item.active !== false).length,
+      recommendLogs: recommendLogs.length,
+      likeLogs: likeLogs.length,
+      quotas: store.quotas.filter((quota) => quota.dateKey === dateKey).length,
+      moderationAudits: moderationAudits.length,
+    },
+  };
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Content-Disposition", `attachment; filename="imagehub-square-audit-${dateKey}-${exportedAt.replace(/[:.]/g, "-")}.json"`);
+  res.end(JSON.stringify(payload, null, 2));
+  appendAuditLog(auth.user.username, "admin_export_square_logs", `dateKey=${dateKey} format=json count=${recommendLogs.length + likeLogs.length}`);
 }
 
 function imageProxyPlugin(): PluginOption {
@@ -1636,6 +3411,7 @@ function imageProxyPlugin(): PluginOption {
     name: "image-api-proxy",
     configureServer(server: ViteDevServer) {
       ensureAdminStore();
+      ensureSquareStore();
       server.middlewares.use("/api/reference-images", (req, res) => {
         if (req.method !== "GET" && req.method !== "HEAD") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
@@ -1658,6 +3434,47 @@ function imageProxyPlugin(): PluginOption {
           return;
         }
         res.end(record.bytes);
+      });
+
+      server.middlewares.use("/api/square/image/", (req, res) => {
+        const itemId = decodeURIComponent((req.url || "/").split("?")[0]?.replace(/^\/+/, "") || "");
+        if (!itemId) { sendJson(res, 400, { ok: false, error: "missing item id" }); return; }
+        const store = readSquareStore();
+        const item = store.items.find((candidate) => candidate.id === itemId);
+        if (!item || !item.thumbnailDataUrl) { sendJson(res, 404, { ok: false, error: "not found" }); return; }
+        const match = item.thumbnailDataUrl.match(/^data:(image\/[a-zA-Z+.-]+);base64,(.*)$/);
+        if (!match) { sendJson(res, 500, { ok: false, error: "invalid data" }); return; }
+        const bytes = Buffer.from(match[2], "base64");
+        res.statusCode = 200;
+        res.setHeader("Content-Type", match[1]);
+        res.setHeader("Content-Length", String(bytes.length));
+        res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+        if (req.method === "HEAD") { res.end(); return; }
+        res.end(bytes);
+      });
+
+      server.middlewares.use("/api/square/feed", (req, res) => {
+        void handleSquareFeed(req, res);
+      });
+
+      server.middlewares.use("/api/square/quota", (req, res) => {
+        void handleSquareQuota(req, res);
+      });
+
+      server.middlewares.use("/api/square/recommend", (req, res) => {
+        void handleSquareRecommend(req, res);
+      });
+
+      server.middlewares.use("/api/square/like", (req, res) => {
+        void handleSquareLike(req, res);
+      });
+
+      server.middlewares.use("/api/square/admin/overview", (req, res) => {
+        void handleSquareAdminOverview(req, res);
+      });
+
+      server.middlewares.use("/api/square/admin/export", (req, res) => {
+        void handleSquareAdminExport(req, res);
       });
 
       server.middlewares.use("/api/admin", async (req, res) => {
@@ -1965,7 +3782,11 @@ function imageProxyPlugin(): PluginOption {
             onChunk: (delta, accumulated) => {
               chunkCount += 1;
               lastChunkAt = Date.now();
-              sse("chunk", { delta, totalLength: accumulated.length });
+              sse("chunk", {
+                delta,
+                totalLength: accumulated.length,
+                preview: truncateText(accumulated, 420),
+              });
             },
           });
 
@@ -2004,6 +3825,179 @@ function imageProxyPlugin(): PluginOption {
               durationMs: finishedAt - startedAt,
             });
           }
+          if (sseStarted) {
+            sse("error", { requestId, status, detail, chunkCount });
+            res.end();
+          } else {
+            sendJson(res, status, { ok: false, requestId, detail });
+          }
+        }
+      });
+
+      server.middlewares.use("/api/agent/analyze", async (req, res) => {
+        if (req.method !== "POST") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        const requestId = randomUUID();
+        const startedAt = Date.now();
+        let logCreated = false;
+        let sseStarted = false;
+        let chunkCount = 0;
+        let lastChunkAt = 0;
+        const sse = (event: string, data: unknown) => {
+          if (!sseStarted) {
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+            res.setHeader("Cache-Control", "no-cache, no-transform");
+            res.setHeader("Connection", "keep-alive");
+            res.setHeader("X-Accel-Buffering", "no");
+            res.flushHeaders?.();
+            sseStarted = true;
+          }
+          res.write(`event: ${event}\n`);
+          res.write(`data: ${JSON.stringify(data)}\n\n`);
+        };
+
+        try {
+          const body = await readJsonBody(req);
+          const baseUrl = normalizeAllowedApiBaseUrl(getString(body, "baseUrl") || ALLOWED_API_BASE_URLS[0]);
+          const apiKey = getString(body, "apiKey");
+          const protocol = getProtocol(body.protocol);
+          const clientId = getString(body, "clientId") || "anonymous";
+          const analysisModel = getString(body, "analysisModel");
+          const prompt = getString(body, "prompt");
+
+          if (!prompt) {
+            sendJson(res, 400, {
+              ok: false,
+              requestId,
+              detail: { status: 400, error: "提示词不能为空" },
+            });
+            return;
+          }
+
+          createRequestLog({
+            requestId,
+            requestType: "agent_analysis",
+            clientId: truncateText(clientId, 120),
+            clientUserAgent: truncateText(req.headers["user-agent"] || "", 500),
+            clientIpHash: hashClientIp(req),
+            protocol,
+            apiBaseUrl: baseUrl.replace(/\/+$/, ""),
+            ...apiKeyLogMeta(apiKey),
+            endpoint: "/api/agent/analyze",
+            model: truncateText(analysisModel || "local-agent-heuristic", 240),
+            prompt: truncateText(prompt, 4000),
+            negativePrompt: getString(body, "negativePrompt") ? truncateText(getString(body, "negativePrompt"), 2400) : undefined,
+            aspectRatio: getString(body, "aspectRatio") || undefined,
+            size: getString(body, "size") || undefined,
+            resolution: getString(body, "resolution") || undefined,
+            quality: getString(body, "quality") || undefined,
+            outputFormat: getString(body, "outputFormat") || undefined,
+            referenceCount: getNumber(body.referenceCount) || 0,
+            requestParams: sanitizeForLog({
+              ...body,
+              baseUrl,
+              apiKey: undefined,
+              credential: apiKeyLogMeta(apiKey),
+            }),
+            status: "running",
+            createdAt: startedAt,
+            startedAt,
+            imageSaved: false,
+          });
+          logCreated = true;
+
+          sse("started", { requestId, model: analysisModel || "local-agent-heuristic", startedAt });
+
+          const localAnalysis = buildLocalAgentModeAnalysis(body);
+          let analysis = localAnalysis;
+          let fallbackReason = "";
+
+          if (analysisModel && apiKey) {
+            try {
+              analysis = await analyzeAgentModeWithGpt(baseUrl, apiKey, body, requestId, {
+                onUpstreamConnected: (status) => {
+                  sse("upstream_connected", { status, elapsedMs: Date.now() - startedAt });
+                },
+                onFirstByte: () => {
+                  sse("receiving", { elapsedMs: Date.now() - startedAt });
+                },
+                onChunk: (_delta, accumulated) => {
+                  chunkCount += 1;
+                  lastChunkAt = Date.now();
+                  sse("chunk", {
+                    totalLength: accumulated.length,
+                    preview: truncateText(accumulated, 420),
+                  });
+                },
+              });
+            } catch (error) {
+              fallbackReason = truncateText(
+                error instanceof Error ? error.message : JSON.stringify(sanitizeForLog(error)),
+                1000,
+              );
+              analysis = {
+                ...localAnalysis,
+                reasoningSummary: `${localAnalysis.reasoningSummary} AI 分析暂不可用，已回退到本地规则拆解。`,
+              };
+            }
+          }
+
+          const finishedAt = Date.now();
+          if (logCreated) {
+            updateRequestLog(requestId, {
+              status: "success",
+              httpStatus: 200,
+              finishedAt,
+              durationMs: finishedAt - startedAt,
+              responseBody: sanitizeForLog({
+                ok: true,
+                requestId,
+                usedModel: analysisModel || "local-agent-heuristic",
+                fallbackReason: fallbackReason || undefined,
+                analysis,
+                chunkCount,
+              }),
+            });
+          }
+
+          sse("done", {
+            requestId,
+            analysis,
+            durationMs: finishedAt - startedAt,
+            chunkCount,
+            fallbackReason: fallbackReason || undefined,
+          });
+          res.end();
+        } catch (error) {
+          const status = isAllowedApiBaseUrlError(error) ? 400 : httpStatusFromDetail(error) || 500;
+          if (logCreated) {
+            const summary = safeErrorSummary(error);
+            const finishedAt = Date.now();
+            updateRequestLog(requestId, {
+              status: "error",
+              httpStatus: status,
+              errorMessage: summary.message,
+              errorType: summary.type || "agent_analysis_error",
+              errorCode: summary.code,
+              errorRaw: summary.raw,
+              responseBody: sanitizeForLog({
+                ok: false,
+                requestId,
+                status,
+                detail: error,
+                chunkCount,
+                lastChunkAt: lastChunkAt ? lastChunkAt - startedAt : null,
+              }),
+              finishedAt,
+              durationMs: finishedAt - startedAt,
+            });
+          }
+          const detail = error && typeof error === "object" && "error" in (error as Record<string, unknown>)
+            ? error
+            : { status, error: error instanceof Error ? error.message : String(error) };
           if (sseStarted) {
             sse("error", { requestId, status, detail, chunkCount });
             res.end();
