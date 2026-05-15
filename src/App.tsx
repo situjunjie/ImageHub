@@ -8164,7 +8164,7 @@ function HomePage({ onEnter, onSquare, onAdmin }: { onEnter: () => void; onSquar
             <span>
               <img src={imageStudioLogo} alt="" />
             </span>
-            <strong>Image Studio</strong>
+            <strong>有济AI-Image Studio</strong>
           </div>
           <div className="home-nav-links" aria-label="首页导航">
             <button type="button" onClick={() => scrollToSection("home-product")}>
