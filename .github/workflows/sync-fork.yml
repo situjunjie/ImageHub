@@ -1,0 +1,28 @@
+name: Sync fork
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 20 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync main from upstream
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sync fork
+        uses: XueMoMo/Sync-Fork-action@v2.3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          upstream_repository: d100000/ImageHub
+          upstream_branch: main
+          target_branch: main
+          git_pull_args: --ff-only
