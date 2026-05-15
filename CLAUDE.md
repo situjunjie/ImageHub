@@ -43,7 +43,7 @@ Server-side route groups:
 5. Client receives the result, stores the Blob + history record in IndexedDB. Server-side never sees the generated image again.
 
 **Hard whitelists (enforced both client- and server-side):**
-- API base URL must be `https://www.taijiai.online/` or `https://bobdong.cn/` — hardcoded in `vite.config.ts`.
+- API base URL must be `https://ai.gigimed.cn/` — hardcoded in `vite.config.ts`.
 - Model name must be `gpt-image-2`, `gpt-5.4-image-2`, or contain `image-2`.
 
 If a task seems to require loosening either whitelist, confirm with the user — these are deliberate product constraints, not oversights.
