@@ -1,0 +1,11 @@
+node_modules
+dist
+.data
+.git
+.DS_Store
+*.tsbuildinfo
+screenshot-*.png
+generated_images
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

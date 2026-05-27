@@ -87,6 +87,10 @@ npm run build     # TypeScript 检查 + Vite 构建
 npm run preview   # 预览生产包
 ```
 
+### Docker 部署
+
+项目已提供 `Dockerfile` 和 `docker-compose.yml`，部署步骤见 [Docker 部署说明](docs/docker-deployment.md)。
+
 ### 管理员配置
 
 默认管理员账号 `admin` / `admin123456`，首次登录强制重置密码。

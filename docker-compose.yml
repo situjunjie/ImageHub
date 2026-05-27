@@ -1,0 +1,18 @@
+services:
+  imagehub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: imagehub
+    ports:
+      - "8877:8877"
+    environment:
+      TZ: Asia/Shanghai
+      ADMIN_USERNAME: admin
+      ADMIN_INITIAL_PASSWORD: "change-this-password"
+    volumes:
+      - imagehub_data:/app/.data
+    restart: unless-stopped
+
+volumes:
+  imagehub_data:
