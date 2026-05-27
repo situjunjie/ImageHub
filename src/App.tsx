@@ -431,7 +431,7 @@ type PreviewItem = {
   submittedReferenceImages?: SubmittedReference[];
 };
 
-type AppPage = "home" | "studio" | "square" | "admin";
+type AppPage = "home" | "studio" | "square" | "admin" | "canvas";
 
 type SquareFeedTab = "latest" | "hot" | "top_day" | "top_week" | "top_month";
 
@@ -615,6 +615,46 @@ type AdminStats = {
   errorCounts: Record<string, number>;
 };
 
+// ── Canvas Mode Types ──
+
+type CanvasNodeStatus = "generating" | "success" | "error";
+
+type CanvasNode = {
+  id: string;
+  type: "image";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  prompt: string;
+  model: string;
+  protocol: ImageProtocol;
+  params: ImageParams;
+  status: CanvasNodeStatus;
+  error?: string;
+  parentId?: string;
+  referenceNodeId?: string;
+  createdAt: number;
+  duration?: number;
+  imageWidth?: number;
+  imageHeight?: number;
+  objectUrl?: string;
+};
+
+type CanvasEdge = {
+  id: string;
+  fromNodeId: string;
+  toNodeId: string;
+};
+
+type CanvasViewport = {
+  x: number;
+  y: number;
+  zoom: number;
+};
+
+type CanvasPanelMode = "generate" | "optimize";
+
 const DB_NAME = "codex-image-batch-studio";
 const STORE_NAME = "history";
 const HISTORY_PAGE_SIZE = 20;
@@ -630,6 +670,11 @@ const FRONTEND_VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const API_KEY_MIN_LENGTH = 8;
 const AGENT_MODE_STORAGE_KEY = "imageStudioAgentModeEnabled";
 const AGENT_MODE_NAME = "Agent 模式 A";
+const CANVAS_STATE_STORE = "canvas-state";
+const CANVAS_IMAGES_STORE = "canvas-images";
+const CANVAS_STATE_KEY = "current";
+const CANVAS_SAVE_DEBOUNCE_MS = 500;
+const CANVAS_DEFAULT_NODE_WIDTH = 280;
 const SQUARE_FEED_TABS: Array<{ value: SquareFeedTab; label: string; icon: typeof Clock3 }> = [
   { value: "latest", label: "最新", icon: Clock3 },
   { value: "hot", label: "热门", icon: Flame },
@@ -1417,6 +1462,7 @@ function getClientId() {
 function pageFromHash(): AppPage {
   if (window.location.hash === "#studio") return "studio";
   if (window.location.hash === "#square") return "square";
+  if (window.location.hash === "#canvas") return "canvas";
   if (window.location.hash.startsWith("#admin")) return "admin";
   return "home";
 }
@@ -1988,7 +2034,7 @@ function mergeHistoricalJobs(current: Job[], incoming: Job[]) {
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 2);
+    const request = indexedDB.open(DB_NAME, 3);
     request.onupgradeneeded = () => {
       const db = request.result;
       const store = db.objectStoreNames.contains(STORE_NAME)
@@ -1996,6 +2042,12 @@ function openDb(): Promise<IDBDatabase> {
         : db.createObjectStore(STORE_NAME, { keyPath: "id" });
       if (!store.indexNames.contains("createdAt")) {
         store.createIndex("createdAt", "createdAt");
+      }
+      if (!db.objectStoreNames.contains(CANVAS_STATE_STORE)) {
+        db.createObjectStore(CANVAS_STATE_STORE);
+      }
+      if (!db.objectStoreNames.contains(CANVAS_IMAGES_STORE)) {
+        db.createObjectStore(CANVAS_IMAGES_STORE);
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -2106,6 +2158,65 @@ async function clearHistoryRecords() {
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readwrite");
     tx.objectStore(STORE_NAME).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// ── Canvas IndexedDB Persistence ──
+
+type CanvasPersistedState = {
+  nodes: Array<Omit<CanvasNode, "objectUrl">>;
+  edges: CanvasEdge[];
+  viewport: CanvasViewport;
+  lastSavedAt: number;
+};
+
+async function saveCanvasStateToDB(state: CanvasPersistedState): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CANVAS_STATE_STORE, "readwrite");
+    tx.objectStore(CANVAS_STATE_STORE).put(state, CANVAS_STATE_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadCanvasStateFromDB(): Promise<CanvasPersistedState | null> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CANVAS_STATE_STORE, "readonly");
+    const request = tx.objectStore(CANVAS_STATE_STORE).get(CANVAS_STATE_KEY);
+    request.onsuccess = () => resolve(request.result ?? null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveCanvasImageToDB(nodeId: string, blob: Blob): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CANVAS_IMAGES_STORE, "readwrite");
+    tx.objectStore(CANVAS_IMAGES_STORE).put(blob, nodeId);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadCanvasImageFromDB(nodeId: string): Promise<Blob | null> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CANVAS_IMAGES_STORE, "readonly");
+    const request = tx.objectStore(CANVAS_IMAGES_STORE).get(nodeId);
+    request.onsuccess = () => resolve(request.result ?? null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function deleteCanvasImageFromDB(nodeId: string): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CANVAS_IMAGES_STORE, "readwrite");
+    tx.objectStore(CANVAS_IMAGES_STORE).delete(nodeId);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -6120,6 +6231,13 @@ export default function App() {
     }
   }
 
+  function enterCanvas() {
+    setActivePage("canvas");
+    if (window.location.hash !== "#canvas") {
+      window.history.pushState(null, "", "#canvas");
+    }
+  }
+
   function returnHome() {
     setActivePage("home");
     if (window.location.hash) {
@@ -6156,7 +6274,7 @@ export default function App() {
     return (
       <>
         {frontendUpdateNotice}
-        <HomePage onEnter={enterStudio} onSquare={enterSquare} onAdmin={enterAdmin} />
+        <HomePage onEnter={enterStudio} onSquare={enterSquare} onAdmin={enterAdmin} onCanvas={enterCanvas} />
       </>
     );
   }
@@ -6169,6 +6287,24 @@ export default function App() {
           apiKey={apiConfig.apiKey}
           onBackHome={returnHome}
           onEnterStudio={enterStudio}
+          onCanvas={enterCanvas}
+        />
+      </>
+    );
+  }
+
+  if (activePage === "canvas") {
+    return (
+      <>
+        {frontendUpdateNotice}
+        <CanvasPage
+          apiConfig={apiConfig}
+          selectedModel={selectedModel}
+          selectableModels={selectableImageModels}
+          modelState={modelState}
+          onBackHome={returnHome}
+          onEnterStudio={enterStudio}
+          onEnterSquare={enterSquare}
         />
       </>
     );
@@ -8112,7 +8248,1327 @@ function AdminJsonBlock({ title, value }: { title: string; value: unknown }) {
   );
 }
 
-function HomePage({ onEnter, onSquare, onAdmin }: { onEnter: () => void; onSquare: () => void; onAdmin: () => void }) {
+// ══════════════════════════════════════
+// Canvas Page Component
+// ══════════════════════════════════════
+
+function CanvasPage({
+  apiConfig,
+  selectedModel: globalSelectedModel,
+  selectableModels,
+  modelState,
+  onBackHome,
+  onEnterStudio,
+  onEnterSquare,
+}: {
+  apiConfig: ApiConfig;
+  selectedModel: string;
+  selectableModels: string[];
+  modelState: ModelLoadState;
+  onBackHome: () => void;
+  onEnterStudio: () => void;
+  onEnterSquare: () => void;
+}) {
+  // ── State ──
+  const [canvasNodes, setCanvasNodes] = useState<CanvasNode[]>([]);
+  const [canvasEdges, setCanvasEdges] = useState<CanvasEdge[]>([]);
+  const [viewport, setViewport] = useState<CanvasViewport>({ x: 0, y: 0, zoom: 1 });
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [panelMode, setPanelMode] = useState<CanvasPanelMode>("generate");
+  const [isPanelOpen, setIsPanelOpen] = useState(true);
+  const [canvasPrompt, setCanvasPrompt] = useState("");
+  const [canvasModel, setCanvasModel] = useState(() => globalSelectedModel || selectableModels[0] || "");
+  const [canvasAspectRatio, setCanvasAspectRatio] = useState("1:1");
+  const [canvasResolution, setCanvasResolution] = useState<ImageResolution>("1K");
+  const [canvasQuality, setCanvasQuality] = useState("auto");
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [optimizeSourceNode, setOptimizeSourceNode] = useState<CanvasNode | null>(null);
+  const [optimizePrompt, setOptimizePrompt] = useState("");
+  const [compressedRef, setCompressedRef] = useState<{ dataUrl: string; size: number } | null>(null);
+  const [isSpaceHeld, setIsSpaceHeld] = useState(false);
+  const [toastMessage, setToastMessage] = useState("");
+  const [canvasLoaded, setCanvasLoaded] = useState(false);
+  const [isMinimapVisible, setIsMinimapVisible] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
+
+  // ── Refs ──
+  const containerRef = useRef<HTMLDivElement>(null);
+  const promptInputRef = useRef<HTMLTextAreaElement>(null);
+  const optimizePromptRef = useRef<HTMLTextAreaElement>(null);
+  const nodesRef = useRef(canvasNodes);
+  nodesRef.current = canvasNodes;
+  const edgesRef = useRef(canvasEdges);
+  edgesRef.current = canvasEdges;
+  const viewportRef = useRef(viewport);
+  viewportRef.current = viewport;
+  const isPanningRef = useRef(false);
+  const isDraggingNodeRef = useRef(false);
+  const panStartRef = useRef({ screenX: 0, screenY: 0, vpX: 0, vpY: 0 });
+  const dragStartRef = useRef({ nodeId: "", startX: 0, startY: 0, screenX: 0, screenY: 0 });
+  const saveTimerRef = useRef<number>(0);
+  const toastTimerRef = useRef<number>(0);
+
+  // ── Helper: aspect ratio to number ──
+  function aspectRatioToNumber(ratio: string): number {
+    const parts = ratio.split(":").map(Number);
+    if (parts.length === 2 && parts[0] > 0 && parts[1] > 0) return parts[0] / parts[1];
+    return 1;
+  }
+
+  // ── Helper: show toast ──
+  function showToast(message: string) {
+    setToastMessage(message);
+    window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToastMessage(""), 2000);
+  }
+
+  // ── Helper: debounced save ──
+  function scheduleSave() {
+    window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      const state: CanvasPersistedState = {
+        nodes: nodesRef.current.map(({ objectUrl: _objectUrl, ...rest }) => rest),
+        edges: edgesRef.current,
+        viewport: viewportRef.current,
+        lastSavedAt: Date.now(),
+      };
+      void saveCanvasStateToDB(state);
+    }, CANVAS_SAVE_DEBOUNCE_MS);
+  }
+
+  // ── Load canvas state from IndexedDB on mount ──
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const saved = await loadCanvasStateFromDB();
+        if (cancelled || !saved) { setCanvasLoaded(true); return; }
+        const loadedNodes: CanvasNode[] = [];
+        for (const node of saved.nodes) {
+          if (node.status === "success") {
+            const blob = await loadCanvasImageFromDB(node.id);
+            if (blob) {
+              loadedNodes.push({ ...node, objectUrl: URL.createObjectURL(blob) });
+            } else {
+              loadedNodes.push({ ...node, status: "error", error: "图片数据丢失" });
+            }
+          } else if (node.status === "generating") {
+            // Was generating when page closed - mark as error
+            loadedNodes.push({ ...node, status: "error", error: "生成中断（页面关闭）" });
+          } else {
+            loadedNodes.push(node);
+          }
+        }
+        if (!cancelled) {
+          setCanvasNodes(loadedNodes);
+          setCanvasEdges(saved.edges || []);
+          setViewport(saved.viewport || { x: 0, y: 0, zoom: 1 });
+          setCanvasLoaded(true);
+        }
+      } catch {
+        if (!cancelled) setCanvasLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Cleanup objectUrls on unmount ──
+  useEffect(() => {
+    return () => {
+      nodesRef.current.forEach((n) => { if (n.objectUrl) URL.revokeObjectURL(n.objectUrl); });
+    };
+  }, []);
+
+  // ── Save on beforeunload ──
+  useEffect(() => {
+    const handler = () => {
+      const state: CanvasPersistedState = {
+        nodes: nodesRef.current.map(({ objectUrl: _objectUrl, ...rest }) => rest),
+        edges: edgesRef.current,
+        viewport: viewportRef.current,
+        lastSavedAt: Date.now(),
+      };
+      void saveCanvasStateToDB(state);
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, []);
+
+  // ── Auto-save when nodes/edges change ──
+  useEffect(() => {
+    if (canvasLoaded) scheduleSave();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasNodes, canvasEdges, canvasLoaded]);
+
+  // ── Zoom helpers ──
+  function clampZoomVal(z: number) { return clampNumber(z, 0.1, 3); }
+
+  function zoomAtPoint(screenX: number, screenY: number, newZoom: number) {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const vp = viewportRef.current;
+    const canvasX = (screenX - rect.left) / vp.zoom + vp.x;
+    const canvasY = (screenY - rect.top) / vp.zoom + vp.y;
+    setViewport({
+      x: canvasX - (screenX - rect.left) / newZoom,
+      y: canvasY - (screenY - rect.top) / newZoom,
+      zoom: newZoom,
+    });
+  }
+
+  function zoomAtCenter(newZoom: number) {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    zoomAtPoint(rect.left + rect.width / 2, rect.top + rect.height / 2, newZoom);
+  }
+
+  function fitAllNodes() {
+    if (canvasNodes.length === 0) return;
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const pad = 80;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of canvasNodes) {
+      if (n.x < minX) minX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.x + n.width > maxX) maxX = n.x + n.width;
+      if (n.y + n.height > maxY) maxY = n.y + n.height;
+    }
+    const cw = maxX - minX + pad * 2;
+    const ch = maxY - minY + pad * 2;
+    const zoom = clampZoomVal(Math.min(rect.width / cw, rect.height / ch));
+    setViewport({
+      x: minX - pad + (cw - rect.width / zoom) / 2,
+      y: minY - pad + (ch - rect.height / zoom) / 2,
+      zoom,
+    });
+  }
+
+  // ── Viewport center in canvas coords ──
+  function viewportCenter() {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    const vp = viewportRef.current;
+    return {
+      x: vp.x + rect.width / (2 * vp.zoom),
+      y: vp.y + rect.height / (2 * vp.zoom),
+    };
+  }
+
+  // ── Find non-overlapping position ──
+  function findNonOverlappingPos(cx: number, cy: number, w: number, h: number) {
+    let x = cx - w / 2;
+    const y = cy - h / 2;
+    const overlaps = (nx: number, ny: number) =>
+      nodesRef.current.some((n) =>
+        nx < n.x + n.width + 20 && nx + w + 20 > n.x && ny < n.y + n.height + 20 && ny + h + 20 > n.y
+      );
+    let attempts = 0;
+    while (overlaps(x, y) && attempts < 20) {
+      x += w + 40;
+      attempts++;
+    }
+    return { x, y };
+  }
+
+  // ── Pan & Zoom event handlers ──
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    function onWheel(e: WheelEvent) {
+      e.preventDefault();
+      const vp = viewportRef.current;
+      if (e.ctrlKey || e.metaKey) {
+        // Zoom
+        const factor = e.deltaY > 0 ? 1 / 1.08 : 1.08;
+        const nz = clampZoomVal(vp.zoom * factor);
+        const rect = el!.getBoundingClientRect();
+        const cx = (e.clientX - rect.left) / vp.zoom + vp.x;
+        const cy = (e.clientY - rect.top) / vp.zoom + vp.y;
+        setViewport({
+          x: cx - (e.clientX - rect.left) / nz,
+          y: cy - (e.clientY - rect.top) / nz,
+          zoom: nz,
+        });
+      } else {
+        // Pan
+        setViewport({
+          x: vp.x + e.deltaX / vp.zoom,
+          y: vp.y + e.deltaY / vp.zoom,
+          zoom: vp.zoom,
+        });
+      }
+    }
+
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // ── Pointer events for panning and node dragging ──
+  function handleCanvasPointerDown(e: React.PointerEvent) {
+    if (e.target !== e.currentTarget && !isSpaceHeld) return; // clicked on a child, not canvas background
+    // Deselect if clicking on canvas background
+    if (e.button === 0 && !isSpaceHeld) {
+      setSelectedNodeId(null);
+      if (panelMode === "optimize") {
+        setPanelMode("generate");
+        setOptimizeSourceNode(null);
+        setCompressedRef(null);
+      }
+    }
+    // Start pan
+    if (e.button === 1 || e.button === 2 || (e.button === 0 && isSpaceHeld)) {
+      e.preventDefault();
+      isPanningRef.current = true;
+      panStartRef.current = {
+        screenX: e.clientX,
+        screenY: e.clientY,
+        vpX: viewportRef.current.x,
+        vpY: viewportRef.current.y,
+      };
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    }
+  }
+
+  function handleCanvasPointerMove(e: React.PointerEvent) {
+    if (isDraggingNodeRef.current) {
+      const ds = dragStartRef.current;
+      const vp = viewportRef.current;
+      const dx = (e.clientX - ds.screenX) / vp.zoom;
+      const dy = (e.clientY - ds.screenY) / vp.zoom;
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === ds.nodeId ? { ...n, x: ds.startX + dx, y: ds.startY + dy } : n
+      ));
+      return;
+    }
+    if (isPanningRef.current) {
+      const ps = panStartRef.current;
+      const vp = viewportRef.current;
+      setViewport({
+        x: ps.vpX - (e.clientX - ps.screenX) / vp.zoom,
+        y: ps.vpY - (e.clientY - ps.screenY) / vp.zoom,
+        zoom: vp.zoom,
+      });
+    }
+  }
+
+  function handleCanvasPointerUp() {
+    if (isDraggingNodeRef.current) {
+      isDraggingNodeRef.current = false;
+      scheduleSave();
+    }
+    if (isPanningRef.current) {
+      isPanningRef.current = false;
+    }
+  }
+
+  function handleNodePointerDown(e: React.PointerEvent, node: CanvasNode) {
+    if (isSpaceHeld || e.button !== 0) return;
+    e.stopPropagation();
+    setSelectedNodeId(node.id);
+    isDraggingNodeRef.current = true;
+    dragStartRef.current = {
+      nodeId: node.id,
+      startX: node.x,
+      startY: node.y,
+      screenX: e.clientX,
+      screenY: e.clientY,
+    };
+  }
+
+  // ── Keyboard shortcuts ──
+  useEffect(() => {
+    function isInputFocused() {
+      const tag = document.activeElement?.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === " " && !isInputFocused()) {
+        e.preventDefault();
+        setIsSpaceHeld(true);
+      }
+      if (e.key === "Escape") {
+        setSelectedNodeId(null);
+        if (panelMode === "optimize") {
+          setPanelMode("generate");
+          setOptimizeSourceNode(null);
+          setCompressedRef(null);
+        }
+        setShowDeleteConfirm(null);
+      }
+      if ((e.key === "Delete" || e.key === "Backspace") && !isInputFocused() && selectedNodeId) {
+        e.preventDefault();
+        setShowDeleteConfirm(selectedNodeId);
+      }
+      if (e.key === "e" && !isInputFocused() && selectedNodeId) {
+        const node = nodesRef.current.find((n) => n.id === selectedNodeId);
+        if (node?.status === "success") void enterOptimizeMode(node);
+      }
+      if (e.key === "m" && !isInputFocused()) {
+        setIsMinimapVisible((v) => !v);
+      }
+      if ((e.metaKey || e.ctrlKey) && (e.key === "=" || e.key === "+")) {
+        e.preventDefault();
+        const nz = clampZoomVal(viewportRef.current.zoom * 1.2);
+        zoomAtCenter(nz);
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "-") {
+        e.preventDefault();
+        const nz = clampZoomVal(viewportRef.current.zoom / 1.2);
+        zoomAtCenter(nz);
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "0") {
+        e.preventDefault();
+        zoomAtCenter(1);
+      }
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "f" || e.key === "F")) {
+        e.preventDefault();
+        fitAllNodes();
+      }
+    }
+    function onKeyUp(e: KeyboardEvent) {
+      if (e.key === " ") setIsSpaceHeld(false);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedNodeId, panelMode]);
+
+  // ── Context menu prevention ──
+  function handleContextMenu(e: React.MouseEvent) {
+    e.preventDefault();
+  }
+
+  // ── Delete node ──
+  function confirmDeleteNode(id: string) {
+    const node = canvasNodes.find((n) => n.id === id);
+    if (node?.objectUrl) URL.revokeObjectURL(node.objectUrl);
+    setCanvasNodes((prev) => prev.filter((n) => n.id !== id));
+    setCanvasEdges((prev) => prev.filter((edge) => edge.fromNodeId !== id && edge.toNodeId !== id));
+    if (selectedNodeId === id) {
+      setSelectedNodeId(null);
+      if (panelMode === "optimize") {
+        setPanelMode("generate");
+        setOptimizeSourceNode(null);
+        setCompressedRef(null);
+      }
+    }
+    setShowDeleteConfirm(null);
+    void deleteCanvasImageFromDB(id);
+  }
+
+  // ── Download node ──
+  function downloadNode(node: CanvasNode) {
+    if (!node.objectUrl) return;
+    const a = document.createElement("a");
+    a.href = node.objectUrl;
+    a.download = `${node.model}-${node.params.aspectRatio.replace(":", "x")}-${Date.now()}.png`;
+    a.click();
+  }
+
+  // ── Copy prompt ──
+  function copyPrompt(node: CanvasNode) {
+    void navigator.clipboard.writeText(node.prompt);
+    showToast("提示词已复制");
+  }
+
+  // ── Enter optimize mode ──
+  async function enterOptimizeMode(node: CanvasNode) {
+    setPanelMode("optimize");
+    setOptimizeSourceNode(node);
+    setOptimizePrompt("");
+    setIsPanelOpen(true);
+    setCompressedRef(null);
+    // Compress the image
+    try {
+      const blob = await loadCanvasImageFromDB(node.id);
+      if (!blob) return;
+      const dataUrl = await blobToDataUrl(blob);
+      // Use createSquareThumbnail with maxEdge 1024
+      const result = await createSquareThumbnail(dataUrl, 1024);
+      const size = Math.round(result.dataUrl.length * 3 / 4); // approximate byte size
+      setCompressedRef({ dataUrl: result.dataUrl, size });
+    } catch {
+      // Failed to compress, use original objectUrl
+    }
+  }
+
+  // ── Generation flow ──
+  async function handleCanvasGenerate() {
+    const trimmedPrompt = canvasPrompt.trim();
+    if (!trimmedPrompt || !canvasModel || modelState.status !== "ready") return;
+
+    const aspectNum = aspectRatioToNumber(canvasAspectRatio);
+    const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
+    const nodeH = Math.round(nodeW / aspectNum);
+    const center = viewportCenter();
+    const pos = findNonOverlappingPos(center.x, center.y, nodeW, nodeH);
+
+    const nodeId = uid();
+    const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel);
+    const newNode: CanvasNode = {
+      id: nodeId,
+      type: "image",
+      x: pos.x,
+      y: pos.y,
+      width: nodeW,
+      height: nodeH,
+      prompt: trimmedPrompt,
+      model: canvasModel,
+      protocol: apiConfig.protocol,
+      params: {
+        aspectRatio: canvasAspectRatio,
+        size,
+        resolution: canvasResolution,
+        quality: canvasQuality,
+        outputFormat: "png",
+        batchCount: 1,
+        concurrency: 1,
+        retryLimit: 0,
+        seed: "",
+        negativePrompt: "",
+      },
+      status: "generating",
+      createdAt: Date.now(),
+    };
+
+    setCanvasNodes((prev) => [...prev, newNode]);
+    setCanvasPrompt("");
+    setIsGenerating(true);
+
+    const startedAt = Date.now();
+    try {
+      const response = await fetch("/api/images/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
+          apiKey: apiConfig.apiKey,
+          clientId: getClientId(),
+          request: {
+            protocol: apiConfig.protocol,
+            model: canvasModel,
+            prompt: trimmedPrompt,
+            referenceImages: [],
+            aspectRatio: canvasAspectRatio,
+            size,
+            resolution: canvasResolution,
+            quality: canvasQuality,
+            outputFormat: "png",
+            seed: "",
+          },
+        }),
+      });
+      const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
+      if (!response.ok || !payload.ok || !payload.images?.[0]?.dataUrl) {
+        const detail = payload.detail && typeof payload.detail === "object"
+          ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
+          : payload.detail || "生成失败";
+        throw new Error(String(detail));
+      }
+      const dataUrl = payload.images[0].dataUrl;
+      const blob = await dataUrlToBlob(dataUrl);
+      const objectUrl = URL.createObjectURL(blob);
+      const { width, height } = await getImageSize(objectUrl);
+      const duration = Date.now() - startedAt;
+      const adjustedH = Math.round(nodeW * (height / width));
+
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === nodeId ? {
+          ...n,
+          status: "success" as const,
+          objectUrl,
+          width: nodeW,
+          height: adjustedH,
+          imageWidth: width,
+          imageHeight: height,
+          duration,
+        } : n
+      ));
+      await saveCanvasImageToDB(nodeId, blob);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === nodeId ? { ...n, status: "error" as const, error: message } : n
+      ));
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+
+  // ── Optimize generation flow ──
+  async function handleCanvasOptimize() {
+    if (!optimizeSourceNode || !compressedRef) return;
+    const sourceNode = optimizeSourceNode;
+    const supplement = optimizePrompt.trim();
+    const finalPrompt = supplement
+      ? `基于参考图进行优化。原始描述：${sourceNode.prompt}。优化方向：${supplement}`
+      : sourceNode.prompt;
+
+    const aspectNum = aspectRatioToNumber(canvasAspectRatio);
+    const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
+    const nodeH = Math.round(nodeW / aspectNum);
+
+    // Position to the right of parent
+    let newX = sourceNode.x + sourceNode.width + 60;
+    let newY = sourceNode.y;
+    // If overlapping, shift down
+    let attempts = 0;
+    while (
+      nodesRef.current.some((n) =>
+        newX < n.x + n.width + 20 && newX + nodeW + 20 > n.x &&
+        newY < n.y + n.height + 20 && newY + nodeH + 20 > n.y
+      ) && attempts < 20
+    ) {
+      newY += nodeH + 40;
+      attempts++;
+    }
+
+    const nodeId = uid();
+    const edgeId = uid();
+    const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel);
+    const newNode: CanvasNode = {
+      id: nodeId,
+      type: "image",
+      x: newX,
+      y: newY,
+      width: nodeW,
+      height: nodeH,
+      prompt: finalPrompt,
+      model: canvasModel,
+      protocol: apiConfig.protocol,
+      params: {
+        aspectRatio: canvasAspectRatio,
+        size,
+        resolution: canvasResolution,
+        quality: canvasQuality,
+        outputFormat: "png",
+        batchCount: 1,
+        concurrency: 1,
+        retryLimit: 0,
+        seed: "",
+        negativePrompt: "",
+      },
+      status: "generating",
+      parentId: sourceNode.id,
+      referenceNodeId: sourceNode.id,
+      createdAt: Date.now(),
+    };
+    const newEdge: CanvasEdge = { id: edgeId, fromNodeId: sourceNode.id, toNodeId: nodeId };
+
+    setCanvasNodes((prev) => [...prev, newNode]);
+    setCanvasEdges((prev) => [...prev, newEdge]);
+    setIsGenerating(true);
+
+    const startedAt = Date.now();
+    try {
+      const response = await fetch("/api/images/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
+          apiKey: apiConfig.apiKey,
+          clientId: getClientId(),
+          request: {
+            protocol: apiConfig.protocol,
+            model: canvasModel,
+            prompt: finalPrompt,
+            referenceImages: [{
+              name: "reference.webp",
+              type: "image/webp",
+              dataUrl: compressedRef.dataUrl,
+              originalBytes: compressedRef.size,
+              requestBytes: compressedRef.size,
+              compressed: true,
+            }],
+            aspectRatio: canvasAspectRatio,
+            size,
+            resolution: canvasResolution,
+            quality: canvasQuality,
+            outputFormat: "png",
+            seed: "",
+          },
+        }),
+      });
+      const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
+      if (!response.ok || !payload.ok || !payload.images?.[0]?.dataUrl) {
+        const detail = payload.detail && typeof payload.detail === "object"
+          ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
+          : payload.detail || "生成失败";
+        throw new Error(String(detail));
+      }
+      const dataUrl = payload.images[0].dataUrl;
+      const blob = await dataUrlToBlob(dataUrl);
+      const objectUrl = URL.createObjectURL(blob);
+      const { width, height } = await getImageSize(objectUrl);
+      const duration = Date.now() - startedAt;
+      const adjustedH = Math.round(nodeW * (height / width));
+
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === nodeId ? {
+          ...n,
+          status: "success" as const,
+          objectUrl,
+          width: nodeW,
+          height: adjustedH,
+          imageWidth: width,
+          imageHeight: height,
+          duration,
+        } : n
+      ));
+      await saveCanvasImageToDB(nodeId, blob);
+      // Auto-select new node for chaining
+      setSelectedNodeId(nodeId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === nodeId ? { ...n, status: "error" as const, error: message } : n
+      ));
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+
+  // ── Retry failed node ──
+  async function retryNode(node: CanvasNode) {
+    setCanvasNodes((prev) => prev.map((n) =>
+      n.id === node.id ? { ...n, status: "generating" as const, error: undefined } : n
+    ));
+    setIsGenerating(true);
+    const startedAt = Date.now();
+    try {
+      const referenceImages: SubmittedReference[] = [];
+      if (node.referenceNodeId && node.parentId) {
+        // Try to get parent's compressed reference
+        const parentBlob = await loadCanvasImageFromDB(node.parentId);
+        if (parentBlob) {
+          const parentDataUrl = await blobToDataUrl(parentBlob);
+          const compressed = await createSquareThumbnail(parentDataUrl, 1024);
+          referenceImages.push({
+            name: "reference.webp",
+            type: "image/webp",
+            dataUrl: compressed.dataUrl,
+            originalBytes: compressed.dataUrl.length,
+            requestBytes: compressed.dataUrl.length,
+            compressed: true,
+          });
+        }
+      }
+      const response = await fetch("/api/images/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
+          apiKey: apiConfig.apiKey,
+          clientId: getClientId(),
+          request: {
+            protocol: node.protocol,
+            model: node.model,
+            prompt: node.prompt,
+            referenceImages,
+            aspectRatio: node.params.aspectRatio,
+            size: node.params.size,
+            resolution: node.params.resolution,
+            quality: node.params.quality,
+            outputFormat: node.params.outputFormat,
+            seed: "",
+          },
+        }),
+      });
+      const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
+      if (!response.ok || !payload.ok || !payload.images?.[0]?.dataUrl) {
+        const detail = payload.detail && typeof payload.detail === "object"
+          ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
+          : payload.detail || "生成失败";
+        throw new Error(String(detail));
+      }
+      const dataUrl = payload.images[0].dataUrl;
+      const blob = await dataUrlToBlob(dataUrl);
+      const objectUrl = URL.createObjectURL(blob);
+      const { width, height } = await getImageSize(objectUrl);
+      const duration = Date.now() - startedAt;
+      const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
+      const adjustedH = Math.round(nodeW * (height / width));
+
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === node.id ? {
+          ...n,
+          status: "success" as const,
+          objectUrl,
+          width: nodeW,
+          height: adjustedH,
+          imageWidth: width,
+          imageHeight: height,
+          duration,
+          error: undefined,
+        } : n
+      ));
+      await saveCanvasImageToDB(node.id, blob);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === node.id ? { ...n, status: "error" as const, error: message } : n
+      ));
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+
+  // ── Computed values ──
+  const selectedNode = canvasNodes.find((n) => n.id === selectedNodeId) || null;
+  const supportedAspectRatios = getSupportedAspectRatios(apiConfig.protocol, canvasModel);
+  const canScale = isGptImage2ProModel(canvasModel) || !usesOfficialGptImageSizing(apiConfig.protocol, canvasModel);
+  const resolvedSize = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel);
+  const isApiReady = modelState.status === "ready" && apiConfig.apiKey.trim().length >= 8;
+
+  // ── Update model when global changes ──
+  useEffect(() => {
+    if (globalSelectedModel && selectableModels.includes(globalSelectedModel)) {
+      setCanvasModel(globalSelectedModel);
+    }
+  }, [globalSelectedModel, selectableModels]);
+
+  // ── Update aspect ratio when model changes ──
+  useEffect(() => {
+    const ratios = getSupportedAspectRatios(apiConfig.protocol, canvasModel);
+    if (!ratios.includes(canvasAspectRatio)) {
+      setCanvasAspectRatio(ratios[0] || "1:1");
+    }
+    if (!canScale) {
+      setCanvasResolution("1K");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasModel, apiConfig.protocol]);
+
+  // ── Floating toolbar position ──
+  const toolbarPos = useMemo(() => {
+    if (!selectedNode || !containerRef.current) return null;
+    const rect = containerRef.current.getBoundingClientRect();
+    const screenX = (selectedNode.x - viewport.x) * viewport.zoom + rect.left + (selectedNode.width * viewport.zoom) / 2;
+    const screenY = (selectedNode.y - viewport.y) * viewport.zoom + rect.top;
+    const aboveY = screenY - 12;
+    const belowY = screenY + selectedNode.height * viewport.zoom + 12;
+    const y = aboveY > rect.top + 56 ? aboveY : belowY;
+    return {
+      x: clampNumber(screenX, rect.left + 100, rect.right - 100),
+      y: clampNumber(y, rect.top + 10, rect.bottom - 50),
+    };
+  }, [selectedNode, viewport]);
+
+  // ── Grid background style ──
+  const gridStyle = useMemo((): CSSProperties => {
+    if (viewport.zoom < 0.25) return {};
+    const spacing = viewport.zoom < 0.5 ? 40 : 20;
+    const rendered = spacing * viewport.zoom;
+    const ox = (-viewport.x * viewport.zoom) % rendered;
+    const oy = (-viewport.y * viewport.zoom) % rendered;
+    return {
+      backgroundImage: `radial-gradient(circle, #e5e5e5 ${Math.max(1, viewport.zoom)}px, transparent ${Math.max(1, viewport.zoom)}px)`,
+      backgroundSize: `${rendered}px ${rendered}px`,
+      backgroundPosition: `${ox}px ${oy}px`,
+    };
+  }, [viewport]);
+
+  // ── Minimap data ──
+  const minimapData = useMemo(() => {
+    if (!isMinimapVisible || canvasNodes.length === 0) return null;
+    const pad = 40;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of canvasNodes) {
+      if (n.x < minX) minX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.x + n.width > maxX) maxX = n.x + n.width;
+      if (n.y + n.height > maxY) maxY = n.y + n.height;
+    }
+    const cw = maxX - minX + pad * 2;
+    const ch = maxY - minY + pad * 2;
+    const scale = Math.min(170 / cw, 110 / ch);
+    const rect = containerRef.current?.getBoundingClientRect();
+    const vpW = rect ? rect.width / viewport.zoom : 0;
+    const vpH = rect ? rect.height / viewport.zoom : 0;
+    return { minX: minX - pad, minY: minY - pad, scale, cw, ch, vpW, vpH };
+  }, [isMinimapVisible, canvasNodes, viewport]);
+
+  // ── Render ──
+  return (
+    <main className={`canvas-page ${isPanelOpen ? "" : "panel-collapsed"}`}>
+      <header className="canvas-topbar">
+        <button type="button" className="home-brand canvas-brand" onClick={onBackHome}>
+          <span><img src={imageStudioLogo} alt="" /></span>
+          <strong>Image Studio</strong>
+          <span className="canvas-topbar-badge">Canvas</span>
+        </button>
+        <div className="canvas-topbar-nav">
+          <button type="button" className="subtle-button" onClick={onBackHome}>首页</button>
+          <button type="button" className="subtle-button" onClick={onEnterStudio}>工作台</button>
+          <button type="button" className="subtle-button" onClick={onEnterSquare}>广场</button>
+        </div>
+      </header>
+
+      {/* Canvas viewport */}
+      <div
+        className={`canvas-viewport ${isSpaceHeld ? "is-space-held" : ""} ${isPanningRef.current ? "is-panning" : ""}`}
+        ref={containerRef}
+        onPointerDown={handleCanvasPointerDown}
+        onPointerMove={handleCanvasPointerMove}
+        onPointerUp={handleCanvasPointerUp}
+        onContextMenu={handleContextMenu}
+        style={gridStyle}
+      >
+        {/* Transform layer */}
+        <div
+          className="canvas-transform-layer"
+          style={{
+            transform: `translate(${-viewport.x * viewport.zoom}px, ${-viewport.y * viewport.zoom}px) scale(${viewport.zoom})`,
+          }}
+        >
+          {/* SVG Edges */}
+          <svg className="canvas-edge-layer">
+            <defs>
+              <marker id="canvas-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+                <path d="M0,0 L6,3 L0,6 Z" fill="rgba(16,185,129,0.4)" />
+              </marker>
+            </defs>
+            {canvasEdges.map((edge) => {
+              const from = canvasNodes.find((n) => n.id === edge.fromNodeId);
+              const to = canvasNodes.find((n) => n.id === edge.toNodeId);
+              if (!from || !to) return null;
+              const x1 = from.x + from.width;
+              const y1 = from.y + from.height / 2;
+              const x2 = to.x;
+              const y2 = to.y + to.height / 2;
+              const dx = Math.abs(x2 - x1) * 0.5;
+              return (
+                <path
+                  key={edge.id}
+                  className="canvas-edge-path"
+                  d={`M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`}
+                  markerEnd="url(#canvas-arrow)"
+                />
+              );
+            })}
+          </svg>
+
+          {/* Nodes */}
+          {canvasNodes.map((node) => (
+            <div
+              key={node.id}
+              className={`canvas-node ${node.status} ${selectedNodeId === node.id ? "selected" : ""} ${isDraggingNodeRef.current && dragStartRef.current.nodeId === node.id ? "dragging" : ""}`}
+              style={{
+                left: node.x,
+                top: node.y,
+                width: node.width,
+                height: node.height,
+              }}
+              onPointerDown={(e) => handleNodePointerDown(e, node)}
+              onDoubleClick={() => {
+                if (node.status === "success") void enterOptimizeMode(node);
+              }}
+            >
+              {node.status === "success" && node.objectUrl && (
+                <img src={node.objectUrl} alt="" draggable={false} className="canvas-node-image" />
+              )}
+              {node.status === "generating" && (
+                <div className="canvas-node-skeleton">
+                  <Loader2 size={24} className="spin" />
+                  <span>生成中...</span>
+                </div>
+              )}
+              {node.status === "error" && (
+                <div className="canvas-node-error-content">
+                  <AlertCircle size={20} />
+                  <span>{node.error || "生成失败"}</span>
+                </div>
+              )}
+              {node.status === "success" && (
+                <>
+                  <span className="canvas-node-badge">{node.model}</span>
+                  {node.duration != null && (
+                    <span className="canvas-node-duration">{formatDuration(node.duration)}</span>
+                  )}
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Empty state */}
+        {canvasLoaded && canvasNodes.length === 0 && (
+          <div className="canvas-empty-state">
+            <ImagePlus size={48} strokeWidth={1.2} />
+            <strong>无限画布</strong>
+            <p>在无边的空间中自由创作</p>
+            <p className="canvas-empty-hint">在右侧面板输入提示词，图片将生成到画布上。<br />选中图片后可以基于它继续优化。</p>
+            <button type="button" className="canvas-empty-action" onClick={() => { setIsPanelOpen(true); promptInputRef.current?.focus(); }}>
+              开始第一次生成 <ArrowRight size={16} />
+            </button>
+          </div>
+        )}
+
+        {/* Floating toolbar */}
+        {selectedNode && toolbarPos && (
+          <div
+            className="canvas-floating-toolbar"
+            style={{ position: "fixed", left: toolbarPos.x, top: toolbarPos.y, transform: "translate(-50%, -100%)" }}
+          >
+            {selectedNode.status === "success" && (
+              <>
+                <button type="button" onClick={() => void enterOptimizeMode(selectedNode)}>
+                  <WandSparkles size={14} /> 优化
+                </button>
+                <button type="button" onClick={() => downloadNode(selectedNode)}>
+                  <Download size={14} /> 下载
+                </button>
+                <button type="button" onClick={() => copyPrompt(selectedNode)}>
+                  <Copy size={14} /> 复制提示词
+                </button>
+                <button type="button" onClick={() => setShowDeleteConfirm(selectedNode.id)}>
+                  <Trash2 size={14} /> 删除
+                </button>
+              </>
+            )}
+            {selectedNode.status === "error" && (
+              <>
+                <button type="button" onClick={() => void retryNode(selectedNode)}>
+                  <RefreshCw size={14} /> 重试
+                </button>
+                <button type="button" onClick={() => setShowDeleteConfirm(selectedNode.id)}>
+                  <Trash2 size={14} /> 删除
+                </button>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Zoom bar */}
+        <div className="canvas-zoom-bar">
+          <button type="button" onClick={() => { const nz = clampZoomVal(viewport.zoom / 1.2); zoomAtCenter(nz); }}>-</button>
+          <input
+            type="range"
+            min={10}
+            max={300}
+            step={5}
+            value={Math.round(viewport.zoom * 100)}
+            onChange={(e) => zoomAtCenter(Number(e.target.value) / 100)}
+          />
+          <span className="canvas-zoom-label">{Math.round(viewport.zoom * 100)}%</span>
+          <button type="button" onClick={() => { const nz = clampZoomVal(viewport.zoom * 1.2); zoomAtCenter(nz); }}>+</button>
+          <button type="button" onClick={fitAllNodes} title="适应全部节点">
+            <Maximize2 size={15} />
+          </button>
+        </div>
+
+        {/* Minimap */}
+        {isMinimapVisible && minimapData && (
+          <div
+            className="canvas-minimap"
+            onPointerDown={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const mx = (e.clientX - rect.left) / minimapData.scale + minimapData.minX;
+              const my = (e.clientY - rect.top) / minimapData.scale + minimapData.minY;
+              setViewport((v) => ({
+                ...v,
+                x: mx - minimapData.vpW / 2,
+                y: my - minimapData.vpH / 2,
+              }));
+            }}
+          >
+            {canvasNodes.map((n) => (
+              <div
+                key={n.id}
+                className={`canvas-minimap-node ${n.status} ${n.id === selectedNodeId ? "selected" : ""}`}
+                style={{
+                  left: (n.x - minimapData.minX) * minimapData.scale,
+                  top: (n.y - minimapData.minY) * minimapData.scale,
+                  width: Math.max(4, n.width * minimapData.scale),
+                  height: Math.max(4, n.height * minimapData.scale),
+                }}
+              />
+            ))}
+            <div
+              className="canvas-minimap-viewport"
+              style={{
+                left: (viewport.x - minimapData.minX) * minimapData.scale,
+                top: (viewport.y - minimapData.minY) * minimapData.scale,
+                width: minimapData.vpW * minimapData.scale,
+                height: minimapData.vpH * minimapData.scale,
+              }}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* Right panel */}
+      <aside className={`canvas-right-panel ${isPanelOpen ? "open" : "closed"}`}>
+        {panelMode === "generate" ? (
+          <>
+            <div className="canvas-panel-header">
+              <strong>画布生成</strong>
+              <button type="button" className="icon-button" onClick={() => setIsPanelOpen(false)} title="收起面板">
+                <PanelRightClose size={16} />
+              </button>
+            </div>
+
+            {/* Model selector */}
+            <div className="canvas-panel-section">
+              <label className="canvas-panel-label">模型</label>
+              <select
+                className="canvas-select"
+                value={canvasModel}
+                onChange={(e) => setCanvasModel(e.target.value)}
+              >
+                {selectableModels.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+              <span className="canvas-panel-hint">{imageModelLaneLabel(canvasModel)}</span>
+            </div>
+
+            {/* Prompt */}
+            <div className="canvas-panel-section">
+              <label className="canvas-panel-label">提示词</label>
+              <textarea
+                ref={promptInputRef}
+                className="canvas-prompt-input"
+                value={canvasPrompt}
+                onChange={(e) => setCanvasPrompt(e.target.value)}
+                placeholder="描述你想生成的图片..."
+                rows={4}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleCanvasGenerate();
+                  }
+                }}
+              />
+            </div>
+
+            {/* Params */}
+            <details className="canvas-panel-details" open>
+              <summary>参数</summary>
+              <div className="canvas-params-grid">
+                <div className="canvas-param">
+                  <label>宽高比</label>
+                  <select
+                    className="canvas-select"
+                    value={canvasAspectRatio}
+                    onChange={(e) => setCanvasAspectRatio(e.target.value)}
+                  >
+                    {supportedAspectRatios.map((r) => (
+                      <option key={r} value={r}>{r}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="canvas-param">
+                  <label>分辨率</label>
+                  <select
+                    className="canvas-select"
+                    value={canvasResolution}
+                    onChange={(e) => setCanvasResolution(e.target.value as ImageResolution)}
+                    disabled={!canScale}
+                  >
+                    <option value="1K">1K</option>
+                    <option value="2K">2K</option>
+                    <option value="4K">4K</option>
+                  </select>
+                </div>
+                <div className="canvas-param">
+                  <label>质量</label>
+                  <select
+                    className="canvas-select"
+                    value={canvasQuality}
+                    onChange={(e) => setCanvasQuality(e.target.value)}
+                  >
+                    <option value="auto">auto</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                  </select>
+                </div>
+              </div>
+            </details>
+
+            {/* Size preview */}
+            <div className="canvas-size-preview">
+              {resolvedSize} &middot; {imageModelLaneLabel(canvasModel)}
+            </div>
+
+            {/* Generate button */}
+            <button
+              type="button"
+              className="canvas-generate-btn"
+              disabled={!canvasPrompt.trim() || !isApiReady || isGenerating}
+              onClick={() => void handleCanvasGenerate()}
+            >
+              {isGenerating ? <><Loader2 size={16} className="spin" /> 生成中...</> : "生成到画布"}
+            </button>
+
+            {!isApiReady && (
+              <div className="canvas-api-hint">
+                请先在工作台配置 API Key 并验证连接
+                <button type="button" className="link-button" onClick={onEnterStudio}>前往配置</button>
+              </div>
+            )}
+
+            {/* Selected node info */}
+            {selectedNode && selectedNode.status === "success" && panelMode === "generate" && (
+              <div className="canvas-panel-section canvas-selected-hint">
+                <span>已选中图片</span>
+                <button type="button" className="canvas-optimize-entry" onClick={() => void enterOptimizeMode(selectedNode)}>
+                  <WandSparkles size={14} /> 基于此图优化
+                </button>
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            {/* Optimize mode */}
+            <div className="canvas-panel-header">
+              <button type="button" className="canvas-back-btn" onClick={() => {
+                setPanelMode("generate");
+                setOptimizeSourceNode(null);
+                setCompressedRef(null);
+              }}>
+                &larr; 返回
+              </button>
+              <strong>优化图片</strong>
+            </div>
+
+            {/* Reference preview */}
+            {compressedRef && (
+              <div className="canvas-ref-preview">
+                <img src={compressedRef.dataUrl} alt="" />
+                <span className="canvas-ref-info">已自动压缩为参考图 &middot; {formatBytes(compressedRef.size)}</span>
+              </div>
+            )}
+            {!compressedRef && optimizeSourceNode && (
+              <div className="canvas-ref-preview loading">
+                <Loader2 size={20} className="spin" />
+                <span>压缩参考图中...</span>
+              </div>
+            )}
+
+            {/* Original prompt */}
+            {optimizeSourceNode && (
+              <div className="canvas-panel-section">
+                <label className="canvas-panel-label">原始提示词</label>
+                <div className="canvas-original-prompt">{optimizeSourceNode.prompt}</div>
+              </div>
+            )}
+
+            {/* Supplementary prompt */}
+            <div className="canvas-panel-section">
+              <label className="canvas-panel-label">补充优化提示词</label>
+              <textarea
+                ref={optimizePromptRef}
+                className="canvas-prompt-input"
+                value={optimizePrompt}
+                onChange={(e) => setOptimizePrompt(e.target.value)}
+                placeholder="描述你想要的修改，如：改为夜景、增加雪花效果..."
+                rows={3}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleCanvasOptimize();
+                  }
+                }}
+              />
+            </div>
+
+            {/* Model & params */}
+            <div className="canvas-panel-section">
+              <label className="canvas-panel-label">模型</label>
+              <select
+                className="canvas-select"
+                value={canvasModel}
+                onChange={(e) => setCanvasModel(e.target.value)}
+              >
+                {selectableModels.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="canvas-params-grid">
+              <div className="canvas-param">
+                <label>宽高比</label>
+                <select
+                  className="canvas-select"
+                  value={canvasAspectRatio}
+                  onChange={(e) => setCanvasAspectRatio(e.target.value)}
+                >
+                  {supportedAspectRatios.map((r) => (
+                    <option key={r} value={r}>{r}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="canvas-param">
+                <label>分辨率</label>
+                <select
+                  className="canvas-select"
+                  value={canvasResolution}
+                  onChange={(e) => setCanvasResolution(e.target.value as ImageResolution)}
+                  disabled={!canScale}
+                >
+                  <option value="1K">1K</option>
+                  <option value="2K">2K</option>
+                  <option value="4K">4K</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Size preview */}
+            <div className="canvas-size-preview">
+              {resolvedSize}
+            </div>
+
+            {/* Optimize button */}
+            <button
+              type="button"
+              className="canvas-generate-btn"
+              disabled={!compressedRef || !isApiReady || isGenerating}
+              onClick={() => void handleCanvasOptimize()}
+            >
+              {isGenerating ? <><Loader2 size={16} className="spin" /> 优化中...</> : "生成优化"}
+            </button>
+          </>
+        )}
+      </aside>
+
+      {/* Panel expand button when collapsed */}
+      {!isPanelOpen && (
+        <button type="button" className="canvas-panel-expand" onClick={() => setIsPanelOpen(true)}>
+          <PanelRightOpen size={18} />
+        </button>
+      )}
+
+      {/* Toast */}
+      {toastMessage && (
+        <div className="canvas-toast">{toastMessage}</div>
+      )}
+
+      {/* Delete confirmation dialog */}
+      {showDeleteConfirm && (
+        <div className="canvas-dialog-overlay" onClick={() => setShowDeleteConfirm(null)}>
+          <div className="canvas-dialog" onClick={(e) => e.stopPropagation()}>
+            <p>确认删除此图片？此操作不可撤销。</p>
+            <div className="canvas-dialog-actions">
+              <button type="button" className="subtle-button" onClick={() => setShowDeleteConfirm(null)}>取消</button>
+              <button type="button" className="canvas-dialog-danger" onClick={() => confirmDeleteNode(showDeleteConfirm)}>删除</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </main>
+  );
+}
+
+function HomePage({ onEnter, onSquare, onAdmin, onCanvas }: { onEnter: () => void; onSquare: () => void; onAdmin: () => void; onCanvas: () => void }) {
   const featureBands = [
     {
       title: "统一记录流",
@@ -8170,6 +9626,9 @@ function HomePage({ onEnter, onSquare, onAdmin }: { onEnter: () => void; onSquar
             <button type="button" onClick={onSquare}>
               广场
             </button>
+            <button type="button" onClick={onCanvas}>
+              画布
+            </button>
             <button type="button" onClick={() => scrollToSection("home-local")}>
               本地优先
             </button>
@@ -8180,6 +9639,9 @@ function HomePage({ onEnter, onSquare, onAdmin }: { onEnter: () => void; onSquar
             </button>
             <button type="button" className="home-nav-action" onClick={onSquare}>
               进入广场
+            </button>
+            <button type="button" className="home-nav-action" onClick={onCanvas}>
+              画布模式
             </button>
             <button type="button" className="home-admin-link" onClick={onAdmin}>
               <ShieldCheck size={16} />
@@ -8204,6 +9666,9 @@ function HomePage({ onEnter, onSquare, onAdmin }: { onEnter: () => void; onSquar
             </button>
             <button type="button" className="home-secondary" onClick={onSquare}>
               浏览广场
+            </button>
+            <button type="button" className="home-secondary" onClick={onCanvas}>
+              画布模式
             </button>
           </div>
           <div className="home-metric-row" aria-label="产品能力摘要">
@@ -8316,10 +9781,12 @@ function SquarePage({
   apiKey,
   onBackHome,
   onEnterStudio,
+  onCanvas,
 }: {
   apiKey: string;
   onBackHome: () => void;
   onEnterStudio: () => void;
+  onCanvas: () => void;
 }) {
   const [tab, setTab] = useState<SquareFeedTab>("latest");
   const [items, setItems] = useState<SquareFeedItem[]>([]);
@@ -8459,6 +9926,9 @@ function SquarePage({
           <button type="button" className="subtle-button" onClick={onEnterStudio}>
             <WandSparkles size={16} />
             工作台
+          </button>
+          <button type="button" className="subtle-button" onClick={onCanvas}>
+            画布
           </button>
           <button type="button" className="subtle-button" onClick={onBackHome}>
             首页

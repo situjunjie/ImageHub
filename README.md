@@ -1,289 +1,279 @@
-# ImageHub 2.0 / Image Studio
+# Image Studio — 本地优先的 AI 生图工作台
 
-ImageHub 是一个本地优先的 AI 生图工作台，现在包含 `Agent 模式 + 社区广场` 两层体验：用户可以在工作台里用自然语言完成单图、多图和画册类创作，也可以把生成结果推荐到广场，让作品进入发现、点赞、排序和后台治理链路。
-
-它适合创作者、运营团队、市场团队和本地部署场景：既保留手动参数控制，又提供低噪音的 Agent 入口，并通过服务端配额、日志和风控记录让广场行为可追溯。
+> 从一句提示词，到一组可复用的视觉资产。把批量生成、无限画布、智能分析、社区广场和本地图库，放进一个安静、清晰、反应迅速的创作空间。
 
 ![Image Studio desktop workspace](docs/screenshots/studio-desktop.png)
 
-## 核心能力
+## 为什么需要 Image Studio
 
-- Agent 模式：开启后输入区收敛为上传参考图、参考图带、提示词输入和发送，系统先流式理解意图，再自动编排生成策略。
-- 单图 / 多图 / 画册识别：单图高置信度可自动执行，多图和画册任务会先展示拆解面板，用户确认后提交。
-- 批量生图：一次提交多张图片，支持并发队列、实时耗时、成功/失败状态和重试。
-- 参考图与提示词：支持上传参考图、填写正向提示词和负面提示词，Agent 模式会自动判断参考图使用策略。
-- 模型列表自动读取：填写 API Key 后会自动尝试读取模型列表，用户也可以手动刷新。
-- 模型选择限制：只允许选择 `gpt-image-2`、`gpt-5.4-image-2` 或名称中包含 `image-2` 的模型。
-- 固定 API 入口：前端请求地址只能选择 `https://www.taijiai.online/` 或 `https://bobdong.cn/`。
-- 常用宽高比：内置 1:1、4:5、9:16、16:9、21:9 等比例，并自动推导请求尺寸。
-- 本地图库：生成结果、提示词、模型、参数、尺寸和耗时保存在当前浏览器 IndexedDB。
-- 图片预览：生成完成后可打开大图预览、复制提示词、下载单图或批量下载。
-- 广场推荐：成功结果可一键推荐到广场，列表使用最长边 1024 的压缩缩略图，原图仍留在本地历史。
-- 广场发现：支持 `最新 / 热门 / 精选 / 本周 / 本月` 视图，初始 20 条，触底继续懒加载。
-- 点赞与配额：推荐和点赞都要求配置 API Key；每 key 最多 4 个展示位，每日推荐 10 次，每日点赞 10 次。
-- 替换规则：同 key 展示位满 4 张后继续推荐，会替换最早展示项并写入替换日志。
-- 管理员后台：查看请求日志、广场概览、推荐趋势、替换率、点赞率、拒绝原因和风控事件，并支持按天导出广场明细。
+市面上的 AI 生图工具大多是云端 SaaS，生成结果散落在各个平台，本地无法回溯；或者是简单的 API 包装，缺少批量管理、空间化创作和团队协作的能力。
 
-## 产品页面
+**Image Studio** 以 **local-first** 为底层设计原则——所有图片、提示词、参数和历史记录默认保存在当前浏览器 IndexedDB 中，不经过任何第三方服务器。你拥有自己的数据，不被平台锁定。
 
-### 工作台
+## 四大功能模块
 
-中间区域以平铺画廊展示生成记录，右侧配置 API、模型、宽高比、质量、格式、张数与并发，底部输入区用于提示词和参考图。开启 Agent 模式后，界面会隐藏大部分参数噪音，让用户专注描述任务。
+### 🎨 工作台（Studio）
 
-![Studio gallery](docs/screenshots/studio-gallery.png)
+全功能批量生图工作站。
 
-### 图片预览
+- **批量生成**：一次提交 1–20 张图片，1–6 路并发队列，实时显示进度和耗时
+- **多模型支持**：`gpt-image-2` / `gpt-image-2-pro` / `gpt-5.4-image-2` 等 image-2 系列模型
+- **Pro 高分辨率**：gpt-image-2-pro 支持 1K / 2K / 4K 输出，最长边 3840px
+- **参考图上传**：最多 6 张参考图，自动压缩到 API 限制，保留原图在本地
+- **智能分析**：生成前自动检测提示词风险、参数匹配度和可能的失败原因
+- **Agent 模式**：自然语言描述需求，系统自动识别「单图 / 多图批量 / 画册项目」意图并编排生成策略
+- **图片预览**：全屏大图预览、参数详情、一键下载、复制提示词、推荐到广场
 
-生成完成后可以进入预览模式，查看原图比例、尺寸、生成参数和提示词；成功图片可直接推荐到广场。
+![Studio gallery view](docs/screenshots/studio-gallery.png)
 
-![Preview modal](docs/screenshots/preview-modal.png)
+### 🖼️ 无限画布（Canvas）
 
-### 首页
+空间化迭代式创作工作台——参考 Lovart ChatCanvas 交互范式。
 
-首页用于介绍项目能力，并提供进入工作台、广场和管理后台的入口。
+- **无限画布**：DOM + CSS transform 实现的无限二维空间，自由平移缩放
+- **图片即节点**：每次生成在画布上创建一个图片节点，自由拖拽排列
+- **选中即优化**：选中一张图片，自动作为参考图，补充提示词即可生成优化版本
+- **迭代树可视化**：父节点→子节点用 SVG 贝塞尔曲线连接，直观展示创作演化路径
+- **独立参数面板**：右侧 360px 可折叠面板，生成模式 / 优化模式自动切换
+- **参考图压缩**：优化时自动将选中图片压缩到 1024px WebP 格式作为参考图
+- **浮动工具栏**：选中节点后显示「优化 / 下载 / 复制提示词 / 删除」操作栏
+- **缩放控制**：底部滑块 + 百分比 + 适应全部 + 小地图
+- **持久化**：画布状态和节点图片分别存储在 IndexedDB，关闭浏览器不丢失
+- **快捷键**：Space 拖拽、Cmd+/-/0 缩放、E 优化、M 小地图、Delete 删除
 
-![Home page](docs/screenshots/home.png)
+### 🏛️ 广场（Square）
 
-### 广场
+创作者作品展示与发现社区。
 
-广场是创作展示与分发层。作品以 1K 缩略图展示，卡片包含标题、Prompt 标签、模型、参数、尺寸、来源和点赞数；用户可以复制提示词、打开展示图或点赞。
+- **推荐到广场**：成功生成的图片一键推荐，服务端保存 1K 压缩缩略图
+- **多维度浏览**：最新 / 热门 / 精选 / 本周 / 本月，触底无限懒加载
+- **点赞互动**：每日 10 次推荐配额、10 次点赞配额，按 API Key 哈希识别身份
+- **展示位管理**：单 Key 最多 4 张展示位，超出自动替换最早作品
+- **原图保护**：广场只存储压缩缩略图，原图始终保留在创作者本地
 
-广场入口：
+### 🛡️ 管理后台（Admin）
 
-```text
-http://localhost:8877/#square
-```
+运维与治理仪表盘。
 
-### 管理后台
-
-管理员可以查看生成请求统计、成功率、失败分布和日志明细，也可以查看广场展示数、推荐尝试、替换率、点赞数、拒绝原因和风控事件。
+- **请求统计**：总请求数、成功率、平均耗时、模型使用分布、失败原因 Top
+- **日志查询**：按状态和关键词筛选请求日志，requestId 可与客户端对齐排查
+- **广场治理**：展示数、推荐尝试、替换率、点赞数、拒绝原因和风控事件
+- **数据导出**：按天导出广场明细，支持 JSON 和 CSV 格式
 
 ![Admin login](docs/screenshots/admin-login.png)
 
-## 系统架构
+## 快速开始
 
-```mermaid
-flowchart LR
-  User["用户浏览器"] --> UI["React 工作台"]
-  UI --> IDB["IndexedDB 本地历史"]
-  UI --> SquareUI["广场页面"]
-  UI --> Proxy["Vite 本地代理"]
-  SquareUI --> Proxy
-  Proxy --> Models["/api/models"]
-  Proxy --> Generate["/api/images/generate"]
-  Generate --> Upstream["上游 /v1/images/generations"]
-  Proxy --> AdminStore[".data/admin-store.json"]
-  Proxy --> SquareStore[".data/square-store.json"]
-  Admin["管理员后台"] --> Proxy
-```
+### 环境要求
 
-## 数据与隐私策略
+- Node.js >= 18
+- 支持 `image-2` 系列模型的 API Key
 
-ImageHub 仍然采用 local-first 设计，但广场推荐是一个明确的发布动作：
-
-- 生成图片 Blob 默认只保存在当前浏览器 IndexedDB。
-- 本地历史保存生成提示词、模型、参数、尺寸、耗时和错误详情。
-- 服务端管理员日志记录请求元信息和结果状态，不记录 API Key 原文。
-- API Key 作为当前版本身份凭证，服务端只保存哈希值用于配额、点赞和风控。
-- 用户推荐到广场后，服务端会保存 1K 压缩缩略图、提示词、模型、参数和来源信息。
-- 原图不进入广场存储，仍保留在本地历史/预览中。
-- 广场推荐、替换、拒绝、点赞、取消点赞、风控事件会写入 `.data/square-store.json`。
-- `.data/admin-store.json` 和 `.data/square-store.json` 都是本地运行时数据，已通过 `.gitignore` 排除。
-
-## 业务规则
-
-广场当前按 API Key 哈希识别用户身份：
-
-| 规则 | 当前默认值 |
-| --- | --- |
-| 单 key 总展示位 | 4 张 |
-| 单 key 每日推荐额度 | 10 次 |
-| 单 key 每日点赞额度 | 10 次 |
-| 广场分页 | 每次最多 20 条 |
-| 缩略图尺寸 | 最长边 1024，不放大小图 |
-| 日切时区 | `Asia/Shanghai` |
-
-推荐行为：
-
-- 展示位未满 4 张时直接加入广场。
-- 展示位已满且日额度未超时，替换最早展示项。
-- 日推荐额度超限时拒绝。
-- 重复推荐同 key 的同图会拒绝，避免刷占展示位。
-
-点赞行为：
-
-- 首次点赞消耗 1 次日点赞额度。
-- 重复点赞是幂等 `noop`，不重复扣额度。
-- 取消点赞不消耗新额度。
-- 点赞超限时拒绝并返回剩余额度。
-
-## 管理员系统
-
-后台地址：
-
-```text
-http://localhost:8877/#admin
-```
-
-默认管理员：
-
-```text
-用户名：admin
-密码：admin123456
-```
-
-首次登录后系统会要求重置密码。也可以通过环境变量配置初始管理员：
+### 安装与启动
 
 ```bash
-ADMIN_USERNAME=admin ADMIN_INITIAL_PASSWORD=your-password npm run dev
-```
-
-管理员后台能力：
-
-- 查看总请求数、成功率、失败数、平均耗时。
-- 查看模型使用分布和常见失败原因。
-- 按状态和关键词筛选请求日志。
-- 查看请求 `requestId`，便于和用户侧错误对齐排查。
-- 查看广场活跃展示数、推荐尝试、替换率和点赞数。
-- 查看广场今日推荐、点赞、替换、拒绝趋势。
-- 查看广场拒绝原因 Top 和风控事件。
-- 按天导出广场推荐 / 点赞 / 替换 / 拒绝明细，支持 JSON 和 CSV。
-
-## 本地启动
-
-项目使用 Vite + React + TypeScript，默认端口固定为 `8877`。
-
-```bash
+git clone https://github.com/d100000/ImageHub.git
+cd ImageHub
 npm install
 npm run dev
 ```
 
-打开：
+打开浏览器访问 http://localhost:8877
 
-```text
-http://localhost:8877/
-```
-
-构建生产包：
+### 生产构建
 
 ```bash
-npm run build
+npm run build     # TypeScript 检查 + Vite 构建
+npm run preview   # 预览生产包
 ```
 
-本地预览：
+### 管理员配置
+
+默认管理员账号 `admin` / `admin123456`，首次登录强制重置密码。
 
 ```bash
-npm run preview
+# 自定义初始管理员
+ADMIN_USERNAME=admin ADMIN_INITIAL_PASSWORD=your-password npm run dev
 ```
+
+管理后台地址：http://localhost:8877/#admin
 
 ## 使用流程
 
 ### 标准模式
 
-1. 打开首页并进入工作台。
-2. 在右侧配置区选择 API URL。
-3. 填写 API Key，系统会在停止输入 1 秒后静默尝试读取模型列表。
-4. 选择可用的 `image-2` 模型。
-5. 设置宽高比、质量、格式、张数、并发和 Seed。
-6. 输入提示词，必要时上传参考图。
-7. 点击生成，任务会进入中间画廊并显示实时耗时。
-8. 生成完成后可以预览、复制提示词、下载图片或推荐到广场。
+1. 进入工作台，选择 API URL，填写 API Key（自动验证并读取模型列表）
+2. 选择模型、设置宽高比 / 分辨率 / 质量 / 张数 / 并发
+3. 输入提示词，可上传参考图
+4. 点击生成 → 实时进度 → 预览 / 下载 / 推荐到广场
 
 ### Agent 模式
 
-1. 在输入区开启 Agent 模式。
-2. 上传参考图并输入自然语言需求。
-3. 系统流式分析意图，展示理解进度和策略预览。
-4. 单图高置信度任务自动执行。
-5. 多图和画册任务先展示任务拆解，确认后统一提交。
-6. 任务提交后 Agent 面板默认收起，结果进入画廊。
-7. 需要调整策略时可点击重新分析。
+1. 开启 Agent 模式 → 输入自然语言需求
+2. 系统流式分析意图：单图自动执行，多图/画册展示任务拆解
+3. 确认后统一提交，结果进入画廊
 
-### 广场
+### 画布模式
 
-1. 生成成功后，在结果卡片或预览弹窗中点击推荐到广场。
-2. 服务端生成推荐记录，并返回新增、替换或拒绝状态。
-3. 打开 `#square` 浏览最新、热门、精选、本周或本月内容。
-4. 配置 API Key 后可以点赞或取消点赞。
-5. 管理员可在后台查看配额、替换、拒绝和风控日志。
+1. 进入画布页面，在右侧面板输入提示词
+2. 点击「生成到画布」→ 图片节点出现在画布上
+3. 选中图片 → 点击「优化」→ 补充提示词 → 基于参考图生成新版本
+4. 反复迭代，构建视觉创作演化树
 
-## 本地 API
+## 系统架构
 
-生成与模型：
-
-```text
-POST /api/models
-POST /api/images/generate
-POST /api/analyze-prompt
-POST /api/agent-mode/analyze
+```mermaid
+flowchart LR
+  subgraph 浏览器
+    UI["React 前端"]
+    IDB["IndexedDB<br/>图片·历史·画布"]
+    UI --> IDB
+  end
+  subgraph 本地服务
+    Proxy["Vite 中间件<br/>(vite.config.ts)"]
+    AdminStore[".data/admin-store.json"]
+    SquareStore[".data/square-store.json"]
+    Proxy --> AdminStore
+    Proxy --> SquareStore
+  end
+  UI -->|"API 请求"| Proxy
+  Proxy -->|"代理转发"| Upstream["上游 API<br/>/v1/images/generations"]
 ```
 
-广场：
+**关键设计决策：**
 
-```text
-GET  /api/square/feed?tab=latest|hot|top_day|top_week|top_month&cursor=&limit=20
-GET  /api/square/quota?apiKey=
-POST /api/square/recommend
-POST /api/square/like
-GET  /api/square/admin/overview
-GET  /api/square/admin/export?format=json|csv&dateKey=YYYY-MM-DD
+- **全栈单文件**：前端 `src/App.tsx`（~11000 行），后端 `vite.config.ts`（~4200 行），样式 `src/styles.css`（~7900 行）
+- **无外部依赖**：画布用原生 DOM + CSS transform，不引入 react-flow / fabric.js
+- **无路由库**：URL hash (`#studio` / `#canvas` / `#square` / `#admin`) + `activePage` 状态切换
+- **无状态管理库**：纯 `useState` + `useRef`，生成队列用 ref 避免渲染抖动
+- **IndexedDB v3**：三个 store — `history`（生成记录）、`canvas-state`（画布状态）、`canvas-images`（画布图片）
+
+## 数据与隐私策略
+
+Image Studio 采用 **local-first** 设计，隐私保护是产品底线：
+
+| 数据类型 | 存储位置 | 说明 |
+|---------|---------|------|
+| 生成图片 Blob | 浏览器 IndexedDB | 不上传服务端 |
+| 画布节点图片 | 浏览器 IndexedDB | 不上传服务端 |
+| 提示词·参数·历史 | 浏览器 IndexedDB | 本地回溯 |
+| API Key | 浏览器 Storage | 服务端仅记录长度和 4 字符前缀 |
+| 广场缩略图 | 服务端 JSON | 用户主动推荐才上传，最长边 1024px |
+| 请求元数据 | 服务端 JSON | 仅记录 model / status / duration / error 类型 |
+
+**绝不记录：** API Key 原文、图片 URL、图片 base64、参考图内容。
+
+## API 端点
+
+<details>
+<summary>生成与模型</summary>
+
+```
+POST /api/models              # 读取可用模型列表
+POST /api/images/generate     # 生成图片（代理转发）
+GET  /api/temp-reference/:id  # 临时参考图 URL（内存 10min TTL）
+POST /api/agent/analyze       # Agent 意图分析
 ```
 
-管理员：
+</details>
 
-```text
-GET  /api/admin/me
-POST /api/admin/login
-POST /api/admin/logout
-POST /api/admin/change-password
-GET  /api/admin/stats
-GET  /api/admin/requests
-GET  /api/admin/logs/export
+<details>
+<summary>广场</summary>
+
+```
+GET  /api/square/feed?tab=latest&cursor=&limit=20  # 浏览 feed
+GET  /api/square/quota                              # 查询配额
+POST /api/square/recommend                          # 推荐图片
+POST /api/square/like                               # 点赞/取消
+GET  /api/square/image/:id                          # 缩略图二进制
+GET  /api/square/admin/overview                     # 广场概览
+GET  /api/square/admin/export?format=json&dateKey=  # 数据导出
 ```
 
-上游图片生成请求使用 OpenAI 兼容格式，核心端口为：
+</details>
 
-```text
-/v1/images/generations
+<details>
+<summary>管理员</summary>
+
 ```
+POST /api/admin/login            # 登录
+POST /api/admin/logout           # 登出
+POST /api/admin/change-password  # 修改密码
+GET  /api/admin/me               # 当前会话
+GET  /api/admin/stats            # 统计数据
+GET  /api/admin/requests         # 请求日志
+```
+
+</details>
+
+## 业务规则
+
+| 规则 | 默认值 |
+|------|--------|
+| 单 Key 广场展示位 | 4 张 |
+| 每日推荐配额 | 10 次 |
+| 每日点赞配额 | 10 次 |
+| 广场分页大小 | 20 条 |
+| 缩略图尺寸 | 最长边 1024px |
+| API URL 白名单 | `taijiai.online` / `bobdong.cn` |
+| 模型白名单 | 名称含 `image-2` |
+| 管理员密码 | scrypt 哈希，首次登录强制重置 |
 
 ## 技术栈
 
-- React 19
-- TypeScript
-- Vite 6
-- lucide-react
-- IndexedDB
-- Vite dev middleware proxy
-- 本地 JSON 管理员日志存储
-- 本地 JSON 广场存储
+| 技术 | 用途 |
+|------|------|
+| React 19 | UI 框架 |
+| TypeScript 5.7 | 类型安全 |
+| Vite 6 | 构建工具 + 后端中间件 |
+| lucide-react | 图标库 |
+| IndexedDB | 本地数据持久化 |
+| CSS Custom Properties | 主题系统 |
+| scrypt | 管理员密码哈希 |
+
+## 项目结构
+
+```
+├── src/
+│   ├── App.tsx          # 全部前端逻辑（~11000 行）
+│   ├── main.tsx         # React 挂载入口
+│   ├── styles.css       # 全局样式（~7900 行）
+│   └── assets/          # Logo、首页截图
+├── vite.config.ts       # Vite 配置 + 全部后端中间件（~4200 行）
+├── docs/
+│   ├── agent-mode-brochure-prd.md   # Agent 模式产品规格
+│   ├── canvas-mode-prd.md           # 画布模式产品规格
+│   └── screenshots/                 # README 截图
+├── .data/               # 运行时数据（gitignored）
+│   ├── admin-store.json # 管理员 + 请求日志
+│   └── square-store.json# 广场数据
+└── package.json
+```
 
 ## 适用场景
 
-- 电商商品图批量探索
-- 社媒封面和短视频封面生成
-- 海报、场景图、人物图方向测试
-- 官网头图、活动视觉和销售物料生成
-- 多图异构创意拆解
-- 宣传画册 / 彩页初稿探索
-- 团队内部作品展示与复用提示词
-- 多模型服务的生图接口验证
-- 本地保留生成历史和失败排查记录
+- 📦 电商商品图批量探索与 A/B 测试
+- 📱 社媒封面、短视频封面批量生成
+- 🎨 海报、场景图、人物图方向迭代
+- 📐 官网头图、活动视觉、销售物料生成
+- 📖 宣传画册 / 彩页初稿探索（Agent 模式）
+- 🖼️ 创意迭代与视觉演化探索（画布模式）
+- 👥 团队内部作品展示与提示词复用（广场）
+- 🔍 多模型生图接口验证与性能对比
+- 📊 生成历史回溯与失败原因排查
 
 ## 开发说明
 
-仓库中的运行时数据不会提交：
+以下目录不会提交到仓库：
 
-```text
-dist/
-node_modules/
-.data/
-generated_images/
-screenshot-*.png
+```
+dist/                  # 构建产物
+node_modules/          # 依赖
+.data/                 # 运行时数据
+generated_images/      # 临时生成图
+screenshot-*.png       # 截图文件
 ```
 
-README 中使用的项目截图保存在：
+## 许可证
 
-```text
-docs/screenshots/
-```
+本项目仅供学习和内部使用。
