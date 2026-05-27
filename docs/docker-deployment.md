@@ -26,6 +26,12 @@
 docker compose up -d --build
 ```
 
+如果服务器访问 Docker Hub 受限，可以临时指定 Node 基础镜像源：
+
+```bash
+NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine docker compose up -d --build
+```
+
 启动后访问：
 
 ```text
