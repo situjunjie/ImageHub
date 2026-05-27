@@ -126,6 +126,38 @@ docker compose up -d --build
 docker compose up -d --build --force-recreate
 ```
 
+## GitHub Actions 自动发布
+
+项目提供 `.github/workflows/docker-publish.yml`，当 `master-situ` 分支发生 push 时，会自动构建并推送多架构 Docker 镜像：
+
+- `linux/amd64`
+- `linux/arm64`
+
+推送到 Docker Hub 的镜像标签：
+
+- `situjunjie976/image-hub:latest`
+- `situjunjie976/image-hub:0.0.x`
+
+版本号从 Git tag 自动递增。仓库没有 `v*.*.*` 标签时，首次发布为 `0.0.1`；之后按 patch 版本递增，例如 `0.0.2`、`0.0.3`。
+
+在 GitHub 仓库中配置以下 Secrets：
+
+```text
+DOCKERHUB_USERNAME=situjunjie976
+DOCKERHUB_TOKEN=你的 Docker Hub Access Token
+```
+
+建议使用 Docker Hub Access Token，不要直接使用 Docker Hub 登录密码。
+
+如果需要改成其他分支触发，修改 `.github/workflows/docker-publish.yml` 中的：
+
+```yaml
+on:
+  push:
+    branches:
+      - master-situ
+```
+
 ## 公网反向代理
 
 生产环境建议使用 Nginx、Caddy 或云厂商网关做 HTTPS 反向代理。
