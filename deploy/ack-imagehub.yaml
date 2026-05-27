@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: imagehub
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: imagehub-admin
+  namespace: imagehub
+type: Opaque
+stringData:
+  ADMIN_USERNAME: admin
+  ADMIN_INITIAL_PASSWORD: change-this-password-before-apply
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: imagehub-data
+  namespace: imagehub
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: imagehub
+  namespace: imagehub
+  labels:
+    app: imagehub
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: imagehub
+  template:
+    metadata:
+      labels:
+        app: imagehub
+    spec:
+      containers:
+        - name: imagehub
+          image: situjunjie976/image-hub:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8877
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: imagehub-admin
+                  key: ADMIN_USERNAME
+            - name: ADMIN_INITIAL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: imagehub-admin
+                  key: ADMIN_INITIAL_PASSWORD
+          readinessProbe:
+            httpGet:
+              path: /build-version.json
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /build-version.json
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: imagehub-data
+              mountPath: /app/.data
+      volumes:
+        - name: imagehub-data
+          persistentVolumeClaim:
+            claimName: imagehub-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: imagehub
+  namespace: imagehub
+  labels:
+    app: imagehub
+  annotations:
+    service.beta.kubernetes.io/alibaba-cloud-loadbalancer-address-type: internet
+spec:
+  type: LoadBalancer
+  selector:
+    app: imagehub
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

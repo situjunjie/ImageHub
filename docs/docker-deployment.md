@@ -158,6 +158,28 @@ on:
       - master-situ
 ```
 
+## 阿里云 ACK 部署
+
+仓库新增了 [deploy/ack-imagehub.yaml](/Users/situjunjie/projects/ImageHub/deploy/ack-imagehub.yaml)，可直接在 ACK 中使用：
+
+```bash
+kubectl apply -f deploy/ack-imagehub.yaml
+```
+
+这个清单包含：
+
+- `Namespace`
+- `Secret`：管理员账号和初始密码
+- `PVC`：持久化 `.data`
+- `Deployment`：单副本运行 ImageHub
+- `Service`：`LoadBalancer` 对外暴露
+
+注意：
+
+- 这个项目当前的运行时数据保存在 `.data`，所以建议保持单副本。
+- 如果你的 ACK 集群默认存储类不是 `alicloud-disk-essd`，请按集群实际情况调整 `PersistentVolumeClaim`。
+- 部署前先把 `Secret` 里的初始密码改掉。
+
 ## 公网反向代理
 
 生产环境建议使用 Nginx、Caddy 或云厂商网关做 HTTPS 反向代理。
