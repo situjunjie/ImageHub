@@ -12,6 +12,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 import { defineConfig, type PluginOption, type ViteDevServer } from "vite";
 
+const ALLOWED_HOSTS = ["ai-img.gigimed.cn"];
+
 type ImageProtocol =
   | "custom-openai"
   | "openai-images"
@@ -4210,10 +4212,12 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 8877,
     strictPort: true,
+    allowedHosts: ALLOWED_HOSTS,
   },
   preview: {
     host: "0.0.0.0",
     port: 8877,
     strictPort: true,
+    allowedHosts: ALLOWED_HOSTS,
   },
 });

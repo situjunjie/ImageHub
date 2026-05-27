@@ -53,6 +53,53 @@ function uid() {
 }
 ```
 
+### Deployment Host Allowlist
+
+#### 1. Scope / Trigger
+- Trigger: Vite dev or preview servers are exposed behind a deployment domain or reverse proxy.
+
+#### 2. Signatures
+- Configure `server.allowedHosts` and `preview.allowedHosts` in `vite.config.ts`.
+
+#### 3. Contracts
+- `allowedHosts` must be a string array of explicit hostnames such as `["ai-img.gigimed.cn"]`.
+- Avoid `allowedHosts: true` because it allows any Host header.
+
+#### 4. Validation & Error Matrix
+- Missing deployed hostname -> Vite returns "Blocked request. This host (...) is not allowed."
+- Host configured only under `server` -> `vite preview` deployments can still reject the domain.
+
+#### 5. Good/Base/Bad Cases
+- Good: A shared constant is assigned to both `server.allowedHosts` and `preview.allowedHosts`.
+- Base: Localhost and IP access continue to work through Vite defaults.
+- Bad: Disabling host validation globally with `allowedHosts: true`.
+
+#### 6. Tests Required
+- Run `npm run build` to verify the config is type-compatible with the installed Vite version.
+- For deployment incidents, restart the Vite process and request the deployed domain once to confirm the block is gone.
+
+#### 7. Wrong vs Correct
+
+Wrong:
+```typescript
+server: {
+  allowedHosts: true,
+}
+```
+
+Correct:
+```typescript
+const ALLOWED_HOSTS = ["ai-img.gigimed.cn"];
+
+server: {
+  allowedHosts: ALLOWED_HOSTS,
+}
+
+preview: {
+  allowedHosts: ALLOWED_HOSTS,
+}
+```
+
 ---
 
 ## Testing Requirements
