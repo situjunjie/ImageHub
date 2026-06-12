@@ -2,6 +2,7 @@
   "name": "codex-image-batch-studio",
   "private": true,
   "version": "0.1.0",
+  "description": "ImageHub / Image Studio —— 本地优先的 AI 生图工作台：批量生成、无限画布、社区广场与管理后台，图片数据 100% 留在浏览器 IndexedDB",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",

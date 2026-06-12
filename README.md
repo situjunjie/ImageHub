@@ -1,6 +1,12 @@
 # Image Studio — 本地优先的 AI 生图工作台
 
-> 从一句提示词，到一组可复用的视觉资产。把批量生成、无限画布、智能分析、社区广场和本地图库，放进一个安静、清晰、反应迅速的创作空间。
+![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)
+![TypeScript 5.7](https://img.shields.io/badge/TypeScript-5.7-3178C6?logo=typescript&logoColor=white)
+![Vite 6](https://img.shields.io/badge/Vite-6-646CFF?logo=vite&logoColor=white)
+![IndexedDB](https://img.shields.io/badge/%E6%95%B0%E6%8D%AE%E5%AD%98%E5%82%A8-%E6%9C%AC%E5%9C%B0%E4%BC%98%E5%85%88-10A37F)
+![Zero Canvas Deps](https://img.shields.io/badge/%E6%97%A0%E9%99%90%E7%94%BB%E5%B8%83-%E9%9B%B6%E5%A4%96%E9%83%A8%E4%BE%9D%E8%B5%96-8B5CF6)
+
+> 从一句提示词，到一组可复用的视觉资产。把批量生成、无限画布、智能分析、社区广场和本地图库，放进一个安静、清晰、反应迅速的创作空间。生成的每一张图都属于你——图片数据 100% 留在浏览器 IndexedDB，服务端只做代理转发，不落盘任何图片内容。
 
 ![Image Studio desktop workspace](docs/screenshots/studio-desktop.png)
 
@@ -18,7 +24,7 @@
 
 - **批量生成**：一次提交 1–20 张图片，1–6 路并发队列，实时显示进度和耗时
 - **多模型支持**：`gpt-image-2` / `gpt-image-2-pro` / `gpt-5.4-image-2` 等 image-2 系列模型
-- **Pro 高分辨率**：gpt-image-2-pro 支持 1K / 2K / 4K 输出，最长边 3840px
+- **高分辨率尺寸**：gpt-image-2 / gpt-image-2-pro 支持显式 2K / 4K 尺寸选择（9 个 2K + 4 个 4K 标准尺寸），最长边 3840px，所见即所得——请求尺寸与产出像素严格一致
 - **参考图上传**：最多 6 张参考图，自动压缩到 API 限制，保留原图在本地
 - **智能分析**：生成前自动检测提示词风险、参数匹配度和可能的失败原因
 - **Agent 模式**：自然语言描述需求，系统自动识别「单图 / 多图批量 / 画册项目」意图并编排生成策略
@@ -217,6 +223,7 @@ GET  /api/admin/requests         # 请求日志
 | 缩略图尺寸 | 最长边 1024px |
 | API URL 白名单 | `taijiai.online` / `bobdong.cn` |
 | 模型白名单 | 名称含 `image-2` |
+| gpt-image-2 尺寸约束 | 宽高均为 16 的倍数 · 最长边 ≤ 3840 · 总像素 ≤ 829 万（上游实测规则） |
 | 管理员密码 | scrypt 哈希，首次登录强制重置 |
 
 ## 技术栈

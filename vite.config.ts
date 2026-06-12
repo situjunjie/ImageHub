@@ -1224,33 +1224,25 @@ const SIZE_BY_RATIO: Record<string, string> = {
   "16:9": "1792x1024",
   "21:9": "2016x864",
   "9:21": "864x2016",
+  "12:5": "2016x840",
+  "5:12": "840x2016",
 };
 
-const PRO_2K_SIZE_BY_RATIO: Record<string, string> = {
-  "1:1": "2048x2048",
-  "4:5": "2048x2560",
-  "5:4": "2560x2048",
-  "3:4": "2304x3072",
-  "4:3": "3072x2304",
-  "2:3": "2048x3072",
-  "3:2": "3072x2048",
-  "9:16": "2160x3840",
-  "16:9": "3840x2160",
-  "21:9": "3840x1646",
-};
-
-const PRO_4K_SIZE_BY_RATIO: Record<string, string> = {
-  "1:1": "3840x3840",
-  "4:5": "3072x3840",
-  "5:4": "3840x3072",
-  "3:4": "2880x3840",
-  "4:3": "3840x2880",
-  "2:3": "2560x3840",
-  "3:2": "3840x2560",
-  "9:16": "2160x3840",
-  "16:9": "3840x2160",
-  "21:9": "3840x1646",
-};
+const GPT_IMAGE_2_SIZE_OPTIONS = [
+  { size: "2560x1440", aspectRatio: "16:9", resolution: "2K" },
+  { size: "1440x2560", aspectRatio: "9:16", resolution: "2K" },
+  { size: "2048x1152", aspectRatio: "16:9", resolution: "2K" },
+  { size: "1152x2048", aspectRatio: "9:16", resolution: "2K" },
+  { size: "2048x2048", aspectRatio: "1:1", resolution: "2K" },
+  { size: "2048x1536", aspectRatio: "4:3", resolution: "2K" },
+  { size: "1536x2048", aspectRatio: "3:4", resolution: "2K" },
+  { size: "2048x3072", aspectRatio: "2:3", resolution: "2K" },
+  { size: "3072x2048", aspectRatio: "3:2", resolution: "2K" },
+  { size: "3840x2160", aspectRatio: "16:9", resolution: "4K" },
+  { size: "2160x3840", aspectRatio: "9:16", resolution: "4K" },
+  { size: "3840x1600", aspectRatio: "12:5", resolution: "4K" },
+  { size: "1600x3840", aspectRatio: "5:12", resolution: "4K" },
+];
 
 const RESOLUTION_MULTIPLIER: Record<string, number> = {
   "1K": 1,
@@ -1260,6 +1252,21 @@ const RESOLUTION_MULTIPLIER: Record<string, number> = {
 
 function normalizeResolution(value?: string) {
   return value === "2K" || value === "4K" ? value : "1K";
+}
+
+function supportsGptImage2ExplicitSizes(model = "") {
+  const normalized = normalizedModelId(model);
+  return normalized === GPT_IMAGE_2_MODEL || normalized === GPT_IMAGE_2_PRO_MODEL;
+}
+
+function gptImage2SizeOptionForSize(size = "") {
+  return GPT_IMAGE_2_SIZE_OPTIONS.find((option) => option.size === size);
+}
+
+function gptImage2DefaultSizeOption(aspectRatio: string, resolution = "1K") {
+  const res = normalizeResolution(resolution);
+  return GPT_IMAGE_2_SIZE_OPTIONS.find((option) => option.resolution === res && option.aspectRatio === aspectRatio)
+    || GPT_IMAGE_2_SIZE_OPTIONS.find((option) => option.resolution === res);
 }
 
 function scaleSize(size: string, resolution = "1K") {
@@ -1280,13 +1287,17 @@ function scaleSize(size: string, resolution = "1K") {
 }
 
 function imageSizeForProtocol(request: GenerateRequest, protocol: ImageProtocol) {
-  if (isGptImage2Model(request.model) && !isGptImage2ProModel(request.model) && request.aspectRatio) {
+  if (supportsGptImage2ExplicitSizes(request.model) && request.aspectRatio) {
+    const res = normalizeResolution(request.resolution);
+    const preferredOption = gptImage2SizeOptionForSize(request.size);
+    if (preferredOption && preferredOption.resolution === res && preferredOption.aspectRatio === request.aspectRatio) {
+      return preferredOption.size;
+    }
+    const defaultOption = gptImage2DefaultSizeOption(request.aspectRatio, res);
+    if (defaultOption) return defaultOption.size;
     return SIZE_BY_RATIO[request.aspectRatio] || SIZE_BY_RATIO["1:1"];
   }
-  if (isGptImage2ProModel(request.model) && request.aspectRatio) {
-    const res = normalizeResolution(request.resolution);
-    if (res === "4K") return PRO_4K_SIZE_BY_RATIO[request.aspectRatio] || PRO_4K_SIZE_BY_RATIO["1:1"];
-    if (res === "2K") return PRO_2K_SIZE_BY_RATIO[request.aspectRatio] || PRO_2K_SIZE_BY_RATIO["1:1"];
+  if (isGptImage2Model(request.model) && request.aspectRatio) {
     return SIZE_BY_RATIO[request.aspectRatio] || SIZE_BY_RATIO["1:1"];
   }
   return request.aspectRatio

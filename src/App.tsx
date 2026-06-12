@@ -719,6 +719,8 @@ const ASPECT_RATIOS = [
   { value: "16:9", label: "16:9 宽屏", hint: "视频封面、网页头图、桌面壁纸" },
   { value: "21:9", label: "21:9 超宽屏", hint: "横幅、电影感场景" },
   { value: "9:21", label: "9:21 长竖屏", hint: "长屏海报、移动端素材" },
+  { value: "12:5", label: "12:5 4K 超宽", hint: "GPT Image 2 4K 超宽输出尺寸 3840x1600" },
+  { value: "5:12", label: "5:12 4K 超高", hint: "GPT Image 2 4K 超高输出尺寸 1600x3840" },
   { value: "4:1", label: "4:1 横幅", hint: "Banner、页面横幅" },
   { value: "1:4", label: "1:4 长图", hint: "竖向长图、信息流素材" },
   { value: "8:1", label: "8:1 超横幅", hint: "超宽展示屏、高级模式" },
@@ -727,7 +729,7 @@ const ASPECT_RATIOS = [
 
 const ALL_ASPECT_RATIOS = ASPECT_RATIOS.map((ratio) => ratio.value);
 const GPT_IMAGE_SUPPORTED_ASPECT_RATIOS = ["1:1", "2:3", "3:2"] as const;
-const GPT_IMAGE_2_PRO_SUPPORTED_ASPECT_RATIOS = ["1:1", "4:5", "5:4", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9"] as const;
+const GPT_IMAGE_2_PRO_1K_SUPPORTED_ASPECT_RATIOS = ["1:1", "4:5", "5:4", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9"] as const;
 const GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"] as const;
 
 const IMAGEN_ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"];
@@ -746,37 +748,41 @@ const SIZE_BY_RATIO: Record<string, string> = {
   "16:9": "1792x1024",
   "21:9": "2016x864",
   "9:21": "864x2016",
+  "12:5": "2016x840",
+  "5:12": "840x2016",
   "4:1": "2048x512",
   "1:4": "512x2048",
   "8:1": "2048x256",
   "1:8": "256x2048",
 };
 
-const PRO_2K_SIZE_BY_RATIO: Record<string, string> = {
-  "1:1": "2048x2048",
-  "4:5": "2048x2560",
-  "5:4": "2560x2048",
-  "3:4": "2304x3072",
-  "4:3": "3072x2304",
-  "2:3": "2048x3072",
-  "3:2": "3072x2048",
-  "9:16": "2160x3840",
-  "16:9": "3840x2160",
-  "21:9": "3840x1646",
-};
+const GPT_IMAGE_2_SIZE_OPTIONS: Array<{
+  size: string;
+  aspectRatio: string;
+  resolution: Exclude<ImageResolution, "1K">;
+  label: string;
+}> = [
+  { size: "2560x1440", aspectRatio: "16:9", resolution: "2K", label: "2K QHD 横屏" },
+  { size: "1440x2560", aspectRatio: "9:16", resolution: "2K", label: "2K QHD 竖屏" },
+  { size: "2048x1152", aspectRatio: "16:9", resolution: "2K", label: "2K 16:9 横屏" },
+  { size: "1152x2048", aspectRatio: "9:16", resolution: "2K", label: "2K 9:16 竖屏" },
+  { size: "2048x2048", aspectRatio: "1:1", resolution: "2K", label: "2K 方图" },
+  { size: "2048x1536", aspectRatio: "4:3", resolution: "2K", label: "2K 4:3 横图" },
+  { size: "1536x2048", aspectRatio: "3:4", resolution: "2K", label: "2K 3:4 竖图" },
+  { size: "2048x3072", aspectRatio: "2:3", resolution: "2K", label: "2K 2:3 竖图" },
+  { size: "3072x2048", aspectRatio: "3:2", resolution: "2K", label: "2K 3:2 横图" },
+  { size: "3840x2160", aspectRatio: "16:9", resolution: "4K", label: "4K UHD 横屏" },
+  { size: "2160x3840", aspectRatio: "9:16", resolution: "4K", label: "4K UHD 竖屏" },
+  { size: "3840x1600", aspectRatio: "12:5", resolution: "4K", label: "4K 超宽" },
+  { size: "1600x3840", aspectRatio: "5:12", resolution: "4K", label: "4K 超高" },
+];
 
-const PRO_4K_SIZE_BY_RATIO: Record<string, string> = {
-  "1:1": "3840x3840",
-  "4:5": "3072x3840",
-  "5:4": "3840x3072",
-  "3:4": "2880x3840",
-  "4:3": "3840x2880",
-  "2:3": "2560x3840",
-  "3:2": "3840x2560",
-  "9:16": "2160x3840",
-  "16:9": "3840x2160",
-  "21:9": "3840x1646",
-};
+const GPT_IMAGE_2_2K_SUPPORTED_ASPECT_RATIOS = [...new Set(
+  GPT_IMAGE_2_SIZE_OPTIONS.filter((option) => option.resolution === "2K").map((option) => option.aspectRatio),
+)];
+const GPT_IMAGE_2_4K_SUPPORTED_ASPECT_RATIOS = [...new Set(
+  GPT_IMAGE_2_SIZE_OPTIONS.filter((option) => option.resolution === "4K").map((option) => option.aspectRatio),
+)];
 
 const GEMINI_3_PRO_SIZE_BY_RATIO: Record<string, string> = {
   "1:1": "1024x1024",
@@ -1715,6 +1721,11 @@ function isGptImage2ProModel(model = "") {
   return normalizedImageModelId(model) === GPT_IMAGE_2_PRO_MODEL;
 }
 
+function supportsGptImage2ExplicitSizes(model = "") {
+  const normalized = normalizedImageModelId(model);
+  return normalized === GPT_IMAGE_2_MODEL || normalized === GPT_IMAGE_2_PRO_MODEL;
+}
+
 function isGemini3ProImageModel(model = "") {
   return normalizedImageModelId(model) === GEMINI_3_PRO_IMAGE_MODEL;
 }
@@ -1742,19 +1753,43 @@ function imageModelLaneLabel(model: string) {
 }
 
 function usesOfficialGptImageSizing(protocol: ImageProtocol, model = "") {
-  return isGptImage2Model(model) && !isGptImage2ProModel(model) && (
+  return isGptImage2Model(model) && !supportsGptImage2ExplicitSizes(model) && (
     protocol === "custom-openai"
     || protocol === "openai-images"
     || protocol === "openai-responses"
   );
 }
 
-function getSupportedAspectRatios(protocol: ImageProtocol, model = "") {
+function gptImage2SizeOptionsForResolution(resolution: ImageResolution) {
+  return GPT_IMAGE_2_SIZE_OPTIONS.filter((option) => option.resolution === resolution);
+}
+
+function gptImage2SizeOptionForSize(size = "") {
+  return GPT_IMAGE_2_SIZE_OPTIONS.find((option) => option.size === size);
+}
+
+function gptImage2DefaultSizeOption(aspectRatio: string, resolution: ImageResolution) {
+  const options = gptImage2SizeOptionsForResolution(resolution);
+  return options.find((option) => option.aspectRatio === aspectRatio) || options[0];
+}
+
+function explicitSizeOptionsForModel(model: string, resolution: ImageResolution) {
+  return supportsGptImage2ExplicitSizes(model) ? gptImage2SizeOptionsForResolution(resolution) : [];
+}
+
+function getSupportedAspectRatios(
+  protocol: ImageProtocol,
+  model = "",
+  resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION,
+) {
   if (isGemini3ProImageModel(model) && protocol === "gemini-native") {
     return [...GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS];
   }
-  if (isGptImage2ProModel(model)) {
-    return [...GPT_IMAGE_2_PRO_SUPPORTED_ASPECT_RATIOS];
+  if (supportsGptImage2ExplicitSizes(model)) {
+    const res = safeImageResolution(resolution);
+    if (res === "4K") return [...GPT_IMAGE_2_4K_SUPPORTED_ASPECT_RATIOS];
+    if (res === "2K") return [...GPT_IMAGE_2_2K_SUPPORTED_ASPECT_RATIOS];
+    return [...GPT_IMAGE_2_PRO_1K_SUPPORTED_ASPECT_RATIOS];
   }
   if (usesOfficialGptImageSizing(protocol, model)) {
     return [...GPT_IMAGE_SUPPORTED_ASPECT_RATIOS];
@@ -1762,8 +1797,13 @@ function getSupportedAspectRatios(protocol: ImageProtocol, model = "") {
   return getProtocolDefinition(protocol).supportedAspectRatios;
 }
 
-function isAspectRatioSupported(protocol: ImageProtocol, aspectRatio: string, model = "") {
-  return getSupportedAspectRatios(protocol, model).includes(aspectRatio);
+function isAspectRatioSupported(
+  protocol: ImageProtocol,
+  aspectRatio: string,
+  model = "",
+  resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION,
+) {
+  return getSupportedAspectRatios(protocol, model, resolution).includes(aspectRatio);
 }
 
 function isImageResolution(value: unknown): value is ImageResolution {
@@ -1807,13 +1847,18 @@ function resolveRequestSize(
   resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION,
   protocol: ImageProtocol,
   model = "",
+  preferredSize = "",
 ) {
   const baseSize = baseSizeForModel(aspectRatio, protocol, model);
   if (usesOfficialGptImageSizing(protocol, model)) return baseSize;
-  if (isGptImage2ProModel(model)) {
+  if (supportsGptImage2ExplicitSizes(model)) {
     const res = safeImageResolution(resolution);
-    if (res === "4K") return PRO_4K_SIZE_BY_RATIO[aspectRatio] || PRO_4K_SIZE_BY_RATIO["1:1"];
-    if (res === "2K") return PRO_2K_SIZE_BY_RATIO[aspectRatio] || PRO_2K_SIZE_BY_RATIO["1:1"];
+    const preferredOption = gptImage2SizeOptionForSize(preferredSize);
+    if (preferredOption && preferredOption.resolution === res && preferredOption.aspectRatio === aspectRatio) {
+      return preferredOption.size;
+    }
+    const defaultOption = gptImage2DefaultSizeOption(aspectRatio, res);
+    if (defaultOption) return defaultOption.size;
     return baseSize;
   }
   return scaleSize(baseSize, safeImageResolution(resolution));
@@ -1833,7 +1878,9 @@ function normalizeImageParams(params: Partial<ImageParams> = {}): ImageParams {
   return {
     aspectRatio,
     resolution,
-    size: resolveSize(aspectRatio, resolution),
+    size: typeof params.size === "string" && params.size.trim()
+      ? params.size.trim()
+      : resolveSize(aspectRatio, resolution),
     quality: typeof params.quality === "string" ? params.quality : "auto",
     outputFormat: params.outputFormat === "jpeg" || params.outputFormat === "webp" ? params.outputFormat : "png",
     batchCount: clampNumber(Number(params.batchCount || 4), 1, 20),
@@ -2983,7 +3030,12 @@ function buildLocalPromptAnalysis({
       fix: "切换到兼容协议或 Gemini Native。",
     });
   }
-  if (!isAspectRatioSupported(protocol, params.aspectRatio, selectedModel)) {
+  const analysisResolution = normalizeResolutionForRequest(
+    safeImageResolution(params.resolution),
+    protocol,
+    selectedModel,
+  );
+  if (!isAspectRatioSupported(protocol, params.aspectRatio, selectedModel, analysisResolution)) {
     risks.push({
       level: "high",
       title: "宽高比不兼容",
@@ -3001,17 +3053,18 @@ function buildLocalPromptAnalysis({
   }
 
   const suggestedAspectRatio = recommendAspectRatioForPrompt(trimmed, params.aspectRatio);
-  const fallbackAspectRatio = getSupportedAspectRatios(protocol, selectedModel)[0] || "1:1";
-  const nextSuggestedAspectRatio = isAspectRatioSupported(protocol, suggestedAspectRatio, selectedModel)
+  const fallbackAspectRatio = getSupportedAspectRatios(protocol, selectedModel, analysisResolution)[0] || "1:1";
+  const nextSuggestedAspectRatio = isAspectRatioSupported(protocol, suggestedAspectRatio, selectedModel, analysisResolution)
     ? suggestedAspectRatio
     : fallbackAspectRatio;
   const suggestedParams: SuggestedParams = {
     aspectRatio: nextSuggestedAspectRatio,
     size: resolveRequestSize(
       nextSuggestedAspectRatio,
-      safeImageResolution(params.resolution),
+      analysisResolution,
       protocol,
       selectedModel,
+      params.size,
     ),
     resolution: normalizeResolutionForRequest(
       safeImageResolution(params.resolution),
@@ -3383,24 +3436,29 @@ export default function App() {
   const currentApiConnectionKey = apiConnectionKey(apiConfig);
   const isModelConnectionVerified = modelState.status === "ready" && verifiedModelKey === currentApiConnectionKey;
   const isOfficialGptImageSizeMode = usesOfficialGptImageSizing(apiConfig.protocol, selectedModel);
-  const supportedAspectRatios = getSupportedAspectRatios(apiConfig.protocol, selectedModel);
-  const supportedAspectOptions = ASPECT_RATIOS.filter((ratio) => supportedAspectRatios.includes(ratio.value));
-  const selectedAspectRatio = getAspectDefinition(params.aspectRatio);
   const selectedResolution = normalizeResolutionForRequest(
     safeImageResolution(params.resolution),
     apiConfig.protocol,
     selectedModel,
   );
+  const supportedAspectRatios = getSupportedAspectRatios(apiConfig.protocol, selectedModel, selectedResolution);
+  const supportedAspectOptions = ASPECT_RATIOS.filter((ratio) => supportedAspectRatios.includes(ratio.value));
+  const selectedAspectRatio = getAspectDefinition(params.aspectRatio);
   const selectedResolutionDefinition = IMAGE_RESOLUTIONS.find((item) => item.value === selectedResolution) || IMAGE_RESOLUTIONS[0];
   const resolvedRequestSize = resolveRequestSize(
     params.aspectRatio,
     selectedResolution,
     apiConfig.protocol,
     selectedModel,
+    params.size,
   );
-  const aspectRatioSupported = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel);
+  const explicitSizeOptions = explicitSizeOptionsForModel(selectedModel, selectedResolution);
+  const selectedExplicitSizeOption = explicitSizeOptions.find((option) => option.size === resolvedRequestSize);
+  const aspectRatioSupported = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel, selectedResolution);
   const selectedAspectHint = isGemini3ProImageModel(selectedModel)
     ? "Gemini 3 Pro 官方支持比例"
+    : selectedExplicitSizeOption
+      ? selectedExplicitSizeOption.label
     : selectedAspectRatio.hint;
   const composerConfigSummary = `${params.batchCount}张 · ${params.aspectRatio} · ${selectedResolution}`;
   const composerConfigDetail = `${resolvedRequestSize} · ${params.quality} · ${params.outputFormat.toUpperCase()} · 并发 ${params.concurrency}`;
@@ -3617,15 +3675,15 @@ export default function App() {
       apiConfig.protocol,
       selectedModel,
     );
-    const fallbackRatio = getSupportedAspectRatios(apiConfig.protocol, selectedModel)[0] || "1:1";
-    const nextAspectRatio = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel)
+    const fallbackRatio = getSupportedAspectRatios(apiConfig.protocol, selectedModel, normalizedResolution)[0] || "1:1";
+    const nextAspectRatio = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel, normalizedResolution)
       ? params.aspectRatio
       : fallbackRatio;
     if (nextAspectRatio === params.aspectRatio && normalizedResolution === params.resolution) return;
     updateParams({
       aspectRatio: nextAspectRatio,
       resolution: normalizedResolution,
-      size: resolveRequestSize(nextAspectRatio, normalizedResolution, apiConfig.protocol, selectedModel),
+      size: resolveRequestSize(nextAspectRatio, normalizedResolution, apiConfig.protocol, selectedModel, params.size),
     });
   }, [apiConfig.protocol, selectedModel, params.aspectRatio, params.resolution]);
 
@@ -5000,10 +5058,6 @@ export default function App() {
     applyRecommendedParams = true,
     baseParams = params,
   ) {
-    const suggestedRatio = result.suggestedParams.aspectRatio || baseParams.aspectRatio;
-    const nextRatio = applyRecommendedParams && isAspectRatioSupported(apiConfig.protocol, suggestedRatio, selectedModel)
-      ? suggestedRatio
-      : baseParams.aspectRatio;
     const nextResolution = normalizeResolutionForRequest(
       applyRecommendedParams && result.suggestedParams.resolution
         ? safeImageResolution(result.suggestedParams.resolution)
@@ -5011,11 +5065,28 @@ export default function App() {
       apiConfig.protocol,
       selectedModel,
     );
+    const suggestedRatio = result.suggestedParams.aspectRatio || baseParams.aspectRatio;
+    const fallbackRatio =
+      getSupportedAspectRatios(apiConfig.protocol, selectedModel, nextResolution)[0] || baseParams.aspectRatio;
+    const nextRatio = applyRecommendedParams && isAspectRatioSupported(
+      apiConfig.protocol,
+      suggestedRatio,
+      selectedModel,
+      nextResolution,
+    )
+      ? suggestedRatio
+      : fallbackRatio;
     return {
       ...baseParams,
       aspectRatio: nextRatio,
       resolution: nextResolution,
-      size: resolveRequestSize(nextRatio, nextResolution, apiConfig.protocol, selectedModel),
+      size: resolveRequestSize(
+        nextRatio,
+        nextResolution,
+        apiConfig.protocol,
+        selectedModel,
+        result.suggestedParams.size || baseParams.size,
+      ),
       quality: applyRecommendedParams && protocolDefinition.supportsQuality && result.suggestedParams.quality
         ? result.suggestedParams.quality
         : baseParams.quality,
@@ -5248,13 +5319,18 @@ export default function App() {
     const batchParams = options.paramsOverride || params;
     const submittedPrompt = (options.promptOverride || prompt).trim();
     if (!submittedPrompt) return;
+    const batchResolution = normalizeResolutionForRequest(
+      safeImageResolution(batchParams.resolution),
+      apiConfig.protocol,
+      selectedModel,
+    );
     if (
       !selectedModel ||
       !isAllowedImageModel(selectedModel) ||
       !models.includes(selectedModel) ||
       !protocolMatchesImageModel(apiConfig.protocol, selectedModel) ||
       modelState.status !== "ready" ||
-      !isAspectRatioSupported(apiConfig.protocol, batchParams.aspectRatio, selectedModel)
+      !isAspectRatioSupported(apiConfig.protocol, batchParams.aspectRatio, selectedModel, batchResolution)
     ) {
       return;
     }
@@ -5267,16 +5343,13 @@ export default function App() {
       ...batchParams,
       batchCount: total,
       concurrency,
-      resolution: normalizeResolutionForRequest(
-        safeImageResolution(batchParams.resolution),
-        apiConfig.protocol,
-        selectedModel,
-      ),
+      resolution: batchResolution,
       size: resolveRequestSize(
         batchParams.aspectRatio,
-        normalizeResolutionForRequest(safeImageResolution(batchParams.resolution), apiConfig.protocol, selectedModel),
+        batchResolution,
         apiConfig.protocol,
         selectedModel,
+        batchParams.size,
       ),
     };
     const candidateReferenceImages = options.referenceImagesOverride ?? usableReferenceImages;
@@ -5307,14 +5380,14 @@ export default function App() {
 
   function buildAgentModeJobParams(spec: AgentModeJobSpec, baseParams = params): ImageParams {
     const recommendedRatio = spec.aspectRatio || recommendAspectRatioForPrompt(spec.prompt, baseParams.aspectRatio);
-    const aspectRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio, selectedModel)
-      ? recommendedRatio
-      : getSupportedAspectRatios(apiConfig.protocol, selectedModel)[0] || baseParams.aspectRatio;
     const resolution = normalizeResolutionForRequest(
       spec.resolution ? safeImageResolution(spec.resolution) : safeImageResolution(baseParams.resolution),
       apiConfig.protocol,
       selectedModel,
     );
+    const aspectRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio, selectedModel, resolution)
+      ? recommendedRatio
+      : getSupportedAspectRatios(apiConfig.protocol, selectedModel, resolution)[0] || baseParams.aspectRatio;
     return {
       ...baseParams,
       aspectRatio,
@@ -5824,18 +5897,23 @@ export default function App() {
   function updateParams(patch: Partial<ImageParams>) {
     cancelAnalysisCountdown();
     setParams((current) => {
-      const nextAspectRatio = patch.aspectRatio || current.aspectRatio;
       const nextResolution = normalizeResolutionForRequest(
         patch.resolution ? safeImageResolution(patch.resolution) : safeImageResolution(current.resolution),
         apiConfig.protocol,
         selectedModel,
       );
+      const candidateAspectRatio = patch.aspectRatio || current.aspectRatio;
+      const nextSupportedRatios = getSupportedAspectRatios(apiConfig.protocol, selectedModel, nextResolution);
+      const nextAspectRatio = nextSupportedRatios.includes(candidateAspectRatio)
+        ? candidateAspectRatio
+        : nextSupportedRatios[0] || "1:1";
+      const candidateSize = typeof patch.size === "string" ? patch.size : current.size;
       return {
         ...current,
         ...patch,
         aspectRatio: nextAspectRatio,
         resolution: nextResolution,
-        size: resolveRequestSize(nextAspectRatio, nextResolution, apiConfig.protocol, selectedModel),
+        size: resolveRequestSize(nextAspectRatio, nextResolution, apiConfig.protocol, selectedModel, candidateSize),
         batchCount: patch.batchCount !== undefined
           ? clampNumber(Number(patch.batchCount), 1, 20)
           : current.batchCount,
@@ -5902,17 +5980,17 @@ export default function App() {
     setSelectedModel(nextModel);
     setModelFilter("");
     setParams((current) => {
-      const nextSupportedRatios = getSupportedAspectRatios(nextProtocol, nextModel);
+      const canScale = isGptImage2ProModel(nextModel) || !usesOfficialGptImageSizing(nextProtocol, nextModel);
+      const nextResolution = canScale ? current.resolution : "1K" as ImageResolution;
+      const nextSupportedRatios = getSupportedAspectRatios(nextProtocol, nextModel, nextResolution);
       const nextAspectRatio = nextSupportedRatios.includes(current.aspectRatio)
         ? current.aspectRatio
         : nextSupportedRatios[0] || "1:1";
-      const canScale = isGptImage2ProModel(nextModel) || !usesOfficialGptImageSizing(nextProtocol, nextModel);
-      const nextResolution = canScale ? current.resolution : "1K" as ImageResolution;
       return {
         ...current,
         aspectRatio: nextAspectRatio,
         resolution: nextResolution,
-        size: resolveRequestSize(nextAspectRatio, nextResolution, nextProtocol, nextModel),
+        size: resolveRequestSize(nextAspectRatio, nextResolution, nextProtocol, nextModel, current.size),
       };
     });
   }
@@ -6123,17 +6201,23 @@ export default function App() {
     const recommendedRatio = typeof plan.recommendedParams.aspectRatio === "string"
       ? plan.recommendedParams.aspectRatio
       : params.aspectRatio;
-    const nextRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio, selectedModel)
+    const nextResolution = normalizeResolutionForRequest(
+      safeImageResolution(params.resolution),
+      apiConfig.protocol,
+      selectedModel,
+    );
+    const nextRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio, selectedModel, nextResolution)
       ? recommendedRatio
-      : params.aspectRatio;
+      : getSupportedAspectRatios(apiConfig.protocol, selectedModel, nextResolution)[0] || params.aspectRatio;
     return {
       ...params,
       aspectRatio: nextRatio,
       size: resolveRequestSize(
         nextRatio,
-        normalizeResolutionForRequest(safeImageResolution(params.resolution), apiConfig.protocol, selectedModel),
+        nextResolution,
         apiConfig.protocol,
         selectedModel,
+        params.size,
       ),
       negativePrompt: plan.negativePrompt || params.negativePrompt,
     } as ImageParams;
@@ -6255,7 +6339,7 @@ export default function App() {
   const suggestedRatio = analysisResult?.suggestedParams.aspectRatio;
   const suggestedSize = analysisResult?.suggestedParams.size || (
     suggestedRatio
-      ? resolveRequestSize(suggestedRatio, selectedResolution, apiConfig.protocol, selectedModel)
+      ? resolveRequestSize(suggestedRatio, selectedResolution, apiConfig.protocol, selectedModel, params.size)
       : ""
   );
   const suggestedCount = analysisResult?.suggestedParams.count;
@@ -7504,8 +7588,38 @@ export default function App() {
           <div className="ratio-preview">
             <strong>{selectedResolution}</strong>
             <span>{selectedResolutionDefinition.hint}</span>
-            <small>{isOfficialGptImageSizeMode ? "GPT Image 2 仅使用官方固定尺寸，选择 Pro 模型可用 2K/4K" : isGemini3ProImageModel(selectedModel) ? "Gemini 3 Pro 会以 imageSize 传递 1K/2K/4K" : isGptImage2ProModel(selectedModel) ? "Pro 模型支持 2K/4K 高分辨率输出" : "尺寸会随宽高比自动换算"}</small>
+            <small>{isOfficialGptImageSizeMode ? "该 image-2 模型使用官方固定尺寸" : isGemini3ProImageModel(selectedModel) ? "Gemini 3 Pro 会以 imageSize 传递 1K/2K/4K" : supportsGptImage2ExplicitSizes(selectedModel) ? "GPT Image 2 支持显式 2K/4K 尺寸" : "尺寸会随宽高比自动换算"}</small>
           </div>
+          {explicitSizeOptions.length > 0 && (
+            <>
+              <label>
+                <span>尺寸</span>
+                <select
+                  value={resolvedRequestSize}
+                  onChange={(event) => {
+                    const option = gptImage2SizeOptionForSize(event.target.value);
+                    if (!option) return;
+                    updateParams({
+                      aspectRatio: option.aspectRatio,
+                      resolution: option.resolution,
+                      size: option.size,
+                    });
+                  }}
+                >
+                  {explicitSizeOptions.map((option) => (
+                    <option key={option.size} value={option.size}>
+                      {option.size} · {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="ratio-preview">
+                <strong>{resolvedRequestSize}</strong>
+                <span>{selectedExplicitSizeOption?.label || "GPT Image 2 显式尺寸"}</span>
+                <small>{selectedResolution} · {params.aspectRatio}</small>
+              </div>
+            </>
+          )}
           <label>
             <span>质量</span>
             <select
@@ -8280,6 +8394,7 @@ function CanvasPage({
   const [canvasModel, setCanvasModel] = useState(() => globalSelectedModel || selectableModels[0] || "");
   const [canvasAspectRatio, setCanvasAspectRatio] = useState("1:1");
   const [canvasResolution, setCanvasResolution] = useState<ImageResolution>("1K");
+  const [canvasSize, setCanvasSize] = useState("");
   const [canvasQuality, setCanvasQuality] = useState("auto");
   const [isGenerating, setIsGenerating] = useState(false);
   const [optimizeSourceNode, setOptimizeSourceNode] = useState<CanvasNode | null>(null);
@@ -8710,7 +8825,7 @@ function CanvasPage({
     const pos = findNonOverlappingPos(center.x, center.y, nodeW, nodeH);
 
     const nodeId = uid();
-    const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel);
+    const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
     const newNode: CanvasNode = {
       id: nodeId,
       type: "image",
@@ -8831,7 +8946,7 @@ function CanvasPage({
 
     const nodeId = uid();
     const edgeId = uid();
-    const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel);
+    const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
     const newNode: CanvasNode = {
       id: nodeId,
       type: "image",
@@ -9021,9 +9136,12 @@ function CanvasPage({
 
   // ── Computed values ──
   const selectedNode = canvasNodes.find((n) => n.id === selectedNodeId) || null;
-  const supportedAspectRatios = getSupportedAspectRatios(apiConfig.protocol, canvasModel);
   const canScale = isGptImage2ProModel(canvasModel) || !usesOfficialGptImageSizing(apiConfig.protocol, canvasModel);
-  const resolvedSize = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel);
+  const canvasEffectiveResolution = canScale ? canvasResolution : DEFAULT_IMAGE_RESOLUTION;
+  const supportedAspectRatios = getSupportedAspectRatios(apiConfig.protocol, canvasModel, canvasEffectiveResolution);
+  const resolvedSize = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
+  const canvasExplicitSizeOptions = explicitSizeOptionsForModel(canvasModel, canvasEffectiveResolution);
+  const selectedCanvasSizeOption = canvasExplicitSizeOptions.find((option) => option.size === resolvedSize);
   const isApiReady = modelState.status === "ready" && apiConfig.apiKey.trim().length >= 8;
 
   // ── Update model when global changes ──
@@ -9035,15 +9153,19 @@ function CanvasPage({
 
   // ── Update aspect ratio when model changes ──
   useEffect(() => {
-    const ratios = getSupportedAspectRatios(apiConfig.protocol, canvasModel);
+    const nextResolution = canScale ? canvasResolution : DEFAULT_IMAGE_RESOLUTION;
+    const ratios = getSupportedAspectRatios(apiConfig.protocol, canvasModel, nextResolution);
     if (!ratios.includes(canvasAspectRatio)) {
       setCanvasAspectRatio(ratios[0] || "1:1");
     }
-    if (!canScale) {
+    if (!canScale && canvasResolution !== DEFAULT_IMAGE_RESOLUTION) {
       setCanvasResolution("1K");
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canvasModel, apiConfig.protocol]);
+    const nextSize = resolveRequestSize(canvasAspectRatio, nextResolution, apiConfig.protocol, canvasModel, canvasSize);
+    if (nextSize !== canvasSize) {
+      setCanvasSize(nextSize);
+    }
+  }, [apiConfig.protocol, canScale, canvasAspectRatio, canvasModel, canvasResolution, canvasSize]);
 
   // ── Floating toolbar position ──
   const toolbarPos = useMemo(() => {
@@ -9377,6 +9499,28 @@ function CanvasPage({
                     <option value="4K">4K</option>
                   </select>
                 </div>
+                {canvasExplicitSizeOptions.length > 0 && (
+                  <div className="canvas-param">
+                    <label>尺寸</label>
+                    <select
+                      className="canvas-select"
+                      value={resolvedSize}
+                      onChange={(e) => {
+                        const option = gptImage2SizeOptionForSize(e.target.value);
+                        if (!option) return;
+                        setCanvasAspectRatio(option.aspectRatio);
+                        setCanvasResolution(option.resolution);
+                        setCanvasSize(option.size);
+                      }}
+                    >
+                      {canvasExplicitSizeOptions.map((option) => (
+                        <option key={option.size} value={option.size}>
+                          {option.size}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
                 <div className="canvas-param">
                   <label>质量</label>
                   <select
@@ -9395,7 +9539,7 @@ function CanvasPage({
 
             {/* Size preview */}
             <div className="canvas-size-preview">
-              {resolvedSize} &middot; {imageModelLaneLabel(canvasModel)}
+              {resolvedSize} &middot; {selectedCanvasSizeOption?.label || imageModelLaneLabel(canvasModel)}
             </div>
 
             {/* Generate button */}
@@ -9520,11 +9664,33 @@ function CanvasPage({
                   <option value="4K">4K</option>
                 </select>
               </div>
+              {canvasExplicitSizeOptions.length > 0 && (
+                <div className="canvas-param">
+                  <label>尺寸</label>
+                  <select
+                    className="canvas-select"
+                    value={resolvedSize}
+                    onChange={(e) => {
+                      const option = gptImage2SizeOptionForSize(e.target.value);
+                      if (!option) return;
+                      setCanvasAspectRatio(option.aspectRatio);
+                      setCanvasResolution(option.resolution);
+                      setCanvasSize(option.size);
+                    }}
+                  >
+                    {canvasExplicitSizeOptions.map((option) => (
+                      <option key={option.size} value={option.size}>
+                        {option.size}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
 
             {/* Size preview */}
             <div className="canvas-size-preview">
-              {resolvedSize}
+              {resolvedSize} &middot; {selectedCanvasSizeOption?.label || imageModelLaneLabel(canvasModel)}
             </div>
 
             {/* Optimize button */}
