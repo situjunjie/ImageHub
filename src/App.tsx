@@ -31,6 +31,7 @@ import {
   CheckSquare,
   Trash2,
   UploadCloud,
+  User,
   WandSparkles,
   Wifi,
   X,
@@ -552,6 +553,7 @@ type SquareAdminOverview = {
 type AdminUserView = {
   username: string;
   mustChangePassword: boolean;
+  oauthUser?: boolean;
 };
 
 type AdminRequestLog = {
@@ -685,7 +687,7 @@ const SQUARE_FEED_TABS: Array<{ value: SquareFeedTab; label: string; icon: typeo
 const CURRENT_FRONTEND_VERSION = typeof __FRONTEND_BUILD_VERSION__ === "string"
   ? __FRONTEND_BUILD_VERSION__
   : "dev";
-const ALLOWED_API_ENDPOINTS = [
+const ALLOWED_API_ENDPOINTS: { value: string; label: string; description: string }[] = [
   {
     value: "https://www.taijiai.online/",
     label: "太极 AI",
@@ -696,7 +698,7 @@ const ALLOWED_API_ENDPOINTS = [
     label: "BobDong",
     description: "备用服务地址",
   },
-] as const;
+];
 const DEFAULT_API_URL = ALLOWED_API_ENDPOINTS[0].value;
 const DEFAULT_PROTOCOL: ImageProtocol = "custom-openai";
 const DEFAULT_IMAGE_RESOLUTION: ImageResolution = "1K";
@@ -2098,7 +2100,15 @@ function openDb(): Promise<IDBDatabase> {
       }
     };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onerror = () => {
+      if (request.error?.name === "VersionError") {
+        const retry = indexedDB.open(DB_NAME);
+        retry.onsuccess = () => resolve(retry.result);
+        retry.onerror = () => reject(retry.error);
+      } else {
+        reject(request.error);
+      }
+    };
   });
 }
 
@@ -3408,6 +3418,9 @@ export default function App() {
   });
   const [analysisStepIndex, setAnalysisStepIndex] = useState(0);
   const [availableFrontendVersion, setAvailableFrontendVersion] = useState("");
+  const [oauthEnabled, setOauthEnabled] = useState(false);
+  const [oauthUser, setOauthUser] = useState<{ sub: string; username: string; displayName: string; email: string; role: number; group: string } | null>(null);
+  const [oauthChecked, setOauthChecked] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const canvasRef = useRef<HTMLElement | null>(null);
@@ -3549,6 +3562,52 @@ export default function App() {
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const hash = window.location.hash;
+    const isOauthReturn = hash === "#oauth-success" || hash === "#oauth-error";
+    if (isOauthReturn) {
+      window.history.replaceState(null, "", window.location.pathname);
+      setActivePage("home");
+    }
+
+    (async () => {
+      try {
+        const cfgRes = await fetch("/api/auth/oauth/config");
+        const cfg = await cfgRes.json() as { enabled?: boolean; providerUrl?: string };
+        if (cancelled) return;
+        if (!cfg.enabled) { setOauthChecked(true); return; }
+        setOauthEnabled(true);
+        if (cfg.providerUrl) {
+          const normalized = cfg.providerUrl.replace(/\/+$/, "");
+          if (!ALLOWED_API_ENDPOINTS.some((ep) => ep.value.replace(/\/+$/, "") === normalized)) {
+            ALLOWED_API_ENDPOINTS.push({ value: normalized, label: "太极 AI (OAuth)", description: "OAuth 登录服务地址" });
+          }
+        }
+
+        const meRes = await fetch("/api/auth/oauth/me", { credentials: "same-origin" });
+        const me = await meRes.json() as { loggedIn?: boolean; sub?: string; username?: string; displayName?: string; email?: string; role?: number; group?: string; apiKey?: string };
+        if (cancelled) return;
+        if (me.loggedIn) {
+          setOauthUser({ sub: me.sub || "", username: me.username || "", displayName: me.displayName || "", email: me.email || "", role: me.role ?? 1, group: me.group || "" });
+          if (me.apiKey) {
+            const baseUrl = cfg.providerUrl || "";
+            setApiConfig((prev) => ({
+              ...prev,
+              apiKey: me.apiKey!,
+              baseUrl: normalizeApiBaseUrl(baseUrl) || prev.baseUrl,
+              rememberKey: true,
+            }));
+          }
+        } else if (hash === "#oauth-error") {
+          window.alert("登录失败，请重试");
+        }
+      } catch { /* oauth config unavailable — disable silently */ }
+      if (!cancelled) setOauthChecked(true);
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -6329,6 +6388,17 @@ export default function App() {
     }
   }
 
+  function oauthLogin() {
+    window.location.href = "/api/auth/oauth/login";
+  }
+
+  async function oauthLogout() {
+    try {
+      await fetch("/api/auth/oauth/logout", { method: "POST", credentials: "same-origin" });
+    } catch { /* ignore */ }
+    setOauthUser(null);
+  }
+
   function completeOnboarding() {
     localStorage.setItem("imageStudioOnboardingComplete", "true");
     setShowOnboarding(false);
@@ -6358,7 +6428,7 @@ export default function App() {
     return (
       <>
         {frontendUpdateNotice}
-        <HomePage onEnter={enterStudio} onSquare={enterSquare} onAdmin={enterAdmin} onCanvas={enterCanvas} />
+        <HomePage onEnter={enterStudio} onSquare={enterSquare} onAdmin={enterAdmin} onCanvas={enterCanvas} oauthUser={oauthUser} onOauthLogout={oauthLogout} />
       </>
     );
   }
@@ -6398,7 +6468,7 @@ export default function App() {
     return (
       <>
         {frontendUpdateNotice}
-        <AdminApp onBackHome={returnHome} onEnterStudio={enterStudio} />
+        <AdminApp onBackHome={returnHome} onEnterStudio={enterStudio} oauthEnabled={oauthEnabled} onOauthLogin={oauthLogin} />
       </>
     );
   }
@@ -6520,6 +6590,12 @@ export default function App() {
             <strong>{selectedModel || "未选择"}</strong>
           </div>
           <div className="topbar-cluster right">
+            {oauthUser && (
+              <div className="oauth-user-compact" title={oauthUser.email || oauthUser.username}>
+                <User size={14} />
+                <span>{oauthUser.displayName || oauthUser.username}</span>
+              </div>
+            )}
             <button
               type="button"
               className={`topbar-log-button ${latestLocalLogLevel ? `is-${latestLocalLogLevel}` : ""}`}
@@ -7740,9 +7816,13 @@ export default function App() {
 function AdminApp({
   onBackHome,
   onEnterStudio,
+  oauthEnabled,
+  onOauthLogin,
 }: {
   onBackHome: () => void;
   onEnterStudio: () => void;
+  oauthEnabled: boolean;
+  onOauthLogin: () => void;
 }) {
   const [user, setUser] = useState<AdminUserView | null>(null);
   const [isChecking, setIsChecking] = useState(true);
@@ -7982,6 +8062,16 @@ function AdminApp({
           <form className="admin-login-card" onSubmit={handleLogin}>
             <strong>管理员登录</strong>
             <span>首次登录默认账号需要立即重置密码</span>
+            {oauthEnabled && (
+              <button type="button" className="login-option login-option-oauth" onClick={onOauthLogin}>
+                <ExternalLink size={20} />
+                <div>
+                  <strong>太极AI 账号登录</strong>
+                  <span>使用太极AI统一账号</span>
+                </div>
+              </button>
+            )}
+            {oauthEnabled && <div className="admin-login-divider"><span>或使用管理员密码</span></div>}
             <label>
               <span>用户名</span>
               <input
@@ -9734,7 +9824,11 @@ function CanvasPage({
   );
 }
 
-function HomePage({ onEnter, onSquare, onAdmin, onCanvas }: { onEnter: () => void; onSquare: () => void; onAdmin: () => void; onCanvas: () => void }) {
+function HomePage({ onEnter, onSquare, onAdmin, onCanvas, oauthUser, onOauthLogout }: {
+  onEnter: () => void; onSquare: () => void; onAdmin: () => void; onCanvas: () => void;
+  oauthUser: { sub: string; username: string; displayName: string; email: string; role: number; group: string } | null;
+  onOauthLogout: () => void;
+}) {
   const featureBands = [
     {
       title: "统一记录流",
@@ -9813,6 +9907,13 @@ function HomePage({ onEnter, onSquare, onAdmin, onCanvas }: { onEnter: () => voi
               <ShieldCheck size={16} />
               管理后台
             </button>
+            {oauthUser && (
+              <div className="oauth-user-info">
+                <User size={16} />
+                <span className="oauth-user-name">{oauthUser.displayName || oauthUser.username}</span>
+                <button type="button" className="oauth-logout-btn" onClick={onOauthLogout}>退出</button>
+              </div>
+            )}
           </div>
         </nav>
 

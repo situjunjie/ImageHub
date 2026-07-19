@@ -10,7 +10,12 @@ import {
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
-import { defineConfig, type PluginOption, type ViteDevServer } from "vite";
+import { defineConfig, loadEnv, type PluginOption, type ViteDevServer } from "vite";
+
+const _env = loadEnv("development", process.cwd(), "");
+for (const key of ["OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET", "OAUTH_PROVIDER_URL", "OAUTH_REDIRECT_URI"]) {
+  if (_env[key] && !process.env[key]) process.env[key] = _env[key];
+}
 
 type ImageProtocol =
   | "custom-openai"
@@ -265,7 +270,7 @@ const GPT_IMAGE_2_PRO_MODEL = "gpt-image-2-pro";
 const GPT_IMAGE_2_FAMILY_MODEL = "gpt-5.4-image-2";
 const GEMINI_3_PRO_IMAGE_MODEL = "gemini-3-pro-image-preview";
 const GEMINI_NATIVE_API_PREFIX = "/v1beta";
-const ALLOWED_API_BASE_URLS = ["https://www.taijiai.online/", "https://bobdong.cn/"];
+const ALLOWED_API_BASE_URLS: string[] = ["https://www.taijiai.online/", "https://bobdong.cn/"];
 const SESSION_COOKIE = "image_studio_admin_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const DATA_DIR = join(process.cwd(), ".data");
@@ -274,6 +279,17 @@ const SQUARE_STORE_PATH = join(DATA_DIR, "square-store.json");
 const REFERENCE_TEMP_TTL_MS = 1000 * 60 * 10;
 const PUBLIC_REFERENCE_BASE_URL = "https://imagehub.taijiai.online";
 const SQUARE_TIME_ZONE = "Asia/Shanghai";
+const OAUTH_CLIENT_ID = (process.env.OAUTH_CLIENT_ID || "").trim();
+const OAUTH_CLIENT_SECRET = (process.env.OAUTH_CLIENT_SECRET || "").trim();
+const OAUTH_PROVIDER_URL = (process.env.OAUTH_PROVIDER_URL || "https://www.taijiai.online").replace(/\/+$/, "");
+const OAUTH_REDIRECT_URI = (process.env.OAUTH_REDIRECT_URI || "").trim();
+const OAUTH_ENABLED = OAUTH_CLIENT_ID.length > 0 && OAUTH_CLIENT_SECRET.length > 0;
+const OAUTH_SESSION_COOKIE = "imagehub_oauth_session";
+const OAUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 24;
+const OAUTH_STATE_TTL_MS = 1000 * 60 * 10;
+if (OAUTH_ENABLED && OAUTH_PROVIDER_URL && !ALLOWED_API_BASE_URLS.some((url) => url.replace(/\/+$/, "") === OAUTH_PROVIDER_URL)) {
+  ALLOWED_API_BASE_URLS.push(OAUTH_PROVIDER_URL);
+}
 const SQUARE_SHELF_LIMIT = 4;
 const SQUARE_DAILY_RECOMMEND_LIMIT = 10;
 const SQUARE_DAILY_LIKE_LIMIT = 10;
@@ -342,6 +358,19 @@ const FRONTEND_BUILD_INFO = {
 };
 
 const adminSessions = new Map<string, { username: string; expiresAt: number }>();
+
+interface OAuthSessionData {
+  sub: string;
+  username: string;
+  displayName: string;
+  email: string;
+  role: number;
+  group: string;
+  apiKey: string;
+  expiresAt: number;
+}
+const oauthSessions = new Map<string, OAuthSessionData>();
+const oauthPendingStates = new Map<string, { expiresAt: number }>();
 
 const DEFAULT_MODELS: Record<ImageProtocol, string[]> = {
   "custom-openai": [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_PRO_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
@@ -542,6 +571,54 @@ function setSessionCookie(res: ServerResponse, token: string) {
 
 function clearSessionCookie(res: ServerResponse) {
   res.setHeader("Set-Cookie", `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
+}
+
+function createOAuthSession(userInfo: Omit<OAuthSessionData, "expiresAt">) {
+  const token = randomBytes(32).toString("hex");
+  oauthSessions.set(token, { ...userInfo, expiresAt: Date.now() + OAUTH_SESSION_TTL_MS });
+  return token;
+}
+
+function getOAuthSession(req: IncomingMessage) {
+  const token = cookieValue(req, OAUTH_SESSION_COOKIE);
+  if (!token) return null;
+  const session = oauthSessions.get(token);
+  if (!session || session.expiresAt < Date.now()) {
+    oauthSessions.delete(token);
+    return null;
+  }
+  session.expiresAt = Date.now() + OAUTH_SESSION_TTL_MS;
+  return { token, ...session };
+}
+
+function setOAuthCookie(res: ServerResponse, token: string) {
+  const existing = res.getHeader("Set-Cookie");
+  const cookie = `${OAUTH_SESSION_COOKIE}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.round(OAUTH_SESSION_TTL_MS / 1000)}`;
+  if (existing) {
+    res.setHeader("Set-Cookie", Array.isArray(existing) ? [...existing, cookie] : [String(existing), cookie]);
+  } else {
+    res.setHeader("Set-Cookie", cookie);
+  }
+}
+
+function clearOAuthCookie(res: ServerResponse) {
+  const existing = res.getHeader("Set-Cookie");
+  const cookie = `${OAUTH_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`;
+  if (existing) {
+    res.setHeader("Set-Cookie", Array.isArray(existing) ? [...existing, cookie] : [String(existing), cookie]);
+  } else {
+    res.setHeader("Set-Cookie", cookie);
+  }
+}
+
+function cleanupOAuthExpired() {
+  const now = Date.now();
+  for (const [key, session] of oauthSessions) {
+    if (session.expiresAt < now) oauthSessions.delete(key);
+  }
+  for (const [key, state] of oauthPendingStates) {
+    if (state.expiresAt < now) oauthPendingStates.delete(key);
+  }
 }
 
 function hashClientIp(req: IncomingMessage) {
@@ -3423,6 +3500,7 @@ function imageProxyPlugin(): PluginOption {
     configureServer(server: ViteDevServer) {
       ensureAdminStore();
       ensureSquareStore();
+      setInterval(cleanupOAuthExpired, 1000 * 60 * 10);
       server.middlewares.use("/api/reference-images", (req, res) => {
         if (req.method !== "GET" && req.method !== "HEAD") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
@@ -3488,9 +3566,171 @@ function imageProxyPlugin(): PluginOption {
         void handleSquareAdminExport(req, res);
       });
 
+      server.middlewares.use("/api/auth/oauth", async (req, res) => {
+        const path = (req.url || "/").split("?")[0] || "/";
+        const query = new URLSearchParams((req.url || "").split("?")[1] || "");
+
+        try {
+          if (path === "/config" && req.method === "GET") {
+            sendJson(res, 200, {
+              enabled: OAUTH_ENABLED,
+              providerName: OAUTH_ENABLED ? "太极AI" : undefined,
+              providerUrl: OAUTH_ENABLED ? OAUTH_PROVIDER_URL : undefined,
+            });
+            return;
+          }
+
+          if (!OAUTH_ENABLED) {
+            sendJson(res, 404, { ok: false, error: "OAuth is not configured" });
+            return;
+          }
+
+          if (path === "/login" && req.method === "GET") {
+            const state = randomBytes(24).toString("hex");
+            oauthPendingStates.set(state, { expiresAt: Date.now() + OAUTH_STATE_TTL_MS });
+            const redirectUri = OAUTH_REDIRECT_URI || `${req.headers["x-forwarded-proto"] || "http"}://${req.headers.host}/api/auth/oauth/callback`;
+            const params = new URLSearchParams({
+              response_type: "code",
+              client_id: OAUTH_CLIENT_ID,
+              redirect_uri: redirectUri,
+              scope: "openid profile email",
+              state,
+            });
+            res.statusCode = 302;
+            res.setHeader("Location", `${OAUTH_PROVIDER_URL}/oauth2/authorize?${params.toString()}`);
+            res.end();
+            return;
+          }
+
+          if (path === "/callback" && req.method === "GET") {
+            const code = query.get("code") || "";
+            const state = query.get("state") || "";
+            const oauthError = query.get("error") || "";
+            const baseRedirect = OAUTH_REDIRECT_URI ? new URL(OAUTH_REDIRECT_URI).origin : `${req.headers["x-forwarded-proto"] || "http"}://${req.headers.host}`;
+
+            if (oauthError || !code) {
+              res.statusCode = 302;
+              res.setHeader("Location", `${baseRedirect}/#oauth-error`);
+              res.end();
+              return;
+            }
+
+            const pending = oauthPendingStates.get(state);
+            if (!pending || pending.expiresAt < Date.now()) {
+              oauthPendingStates.delete(state);
+              res.statusCode = 302;
+              res.setHeader("Location", `${baseRedirect}/#oauth-error`);
+              res.end();
+              return;
+            }
+            oauthPendingStates.delete(state);
+
+            const redirectUri = OAUTH_REDIRECT_URI || `${req.headers["x-forwarded-proto"] || "http"}://${req.headers.host}/api/auth/oauth/callback`;
+
+            const tokenRes = await fetchWithTimeout(`${OAUTH_PROVIDER_URL}/oauth2/token`, {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: new URLSearchParams({
+                grant_type: "authorization_code",
+                code,
+                redirect_uri: redirectUri,
+                client_id: OAUTH_CLIENT_ID,
+                client_secret: OAUTH_CLIENT_SECRET,
+              }).toString(),
+            }, 30_000);
+
+            const tokenData = await tokenRes.json() as { access_token?: string; error?: string };
+            if (!tokenData.access_token) {
+              res.statusCode = 302;
+              res.setHeader("Location", `${baseRedirect}/#oauth-error`);
+              res.end();
+              return;
+            }
+
+            const [userInfoRes, apikeyRes] = await Promise.all([
+              fetchWithTimeout(`${OAUTH_PROVIDER_URL}/oauth2/userinfo`, {
+                headers: { Authorization: `Bearer ${tokenData.access_token}` },
+              }, 15_000),
+              fetchWithTimeout(`${OAUTH_PROVIDER_URL}/oauth2/apikey`, {
+                headers: { Authorization: `Bearer ${tokenData.access_token}` },
+              }, 15_000).catch(() => null),
+            ]);
+
+            const userInfo = await userInfoRes.json() as {
+              sub?: string; username?: string; display_name?: string;
+              email?: string; role?: number; group?: string; error?: string;
+            };
+            if (userInfo.error || !userInfo.sub) {
+              res.statusCode = 302;
+              res.setHeader("Location", `${baseRedirect}/#oauth-error`);
+              res.end();
+              return;
+            }
+
+            let apiKey = "";
+            if (apikeyRes) {
+              try {
+                const apikeyData = await apikeyRes.json() as Record<string, unknown>;
+                console.log("[OAuth] /oauth2/apikey response:", JSON.stringify(apikeyData));
+                apiKey = String(apikeyData.api_key || apikeyData.apiKey || apikeyData.key || "");
+              } catch { /* ignore */ }
+            }
+
+            const sessionToken = createOAuthSession({
+              sub: String(userInfo.sub),
+              username: userInfo.username || "",
+              displayName: userInfo.display_name || userInfo.username || "",
+              email: userInfo.email || "",
+              role: userInfo.role ?? 1,
+              group: userInfo.group || "default",
+              apiKey,
+            });
+            setOAuthCookie(res, sessionToken);
+            res.statusCode = 302;
+            res.setHeader("Location", `${baseRedirect}/#oauth-success`);
+            res.end();
+            return;
+          }
+
+          if (path === "/me" && req.method === "GET") {
+            const session = getOAuthSession(req);
+            if (!session) {
+              sendJson(res, 200, { loggedIn: false });
+              return;
+            }
+            sendJson(res, 200, {
+              loggedIn: true,
+              sub: session.sub,
+              username: session.username,
+              displayName: session.displayName,
+              email: session.email,
+              role: session.role,
+              group: session.group,
+              apiKey: session.apiKey || undefined,
+            });
+            return;
+          }
+
+          if (path === "/logout" && req.method === "POST") {
+            const session = getOAuthSession(req);
+            if (session) oauthSessions.delete(session.token);
+            clearOAuthCookie(res);
+            sendJson(res, 200, { ok: true });
+            return;
+          }
+
+          sendJson(res, 404, { ok: false, error: "Not found" });
+        } catch (err) {
+          console.error("[OAuth]", err);
+          sendJson(res, 500, { ok: false, error: "OAuth internal error" });
+        }
+      });
+
       server.middlewares.use("/api/admin", async (req, res) => {
         const path = (req.url || "/").split("?")[0] || "/";
         const session = getAdminSession(req);
+        const oauthSession = !session ? getOAuthSession(req) : null;
+        const isOauthAdmin = oauthSession != null && oauthSession.role >= 10;
         const store = readAdminStore();
 
         try {
@@ -3523,29 +3763,46 @@ function imageProxyPlugin(): PluginOption {
             return;
           }
 
-          if (!session) {
+          if (!session && !isOauthAdmin) {
             sendJson(res, 401, { ok: false, error: "未登录" });
             return;
           }
 
-          const user = store.admins.find((admin) => admin.username === session.username);
-          if (!user) {
+          const user = session
+            ? store.admins.find((admin) => admin.username === session.username)
+            : null;
+          if (session && !user) {
             sendJson(res, 401, { ok: false, error: "管理员不存在" });
             return;
           }
 
           if (path === "/me" && req.method === "GET") {
+            if (isOauthAdmin && !user) {
+              sendJson(res, 200, {
+                ok: true,
+                user: {
+                  username: oauthSession!.displayName || oauthSession!.username,
+                  mustChangePassword: false,
+                  oauthUser: true,
+                },
+              });
+              return;
+            }
             sendJson(res, 200, {
               ok: true,
               user: {
-                username: user.username,
-                mustChangePassword: user.mustChangePassword,
+                username: user!.username,
+                mustChangePassword: user!.mustChangePassword,
               },
             });
             return;
           }
 
           if (path === "/change-password" && req.method === "POST") {
+            if (!user) {
+              sendJson(res, 400, { ok: false, error: "OAuth 用户无需修改密码" });
+              return;
+            }
             const body = await readJsonBody(req);
             const oldPassword = getString(body, "oldPassword");
             const newPassword = getString(body, "newPassword");
@@ -3570,7 +3827,7 @@ function imageProxyPlugin(): PluginOption {
             return;
           }
 
-          if (user.mustChangePassword) {
+          if (user?.mustChangePassword) {
             sendJson(res, 403, { ok: false, error: "首次登录必须修改密码", mustChangePassword: true });
             return;
           }
@@ -3638,7 +3895,7 @@ function imageProxyPlugin(): PluginOption {
             const filename = `image-studio-logs-${exportedAt.replace(/[:.]/g, "-")}.json`;
             const payload = {
               exportedAt,
-              exportedBy: user.username,
+              exportedBy: user?.username || oauthSession?.username || "unknown",
               schemaVersion: 1,
               admins: store.admins.map((admin) => ({
                 username: admin.username,
@@ -3659,7 +3916,7 @@ function imageProxyPlugin(): PluginOption {
             res.setHeader("Cache-Control", "no-store");
             res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
             res.end(JSON.stringify(payload, null, 2));
-            appendAuditLog(user.username, "admin_export_logs", `count=${store.requestLogs.length}`);
+            appendAuditLog(user?.username || oauthSession?.username || "oauth_admin", "admin_export_logs", `count=${store.requestLogs.length}`);
             return;
           }
 
@@ -4221,10 +4478,12 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 8877,
     strictPort: true,
+    allowedHosts: ["imagehub.taijiai.online"],
   },
   preview: {
     host: "0.0.0.0",
     port: 8877,
     strictPort: true,
+    allowedHosts: ["image.taijiai.online"],
   },
 });

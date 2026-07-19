@@ -879,6 +879,23 @@ textarea:focus-visible {
   font-weight: 650;
 }
 
+.admin-login-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.admin-login-divider::before,
+.admin-login-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
 .admin-login-card label {
   display: grid;
   gap: 7px;
@@ -7176,6 +7193,116 @@ textarea:focus-visible {
   .home-secondary {
     justify-content: center;
   }
+}
+
+/* ── OAuth login ── */
+
+.oauth-login-btn {
+  gap: 7px;
+}
+
+.oauth-user-info {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.88);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.oauth-user-name {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.oauth-logout-btn {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.oauth-logout-btn:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.oauth-user-compact {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Login page ── */
+
+.login-option {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.login-option:hover {
+  border-color: var(--text-secondary);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.06);
+}
+
+.login-option div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.login-option strong {
+  font-size: 15px;
+  font-weight: 620;
+}
+
+.login-option span {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.login-option-oauth {
+  border-color: rgba(59, 130, 246, 0.3);
+  background: rgba(59, 130, 246, 0.04);
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  padding: 14px;
+}
+
+.login-option-oauth div {
+  align-items: center;
+}
+
+.login-option-oauth:hover {
+  border-color: rgba(59, 130, 246, 0.6);
+  background: rgba(59, 130, 246, 0.08);
 }
 
 /* ======================================
