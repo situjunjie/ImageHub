@@ -7,7 +7,8 @@ import {
   scryptSync,
   timingSafeEqual,
 } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import Database from "better-sqlite3";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 import { defineConfig, loadEnv, type PluginOption, type ViteDevServer } from "vite";
@@ -134,11 +135,28 @@ type RequestLog = {
   errorType?: string;
   errorCode?: string;
   errorRaw?: string;
+  errorFull?: string;
   createdAt: number;
   startedAt?: number;
   finishedAt?: number;
   durationMs?: number;
-  imageSaved: false;
+  imageSaved: boolean;
+  savedImages?: SavedImageMeta[];
+  stages?: RequestStages;
+};
+
+type SavedImageMeta = {
+  id: string;
+  mime: string;
+  bytes: number;
+};
+
+type RequestStages = {
+  receivedAt?: number;
+  upstreamRequestedAt?: number;
+  upstreamRespondedAt?: number;
+  imageSavedAt?: number;
+  returnedAt?: number;
 };
 
 type AdminAuditLog = {
@@ -276,6 +294,10 @@ const SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const DATA_DIR = join(process.cwd(), ".data");
 const ADMIN_STORE_PATH = join(DATA_DIR, "admin-store.json");
 const SQUARE_STORE_PATH = join(DATA_DIR, "square-store.json");
+const LOCAL_IMAGE_DIR = join(DATA_DIR, "images");
+const LOCAL_IMAGE_URL_PREFIX = "/api/images/local/";
+// 相对路径形如 <用户目录>/<文件名>.<ext>，用户目录与文件名均限制安全字符、禁止路径穿越
+const LOCAL_IMAGE_PATH_PATTERN = /^[A-Za-z0-9_-]{1,64}\/[A-Za-z0-9_.-]{1,120}\.(png|jpg|webp|gif)$/;
 const REFERENCE_TEMP_TTL_MS = 1000 * 60 * 10;
 const PUBLIC_REFERENCE_BASE_URL = "https://imagehub.taijiai.online";
 const SQUARE_TIME_ZONE = "Asia/Shanghai";
@@ -295,6 +317,29 @@ const SQUARE_DAILY_RECOMMEND_LIMIT = 10;
 const SQUARE_DAILY_LIKE_LIMIT = 10;
 const SQUARE_MAX_FEED_LIMIT = 20;
 const SQUARE_MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const CONFIG_STORE_PATH = join(DATA_DIR, "config-store.json");
+const DEFAULT_AGENT_ANALYZE_SYSTEM_PROMPT = [
+  "你是一个图片生成 Agent 的任务拆解器。",
+  "你要识别用户当前输入属于 single_image、multi_image_batch、brochure_project 或 page_refine 哪一种。",
+  "如果是多图任务，要尽量拆成逐张独立 job；如果只是说明总张数但没有逐张差异，也可以返回 1 个 job 并把 count 设为总数。",
+  "如果是宣传画册任务，不要直接输出 jobs，而是返回 brochureProject，包含 title, companyName, industry, purpose, pageCount, summary, outline, styleDirections, requestPrompt。",
+  "outline 每项包含 pageNo, role, title, objective。styleDirections 返回 3 到 6 个方向。",
+  "如果是 page_refine，需要输出 1 个 job，说明是某一页单独重做。",
+  "只返回 JSON，不要使用 Markdown。",
+  "JSON 顶层字段必须包含 intentType, confidence, reasoningSummary, estimatedCostLevel, requiresConfirmation, autoExecute, jobs, brochureProject。",
+  "estimatedCostLevel 只能是 low、medium、high。confidence 范围 0 到 1。",
+  "每个 job 可包含 id, title, prompt, objective, negativePrompt, aspectRatio, size, resolution, quality, count。",
+].join("\n");
+const DEFAULT_PROMPT_ANALYZE_SYSTEM_PROMPT = [
+  "你是一个专业的 GPT 生图发送前分析器。",
+  "你的任务是判断提示词是否适合进入生图流程，并给出提示词优化、参数推荐、失败预判和风格增强。",
+  "只返回 JSON，不要使用 Markdown。",
+  "JSON 字段必须包含 safe, score, riskLevel, summary, optimizedPrompt, suggestedNegativePrompt, suggestedParams, risks, styleEnhancements。",
+  "riskLevel 只能是 low、medium、high。safe=false 仅用于高风险或大概率失败场景。",
+  "suggestedParams 可包含 aspectRatio, size, resolution, count, quality, styleStrength, referenceWeight。",
+  "risks 每项包含 level, title, description, fix。styleEnhancements 每项包含 name, description, promptFragment。",
+  "优化提示词时要保留用户原意，不要替换主体，不要加入未授权的具体人物身份。",
+].join("\n");
 
 const temporaryReferences = new Map<string, {
   bytes: Buffer;
@@ -542,6 +587,157 @@ function appendAuditLog(username: string, action: string, detail?: string) {
   writeAdminStore(store);
 }
 
+type ConfigUpstream = {
+  id: string;
+  name: string;
+  baseUrl: string;
+  enabled: boolean;
+  note?: string;
+  sort: number;
+};
+
+type ConfigModel = {
+  id: string;
+  displayName: string;
+  sizing: "explicit-2k4k" | "official-1k";
+  enabled: boolean;
+  sort: number;
+  tags?: string[];
+};
+
+type ConfigStore = {
+  version: number;
+  updatedAt: string;
+  upstreams: ConfigUpstream[];
+  models: ConfigModel[];
+  presets: {
+    promptStarters: unknown[] | null;
+    stylePresets: unknown[] | null;
+    industryAgents: unknown[] | null;
+    negativePrompt: string | null;
+  };
+  systemPrompts: {
+    agentAnalyze: string;
+    promptAnalyze: string;
+  };
+  quotas: {
+    squareShelfLimit: number;
+    squareDailyRecommend: number;
+    squareDailyLike: number;
+    squareMaxFeed: number;
+    generationDailyLimit: number;
+    userDiskLimitMB: number;
+  };
+};
+
+function defaultConfigStore(): ConfigStore {
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    upstreams: [
+      { id: "taiji", name: "太极 AI", baseUrl: "https://www.taijiai.online/", enabled: true, note: "主服务地址", sort: 1 },
+      { id: "bobdong", name: "BobDong", baseUrl: "https://bobdong.cn/", enabled: true, note: "备用服务地址", sort: 2 },
+    ],
+    models: [
+      { id: GPT_IMAGE_2_MODEL, displayName: "GPT Image 2", sizing: "explicit-2k4k", enabled: true, sort: 1, tags: ["2K", "4K"] },
+      { id: GPT_IMAGE_2_PRO_MODEL, displayName: "GPT Image 2 Pro", sizing: "explicit-2k4k", enabled: true, sort: 2, tags: ["2K", "4K"] },
+      { id: GPT_IMAGE_2_FAMILY_MODEL, displayName: "GPT 5.4 Image 2", sizing: "official-1k", enabled: true, sort: 3, tags: [] },
+      { id: GEMINI_3_PRO_IMAGE_MODEL, displayName: "Gemini 3 Pro Image", sizing: "official-1k", enabled: true, sort: 4, tags: [] },
+    ],
+    presets: {
+      promptStarters: null,
+      stylePresets: null,
+      industryAgents: null,
+      negativePrompt: null,
+    },
+    systemPrompts: {
+      agentAnalyze: DEFAULT_AGENT_ANALYZE_SYSTEM_PROMPT,
+      promptAnalyze: DEFAULT_PROMPT_ANALYZE_SYSTEM_PROMPT,
+    },
+    quotas: {
+      squareShelfLimit: SQUARE_SHELF_LIMIT,
+      squareDailyRecommend: SQUARE_DAILY_RECOMMEND_LIMIT,
+      squareDailyLike: SQUARE_DAILY_LIKE_LIMIT,
+      squareMaxFeed: SQUARE_MAX_FEED_LIMIT,
+      generationDailyLimit: 0,
+      userDiskLimitMB: 0,
+    },
+  };
+}
+
+let configStoreCache: ConfigStore | null = null;
+
+function ensureConfigStore() {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  if (!existsSync(CONFIG_STORE_PATH)) {
+    writeFileSync(CONFIG_STORE_PATH, JSON.stringify(defaultConfigStore(), null, 2));
+  }
+}
+
+function readConfigStore(): ConfigStore {
+  if (configStoreCache) return configStoreCache;
+  ensureConfigStore();
+  const fallback = defaultConfigStore();
+  try {
+    const parsed = JSON.parse(readFileSync(CONFIG_STORE_PATH, "utf8"));
+    const merged: ConfigStore = {
+      ...fallback,
+      ...parsed,
+      upstreams: Array.isArray(parsed.upstreams) ? parsed.upstreams : fallback.upstreams,
+      models: Array.isArray(parsed.models) ? parsed.models : fallback.models,
+      presets: { ...fallback.presets, ...(parsed.presets && typeof parsed.presets === "object" ? parsed.presets : {}) },
+      systemPrompts: { ...fallback.systemPrompts, ...(parsed.systemPrompts && typeof parsed.systemPrompts === "object" ? parsed.systemPrompts : {}) },
+      quotas: { ...fallback.quotas, ...(parsed.quotas && typeof parsed.quotas === "object" ? parsed.quotas : {}) },
+    };
+    configStoreCache = merged;
+    return merged;
+  } catch {
+    configStoreCache = fallback;
+    return fallback;
+  }
+}
+
+function writeConfigStore(store: ConfigStore) {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  store.version += 1;
+  store.updatedAt = new Date().toISOString();
+  writeFileSync(CONFIG_STORE_PATH, JSON.stringify(store, null, 2));
+  configStoreCache = store;
+}
+
+function enabledUpstreamBaseUrls(): string[] {
+  return readConfigStore().upstreams
+    .filter((item) => item.enabled)
+    .map((item) => item.baseUrl.trim().replace(/\/+$/, ""));
+}
+
+function enabledModelIds(): string[] {
+  return readConfigStore().models
+    .filter((item) => item.enabled)
+    .map((item) => normalizedModelId(item.id));
+}
+
+const INTERNAL_HOST_PATTERN = /^(localhost|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/i;
+
+function validateUpstreamBaseUrl(rawUrl: string): string {
+  const trimmed = String(rawUrl || "").trim();
+  if (!/^https?:\/\//i.test(trimmed)) {
+    throw new Error("站点地址必须以 http:// 或 https:// 开头");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error("站点地址格式不合法");
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (INTERNAL_HOST_PATTERN.test(host) || host.endsWith(".local")) {
+    throw new Error("不允许使用内网、回环或云元数据地址（如 127.x / 192.168.x / 169.254.x）");
+  }
+  const base = `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, "");
+  return `${base}/`;
+}
+
 function createSession(username: string) {
   const token = randomBytes(32).toString("hex");
   adminSessions.set(token, { username, expiresAt: Date.now() + SESSION_TTL_MS });
@@ -663,11 +859,11 @@ function getSquareQuota(store: SquareStore, apiKeyHash: string, dateKey = square
 }
 
 function squareRemainingRecommendQuota(quota: SquareQuotaDaily) {
-  return Math.max(0, SQUARE_DAILY_RECOMMEND_LIMIT - quota.dailyRecommendUsed);
+  return Math.max(0, readConfigStore().quotas.squareDailyRecommend - quota.dailyRecommendUsed);
 }
 
 function squareRemainingLikeQuota(quota: SquareQuotaDaily) {
-  return Math.max(0, SQUARE_DAILY_LIKE_LIMIT - quota.dailyLikeUsed);
+  return Math.max(0, readConfigStore().quotas.squareDailyLike - quota.dailyLikeUsed);
 }
 
 function squareClientMeta(req: IncomingMessage) {
@@ -797,13 +993,76 @@ function sanitizeForLog(value: unknown, key = "", depth = 0): unknown {
   return String(value);
 }
 
+const IMAGE_MIME_EXT: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+};
+
+const IMAGE_EXT_MIME: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+};
+
+function sanitizeUserDir(value: string): string {
+  const cleaned = String(value || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+  return cleaned || "anonymous";
+}
+
+// 图片按 <用户目录>/<生成ID>-<序号>.<ext> 存储，用户目录取自 OAuth 用户名或 clientId
+function persistGeneratedImages(
+  images: Array<{ dataUrl: string; revisedPrompt?: string }>,
+  options: { userDir: string; requestId: string },
+) {
+  const saved: SavedImageMeta[] = [];
+  const userDir = sanitizeUserDir(options.userDir);
+  const publicImages = images.map((image, index) => {
+    try {
+      const match = /^data:([^;]+);base64,(.*)$/.exec(image.dataUrl);
+      if (!match) {
+        return { dataUrl: image.dataUrl, revisedPrompt: image.revisedPrompt };
+      }
+      const mime = match[1].toLowerCase();
+      const ext = IMAGE_MIME_EXT[mime] || "png";
+      const buffer = Buffer.from(match[2].replace(/\s+/g, ""), "base64");
+      const dir = join(LOCAL_IMAGE_DIR, userDir);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const fileName = images.length > 1 ? `${options.requestId}-${index}.${ext}` : `${options.requestId}.${ext}`;
+      const relativePath = `${userDir}/${fileName}`;
+      writeFileSync(join(LOCAL_IMAGE_DIR, userDir, fileName), buffer);
+      saved.push({ id: relativePath, mime: IMAGE_EXT_MIME[ext] || mime, bytes: buffer.length });
+      return { url: `${LOCAL_IMAGE_URL_PREFIX}${relativePath}`, revisedPrompt: image.revisedPrompt };
+    } catch {
+      return { dataUrl: image.dataUrl, revisedPrompt: image.revisedPrompt };
+    }
+  });
+  return { saved, publicImages };
+}
+
+function deleteSavedImages(saved?: SavedImageMeta[]) {
+  if (!Array.isArray(saved)) return;
+  for (const image of saved) {
+    if (!image || typeof image.id !== "string" || !LOCAL_IMAGE_PATH_PATTERN.test(image.id) || image.id.includes("..")) continue;
+    try {
+      unlinkSync(join(LOCAL_IMAGE_DIR, image.id));
+    } catch {
+      // 文件可能已被清理，忽略
+    }
+  }
+}
+
 function normalizeAllowedApiBaseUrl(value: string) {
   const normalized = value.trim().replace(/\/+$/, "");
-  const match = ALLOWED_API_BASE_URLS.find((allowed) => allowed.replace(/\/+$/, "") === normalized);
+  const allowList = [...enabledUpstreamBaseUrls(), ...ALLOWED_API_BASE_URLS.map((u) => u.replace(/\/+$/, ""))];
+  const match = allowList.find((allowed) => allowed === normalized);
   if (!match) {
     throw new Error("API URL 不在允许列表中");
   }
-  return match;
+  return `${match}/`;
 }
 
 function isAllowedApiBaseUrlError(error: unknown) {
@@ -819,6 +1078,23 @@ function httpStatusFromDetail(detail: unknown) {
     return (error as Record<string, unknown>).status as number;
   }
   return undefined;
+}
+
+// 把 Error（含 undici 的 cause 链、code、errno）序列化成可读文本，用于记录完整错误
+function describeError(error: unknown, depth = 0): string {
+  if (depth > 5) return "[cause-depth-limit]";
+  if (!(error instanceof Error)) {
+    try { return typeof error === "string" ? error : JSON.stringify(error); } catch { return String(error); }
+  }
+  const parts: string[] = [`${error.name}: ${error.message}`];
+  const anyErr = error as Error & { code?: unknown; errno?: unknown; cause?: unknown };
+  if (anyErr.code != null) parts.push(`code=${String(anyErr.code)}`);
+  if (anyErr.errno != null) parts.push(`errno=${String(anyErr.errno)}`);
+  if (anyErr.cause != null && anyErr.cause !== error) {
+    parts.push(`\n  ↳ cause: ${describeError(anyErr.cause, depth + 1)}`);
+  }
+  if (depth === 0 && error.stack) parts.push(`\n${error.stack}`);
+  return parts.join(" ");
 }
 
 function safeErrorSummary(detail: unknown) {
@@ -838,22 +1114,197 @@ function safeErrorSummary(detail: unknown) {
     type: typeof error.type === "string" ? error.type : undefined,
     code: typeof error.code === "string" ? error.code : undefined,
     raw: redactImageText(typeof detail === "string" ? detail : JSON.stringify(sanitizeForLog(detail)), 2500),
+    // 完整错误内容（仅脱敏图片数据，不做长度截断）——用于排查"中转站看起来没错但生成报错"的情况
+    full: redactImageText(typeof detail === "string" ? detail : JSON.stringify(sanitizeForLog(detail), null, 2), 60000),
   };
 }
 
+// ── SQLite 请求/生成记录存储 ──
+const REQUEST_LOG_LIMIT = 5000;
+let sqliteDb: Database.Database | null = null;
+
+function getDb(): Database.Database {
+  if (sqliteDb) return sqliteDb;
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  const db = new Database(join(DATA_DIR, "imagehub.db"));
+  db.pragma("journal_mode = WAL");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS request_logs (
+      request_id TEXT PRIMARY KEY,
+      request_type TEXT,
+      client_id TEXT,
+      model TEXT,
+      status TEXT,
+      error_key TEXT,
+      created_at INTEGER,
+      duration_ms INTEGER,
+      image_count INTEGER DEFAULT 0,
+      ref_count INTEGER DEFAULT 0,
+      ref_status TEXT,
+      upstream_responded INTEGER DEFAULT 0,
+      image_saved INTEGER DEFAULT 0,
+      search TEXT,
+      data TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_request_logs_status ON request_logs(status);
+    CREATE TABLE IF NOT EXISTS daily_stats (
+      date TEXT NOT NULL,
+      model TEXT NOT NULL,
+      total INTEGER DEFAULT 0,
+      success INTEGER DEFAULT 0,
+      error INTEGER DEFAULT 0,
+      images INTEGER DEFAULT 0,
+      duration_sum INTEGER DEFAULT 0,
+      duration_count INTEGER DEFAULT 0,
+      PRIMARY KEY (date, model)
+    );
+    CREATE TABLE IF NOT EXISTS image_feedback (
+      request_id TEXT PRIMARY KEY,
+      client_id TEXT,
+      model TEXT,
+      rating INTEGER,
+      created_at INTEGER
+    );
+  `);
+  sqliteDb = db;
+  // 首次启动时把历史 admin-store.json 里的旧日志迁移进来（一次性）
+  try {
+    const legacy = readAdminStore();
+    if (Array.isArray(legacy.requestLogs) && legacy.requestLogs.length > 0) {
+      const count = (db.prepare("SELECT COUNT(*) AS n FROM request_logs").get() as { n: number }).n;
+      if (count === 0) {
+        const insert = db.transaction((rows: RequestLog[]) => {
+          for (const row of rows) requestLogRow(row);
+        });
+        insert(legacy.requestLogs);
+        legacy.requestLogs = [];
+        writeAdminStore(legacy);
+      }
+    }
+  } catch {
+    // 迁移失败不阻断启动
+  }
+  // 每日聚合表首次创建时用现有日志回填，之后由请求终态实时累加（不受 5000 条裁剪影响）
+  try {
+    const rollupCount = (db.prepare("SELECT COUNT(*) AS n FROM daily_stats").get() as { n: number }).n;
+    if (rollupCount === 0) {
+      const rows = db.prepare("SELECT data FROM request_logs").all() as Array<{ data: string }>;
+      const backfill = db.transaction(() => {
+        for (const row of rows) {
+          try {
+            const log = JSON.parse(row.data) as RequestLog;
+            if (log.requestType === "image_generation" && (log.status === "success" || log.status === "error")) {
+              bumpDailyStats(log);
+            }
+          } catch { /* 单条损坏忽略 */ }
+        }
+      });
+      backfill();
+    }
+  } catch {
+    // 回填失败不阻断启动
+  }
+  return db;
+}
+
+// 请求到达终态时累加当日聚合（date + model 维度）
+function bumpDailyStats(log: RequestLog) {
+  const durationMs = typeof log.durationMs === "number" ? log.durationMs : null;
+  getDb().prepare(`
+    INSERT INTO daily_stats (date, model, total, success, error, images, duration_sum, duration_count)
+    VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+    ON CONFLICT(date, model) DO UPDATE SET
+      total = total + 1,
+      success = success + excluded.success,
+      error = error + excluded.error,
+      images = images + excluded.images,
+      duration_sum = duration_sum + excluded.duration_sum,
+      duration_count = duration_count + excluded.duration_count
+  `).run(
+    squareDayKey(log.createdAt),
+    log.model || "",
+    log.status === "success" ? 1 : 0,
+    log.status === "error" ? 1 : 0,
+    log.savedImages?.length || 0,
+    durationMs ?? 0,
+    durationMs === null ? 0 : 1,
+  );
+}
+
+function requestLogSearchText(log: RequestLog): string {
+  return `${log.requestId} ${log.clientId} ${log.prompt} ${log.model} ${log.resolution || ""} ${log.agentName || ""} ${log.agentScenario || ""} ${log.errorMessage || ""}`.toLowerCase();
+}
+
+function requestLogRow(log: RequestLog) {
+  const errorKey = log.status === "error"
+    ? (log.errorCode || log.errorType || log.errorMessage || "未知错误")
+    : null;
+  const upstreamResponded = log.stages?.upstreamRespondedAt
+    || (log.status !== "running" && log.errorType !== "validation_error") ? 1 : 0;
+  getDb().prepare(`
+    INSERT INTO request_logs
+      (request_id, request_type, client_id, model, status, error_key, created_at, duration_ms, image_count, ref_count, ref_status, upstream_responded, image_saved, search, data)
+    VALUES (@request_id, @request_type, @client_id, @model, @status, @error_key, @created_at, @duration_ms, @image_count, @ref_count, @ref_status, @upstream_responded, @image_saved, @search, @data)
+    ON CONFLICT(request_id) DO UPDATE SET
+      request_type=excluded.request_type, client_id=excluded.client_id, model=excluded.model, status=excluded.status,
+      error_key=excluded.error_key, created_at=excluded.created_at, duration_ms=excluded.duration_ms, image_count=excluded.image_count,
+      ref_count=excluded.ref_count, ref_status=excluded.ref_status, upstream_responded=excluded.upstream_responded,
+      image_saved=excluded.image_saved, search=excluded.search, data=excluded.data
+  `).run({
+    request_id: log.requestId,
+    request_type: log.requestType,
+    client_id: log.clientId,
+    model: log.model || "",
+    status: log.status,
+    error_key: errorKey,
+    created_at: log.createdAt,
+    duration_ms: typeof log.durationMs === "number" ? log.durationMs : null,
+    image_count: log.savedImages?.length || 0,
+    ref_count: log.referenceCount || 0,
+    ref_status: log.referenceUploadStatus || null,
+    upstream_responded: upstreamResponded,
+    image_saved: log.imageSaved ? 1 : 0,
+    search: requestLogSearchText(log),
+    data: JSON.stringify(log),
+  });
+}
+
+function readRequestLogRecord(requestId: string): RequestLog | null {
+  const row = getDb().prepare("SELECT data FROM request_logs WHERE request_id = ?").get(requestId) as { data: string } | undefined;
+  if (!row) return null;
+  try { return JSON.parse(row.data) as RequestLog; } catch { return null; }
+}
+
 function createRequestLog(log: RequestLog) {
-  const store = readAdminStore();
-  store.requestLogs.unshift(log);
-  store.requestLogs = store.requestLogs.slice(0, 5000);
-  writeAdminStore(store);
+  requestLogRow(log);
+  // 保留最近 REQUEST_LOG_LIMIT 条，清理超出的记录与其图片文件
+  const overflow = getDb()
+    .prepare("SELECT data FROM request_logs ORDER BY created_at DESC LIMIT -1 OFFSET ?")
+    .all(REQUEST_LOG_LIMIT) as Array<{ data: string }>;
+  if (overflow.length > 0) {
+    for (const row of overflow) {
+      try { deleteSavedImages((JSON.parse(row.data) as RequestLog).savedImages); } catch { /* ignore */ }
+    }
+    getDb().prepare(`DELETE FROM request_logs WHERE request_id IN (
+      SELECT request_id FROM request_logs ORDER BY created_at DESC LIMIT -1 OFFSET ?
+    )`).run(REQUEST_LOG_LIMIT);
+  }
 }
 
 function updateRequestLog(requestId: string, patch: Partial<RequestLog>) {
-  const store = readAdminStore();
-  store.requestLogs = store.requestLogs.map((record) =>
-    record.requestId === requestId ? { ...record, ...patch } : record,
-  );
-  writeAdminStore(store);
+  const current = readRequestLogRecord(requestId);
+  if (!current) return;
+  const merged = { ...current, ...patch };
+  requestLogRow(merged);
+  // 生图请求首次从 running 进入终态时累加每日聚合（终态只发生一次，保证不重复计数）
+  if (
+    current.status === "running"
+    && (merged.status === "success" || merged.status === "error")
+    && merged.requestType === "image_generation"
+  ) {
+    bumpDailyStats(merged);
+  }
 }
 
 function generationEndpointLabel(protocol: ImageProtocol, model = "", referenceCount = 0) {
@@ -2135,18 +2586,7 @@ async function analyzeAgentModeWithGpt(
     count: getNumber(body.count),
     referenceCount: getNumber(body.referenceCount) || 0,
   };
-  const systemPrompt = [
-    "你是一个图片生成 Agent 的任务拆解器。",
-    "你要识别用户当前输入属于 single_image、multi_image_batch、brochure_project 或 page_refine 哪一种。",
-    "如果是多图任务，要尽量拆成逐张独立 job；如果只是说明总张数但没有逐张差异，也可以返回 1 个 job 并把 count 设为总数。",
-    "如果是宣传画册任务，不要直接输出 jobs，而是返回 brochureProject，包含 title, companyName, industry, purpose, pageCount, summary, outline, styleDirections, requestPrompt。",
-    "outline 每项包含 pageNo, role, title, objective。styleDirections 返回 3 到 6 个方向。",
-    "如果是 page_refine，需要输出 1 个 job，说明是某一页单独重做。",
-    "只返回 JSON，不要使用 Markdown。",
-    "JSON 顶层字段必须包含 intentType, confidence, reasoningSummary, estimatedCostLevel, requiresConfirmation, autoExecute, jobs, brochureProject。",
-    "estimatedCostLevel 只能是 low、medium、high。confidence 范围 0 到 1。",
-    "每个 job 可包含 id, title, prompt, objective, negativePrompt, aspectRatio, size, resolution, quality, count。",
-  ].join("\n");
+  const systemPrompt = readConfigStore().systemPrompts.agentAnalyze || DEFAULT_AGENT_ANALYZE_SYSTEM_PROMPT;
 
   const upstreamPayload = {
     model: analysisModel,
@@ -2330,16 +2770,7 @@ async function analyzePromptWithGpt(
     referenceIssues: Array.isArray(body.referenceIssues) ? body.referenceIssues : [],
     mode: getString(body, "mode") || "send",
   };
-  const systemPrompt = [
-    "你是一个专业的 GPT 生图发送前分析器。",
-    "你的任务是判断提示词是否适合进入生图流程，并给出提示词优化、参数推荐、失败预判和风格增强。",
-    "只返回 JSON，不要使用 Markdown。",
-    "JSON 字段必须包含 safe, score, riskLevel, summary, optimizedPrompt, suggestedNegativePrompt, suggestedParams, risks, styleEnhancements。",
-    "riskLevel 只能是 low、medium、high。safe=false 仅用于高风险或大概率失败场景。",
-    "suggestedParams 可包含 aspectRatio, size, resolution, count, quality, styleStrength, referenceWeight。",
-    "risks 每项包含 level, title, description, fix。styleEnhancements 每项包含 name, description, promptFragment。",
-    "优化提示词时要保留用户原意，不要替换主体，不要加入未授权的具体人物身份。",
-  ].join("\n");
+  const systemPrompt = readConfigStore().systemPrompts.promptAnalyze || DEFAULT_PROMPT_ANALYZE_SYSTEM_PROMPT;
 
   const upstreamPayload = {
     model: analysisModel,
@@ -2951,7 +3382,7 @@ async function handleSquareFeed(req: IncomingMessage, res: ServerResponse) {
   }
   const url = new URL(req.url || "/", "http://localhost");
   const tab = normalizeSquareFeedTab(url.searchParams.get("tab"));
-  const limit = Math.max(1, Math.min(SQUARE_MAX_FEED_LIMIT, Number(url.searchParams.get("limit")) || SQUARE_MAX_FEED_LIMIT));
+  const limit = Math.max(1, Math.min(readConfigStore().quotas.squareMaxFeed, Number(url.searchParams.get("limit")) || readConfigStore().quotas.squareMaxFeed));
   const offset = squareCursorOffset(url.searchParams.get("cursor"));
   const apiKey = String(req.headers["x-imagehub-api-key"] || "").trim();
   const viewerHash = apiKey ? hashApiKey(apiKey) : "";
@@ -2989,7 +3420,7 @@ async function handleSquareQuota(req: IncomingMessage, res: ServerResponse) {
     dailyLikeUsed: quota.dailyLikeUsed,
     dailyLikeLeft: squareRemainingLikeQuota(quota),
     shelfCount: squareShelfCount(store, apiKeyHash),
-    shelfLimit: SQUARE_SHELF_LIMIT,
+    shelfLimit: readConfigStore().quotas.squareShelfLimit,
     dayKey: quota.dateKey,
   });
 }
@@ -3019,7 +3450,7 @@ async function handleSquareRecommend(req: IncomingMessage, res: ServerResponse) 
         result: "rejected",
         reasonCode,
         remainingDailyQuota: squareRemainingRecommendQuota(quota),
-        remainingShelfSlots: Math.max(0, SQUARE_SHELF_LIMIT - squareShelfCount(store, apiKeyHash)),
+        remainingShelfSlots: Math.max(0, readConfigStore().quotas.squareShelfLimit - squareShelfCount(store, apiKeyHash)),
         ...clientMeta,
         ...extra,
       });
@@ -3031,11 +3462,11 @@ async function handleSquareRecommend(req: IncomingMessage, res: ServerResponse) 
         reasonCode,
         error,
         remainingDailyQuota: squareRemainingRecommendQuota(quota),
-        remainingShelfSlots: Math.max(0, SQUARE_SHELF_LIMIT - squareShelfCount(store, apiKeyHash)),
+        remainingShelfSlots: Math.max(0, readConfigStore().quotas.squareShelfLimit - squareShelfCount(store, apiKeyHash)),
       });
     };
 
-    if (quota.dailyRecommendUsed >= SQUARE_DAILY_RECOMMEND_LIMIT) {
+    if (quota.dailyRecommendUsed >= readConfigStore().quotas.squareDailyRecommend) {
       reject(429, "daily_recommend_quota_exceeded", "今日推荐额度已满");
       return;
     }
@@ -3124,7 +3555,7 @@ async function handleSquareRecommend(req: IncomingMessage, res: ServerResponse) 
     const activeByKey = squareActiveItems(store)
       .filter((item) => item.recommenderHash === apiKeyHash)
       .sort((a, b) => a.createdAt - b.createdAt);
-    const action: "added" | "replaced" = activeByKey.length >= SQUARE_SHELF_LIMIT ? "replaced" : "added";
+    const action: "added" | "replaced" = activeByKey.length >= readConfigStore().quotas.squareShelfLimit ? "replaced" : "added";
     const replaced = action === "replaced" ? activeByKey[0] : undefined;
     const itemId = randomUUID();
     if (replaced) {
@@ -3185,7 +3616,7 @@ async function handleSquareRecommend(req: IncomingMessage, res: ServerResponse) 
       reasonCode: action === "replaced" ? "shelf_limit_replaced_oldest" : "added_to_square",
       replacedItemId: replaced?.id,
       remainingDailyQuota: squareRemainingRecommendQuota(quota),
-      remainingShelfSlots: Math.max(0, SQUARE_SHELF_LIMIT - squareShelfCount(store, apiKeyHash)),
+      remainingShelfSlots: Math.max(0, readConfigStore().quotas.squareShelfLimit - squareShelfCount(store, apiKeyHash)),
       ...clientMeta,
       promptHash,
       imageHash,
@@ -3198,7 +3629,7 @@ async function handleSquareRecommend(req: IncomingMessage, res: ServerResponse) 
       action,
       item: squareFeedItem(item, store, "latest", apiKeyHash),
       remainingDailyQuota: squareRemainingRecommendQuota(quota),
-      remainingShelfSlots: Math.max(0, SQUARE_SHELF_LIMIT - squareShelfCount(store, apiKeyHash)),
+      remainingShelfSlots: Math.max(0, readConfigStore().quotas.squareShelfLimit - squareShelfCount(store, apiKeyHash)),
       replacedItemId: replaced?.id,
     });
   } catch (error) {
@@ -3258,7 +3689,7 @@ async function handleSquareLike(req: IncomingMessage, res: ServerResponse) {
         });
         return;
       }
-      if (quota.dailyLikeUsed >= SQUARE_DAILY_LIKE_LIMIT) {
+      if (quota.dailyLikeUsed >= readConfigStore().quotas.squareDailyLike) {
         log("rejected", "daily_like_quota_exceeded");
         writeSquareStore(store);
         sendJson(res, 429, {
@@ -3494,14 +3925,129 @@ async function handleSquareAdminExport(req: IncomingMessage, res: ServerResponse
   appendAuditLog(auth.user.username, "admin_export_square_logs", `dateKey=${dateKey} format=json count=${recommendLogs.length + likeLogs.length}`);
 }
 
-function imageProxyPlugin(): PluginOption {
-  return {
-    name: "image-api-proxy",
-    configureServer(server: ViteDevServer) {
+// ── API 路由注册：开发（Vite 中间件）与生产（server/index.ts 独立服务）共用同一份实现 ──
+export type ApiApp = {
+  use: (path: string, handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>) => void;
+};
+
+export function registerApiRoutes(app: ApiApp) {
       ensureAdminStore();
       ensureSquareStore();
       setInterval(cleanupOAuthExpired, 1000 * 60 * 10);
-      server.middlewares.use("/api/reference-images", (req, res) => {
+      app.use("/api/config", (req, res) => {
+        if (req.method !== "GET") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        const store = readConfigStore();
+        sendJson(res, 200, {
+          ok: true,
+          version: store.version,
+          updatedAt: store.updatedAt,
+          upstreams: store.upstreams
+            .filter((item) => item.enabled)
+            .sort((a, b) => a.sort - b.sort)
+            .map((item) => ({ id: item.id, name: item.name, baseUrl: item.baseUrl, note: item.note || "" })),
+          models: store.models
+            .filter((item) => item.enabled)
+            .sort((a, b) => a.sort - b.sort)
+            .map((item) => ({ id: item.id, displayName: item.displayName, sizing: item.sizing, tags: item.tags || [] })),
+          presets: store.presets,
+        });
+      });
+
+      // 近 7 日各模型的真实表现（成功率 / P50 / 好差评），用于前端模型选择时展示
+      app.use("/api/model-stats", (req, res) => {
+        if (req.method !== "GET") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        try {
+          const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
+          const rows = getDb().prepare(
+            "SELECT model, status, duration_ms FROM request_logs WHERE request_type = 'image_generation' AND created_at >= ?",
+          ).all(since) as Array<{ model: string; status: string; duration_ms: number | null }>;
+          const feedbackRows = getDb().prepare(
+            "SELECT model, rating, COUNT(*) AS n FROM image_feedback GROUP BY model, rating",
+          ).all() as Array<{ model: string; rating: number; n: number }>;
+          const byModel = new Map<string, { success: number; error: number; durations: number[]; up: number; down: number }>();
+          const bucketFor = (model: string) => {
+            let bucket = byModel.get(model);
+            if (!bucket) {
+              bucket = { success: 0, error: 0, durations: [], up: 0, down: 0 };
+              byModel.set(model, bucket);
+            }
+            return bucket;
+          };
+          for (const row of rows) {
+            if (row.status !== "success" && row.status !== "error") continue;
+            const bucket = bucketFor(row.model || "");
+            if (row.status === "success") {
+              bucket.success += 1;
+              if (typeof row.duration_ms === "number") bucket.durations.push(row.duration_ms);
+            } else {
+              bucket.error += 1;
+            }
+          }
+          for (const row of feedbackRows) {
+            const bucket = bucketFor(row.model || "");
+            if (row.rating === 1) bucket.up += row.n;
+            if (row.rating === -1) bucket.down += row.n;
+          }
+          const models = [...byModel.entries()].map(([id, bucket]) => {
+            const samples = bucket.success + bucket.error;
+            const sorted = bucket.durations.sort((a, b) => a - b);
+            const p50 = sorted.length ? sorted[Math.min(sorted.length - 1, Math.round((sorted.length - 1) * 0.5))] : 0;
+            return {
+              id,
+              samples,
+              successRate: samples ? Math.round((bucket.success / samples) * 1000) / 10 : 0,
+              p50DurationMs: p50,
+              up: bucket.up,
+              down: bucket.down,
+            };
+          });
+          sendJson(res, 200, { ok: true, windowDays: 7, models });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      });
+
+      // 生成结果反馈：rating 1 好评 / -1 差评 / 0 清除
+      app.use("/api/feedback", async (req, res) => {
+        if (req.method !== "POST") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        try {
+          const body = await readJsonBody(req);
+          const requestId = getString(body, "requestId");
+          const rating = Number(body.rating);
+          if (!requestId || ![1, -1, 0].includes(rating)) {
+            sendJson(res, 400, { ok: false, error: "参数不合法" });
+            return;
+          }
+          const log = readRequestLogRecord(requestId);
+          if (!log) {
+            sendJson(res, 404, { ok: false, error: "请求记录不存在" });
+            return;
+          }
+          if (rating === 0) {
+            getDb().prepare("DELETE FROM image_feedback WHERE request_id = ?").run(requestId);
+          } else {
+            getDb().prepare(`
+              INSERT INTO image_feedback (request_id, client_id, model, rating, created_at)
+              VALUES (?, ?, ?, ?, ?)
+              ON CONFLICT(request_id) DO UPDATE SET rating = excluded.rating, created_at = excluded.created_at
+            `).run(requestId, log.clientId, log.model || "", rating, Date.now());
+          }
+          sendJson(res, 200, { ok: true });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      });
+
+      app.use("/api/reference-images", (req, res) => {
         if (req.method !== "GET" && req.method !== "HEAD") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
           return;
@@ -3525,7 +4071,32 @@ function imageProxyPlugin(): PluginOption {
         res.end(record.bytes);
       });
 
-      server.middlewares.use("/api/square/image/", (req, res) => {
+      app.use("/api/images/local/", (req, res) => {
+        if (req.method !== "GET" && req.method !== "HEAD") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        const id = decodeURIComponent((req.url || "/").split("?")[0]?.replace(/^\/+/, "") || "");
+        if (!LOCAL_IMAGE_PATH_PATTERN.test(id) || id.includes("..")) {
+          sendJson(res, 404, { ok: false, error: "图片不存在" });
+          return;
+        }
+        const filePath = join(LOCAL_IMAGE_DIR, id);
+        if (!filePath.startsWith(LOCAL_IMAGE_DIR) || !existsSync(filePath)) {
+          sendJson(res, 404, { ok: false, error: "图片不存在或已被清理" });
+          return;
+        }
+        const ext = id.slice(id.lastIndexOf(".") + 1);
+        const bytes = readFileSync(filePath);
+        res.statusCode = 200;
+        res.setHeader("Content-Type", IMAGE_EXT_MIME[ext] || "application/octet-stream");
+        res.setHeader("Content-Length", String(bytes.length));
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        if (req.method === "HEAD") { res.end(); return; }
+        res.end(bytes);
+      });
+
+      app.use("/api/square/image/", (req, res) => {
         const itemId = decodeURIComponent((req.url || "/").split("?")[0]?.replace(/^\/+/, "") || "");
         if (!itemId) { sendJson(res, 400, { ok: false, error: "missing item id" }); return; }
         const store = readSquareStore();
@@ -3542,31 +4113,31 @@ function imageProxyPlugin(): PluginOption {
         res.end(bytes);
       });
 
-      server.middlewares.use("/api/square/feed", (req, res) => {
+      app.use("/api/square/feed", (req, res) => {
         void handleSquareFeed(req, res);
       });
 
-      server.middlewares.use("/api/square/quota", (req, res) => {
+      app.use("/api/square/quota", (req, res) => {
         void handleSquareQuota(req, res);
       });
 
-      server.middlewares.use("/api/square/recommend", (req, res) => {
+      app.use("/api/square/recommend", (req, res) => {
         void handleSquareRecommend(req, res);
       });
 
-      server.middlewares.use("/api/square/like", (req, res) => {
+      app.use("/api/square/like", (req, res) => {
         void handleSquareLike(req, res);
       });
 
-      server.middlewares.use("/api/square/admin/overview", (req, res) => {
+      app.use("/api/square/admin/overview", (req, res) => {
         void handleSquareAdminOverview(req, res);
       });
 
-      server.middlewares.use("/api/square/admin/export", (req, res) => {
+      app.use("/api/square/admin/export", (req, res) => {
         void handleSquareAdminExport(req, res);
       });
 
-      server.middlewares.use("/api/auth/oauth", async (req, res) => {
+      app.use("/api/auth/oauth", async (req, res) => {
         const path = (req.url || "/").split("?")[0] || "/";
         const query = new URLSearchParams((req.url || "").split("?")[1] || "");
 
@@ -3726,7 +4297,7 @@ function imageProxyPlugin(): PluginOption {
         }
       });
 
-      server.middlewares.use("/api/admin", async (req, res) => {
+      app.use("/api/admin", async (req, res) => {
         const path = (req.url || "/").split("?")[0] || "/";
         const session = getAdminSession(req);
         const oauthSession = !session ? getOAuthSession(req) : null;
@@ -3833,33 +4404,101 @@ function imageProxyPlugin(): PluginOption {
           }
 
           if (path === "/stats" && req.method === "GET") {
-            const logs = store.requestLogs;
-            const success = logs.filter((log) => log.status === "success").length;
-            const error = logs.filter((log) => log.status === "error").length;
-            const durations = logs.filter((log) => typeof log.durationMs === "number").map((log) => log.durationMs || 0);
+            const rows = getDb().prepare(
+              "SELECT status, model, error_key, created_at, duration_ms, image_count, request_type, ref_count, ref_status, upstream_responded, image_saved FROM request_logs",
+            ).all() as Array<{
+              status: string; model: string; error_key: string | null; created_at: number; duration_ms: number | null;
+              image_count: number; request_type: string; ref_count: number; ref_status: string | null;
+              upstream_responded: number; image_saved: number;
+            }>;
+            // 统一指标口径：头部指标 / 模型分布 / 常见失败均只统计生图请求；分析类请求单独计数
+            const imageRows = rows.filter((r) => r.request_type === "image_generation");
+            const analysisCount = rows.length - imageRows.length;
+            const success = imageRows.filter((r) => r.status === "success").length;
+            const error = imageRows.filter((r) => r.status === "error").length;
+            const durations = imageRows.filter((r) => typeof r.duration_ms === "number").map((r) => r.duration_ms || 0);
             const avgDurationMs = durations.length
               ? Math.round(durations.reduce((sum, item) => sum + item, 0) / durations.length)
               : 0;
-            const modelCounts = logs.reduce<Record<string, number>>((acc, log) => {
-              acc[log.model] = (acc[log.model] || 0) + 1;
+            // 成功请求的耗时分位数（P50 反映正常体验，P95 反映长尾）
+            const successDurations = imageRows
+              .filter((r) => r.status === "success" && typeof r.duration_ms === "number")
+              .map((r) => r.duration_ms || 0)
+              .sort((a, b) => a - b);
+            const percentile = (sorted: number[], p: number) =>
+              sorted.length ? sorted[Math.min(sorted.length - 1, Math.round((sorted.length - 1) * p))] : 0;
+            const p50DurationMs = percentile(successDurations, 0.5);
+            const p95DurationMs = percentile(successDurations, 0.95);
+            const modelCounts = imageRows.reduce<Record<string, number>>((acc, r) => {
+              acc[r.model] = (acc[r.model] || 0) + 1;
               return acc;
             }, {});
-            const errorCounts = logs.filter((log) => log.status === "error").reduce<Record<string, number>>((acc, log) => {
-              const key = log.errorCode || log.errorType || log.errorMessage || "未知错误";
+            const errorCounts = imageRows.filter((r) => r.status === "error").reduce<Record<string, number>>((acc, r) => {
+              const key = r.error_key || "未知错误";
               acc[key] = (acc[key] || 0) + 1;
               return acc;
             }, {});
+
+            const totalImages = imageRows.reduce((sum, r) => sum + (r.image_count || 0), 0);
+
+            // 每日趋势读聚合表：不受 5000 条日志裁剪影响，历史永久保留
+            const dailyRows = getDb().prepare(`
+              SELECT date,
+                     SUM(total) AS total, SUM(success) AS success, SUM(error) AS error, SUM(images) AS images,
+                     SUM(duration_sum) AS duration_sum, SUM(duration_count) AS duration_count
+              FROM daily_stats GROUP BY date ORDER BY date DESC LIMIT 14
+            `).all() as Array<{
+              date: string; total: number; success: number; error: number; images: number;
+              duration_sum: number; duration_count: number;
+            }>;
+            const daily = dailyRows.map((bucket) => ({
+              date: bucket.date,
+              total: bucket.total,
+              success: bucket.success,
+              error: bucket.error,
+              images: bucket.images,
+              successRate: bucket.total ? Math.round((bucket.success / bucket.total) * 1000) / 10 : 0,
+              avgDurationMs: bucket.duration_count ? Math.round(bucket.duration_sum / bucket.duration_count) : 0,
+            }));
+
+            // 生成结果反馈计数
+            const feedbackRows = getDb().prepare(
+              "SELECT rating, COUNT(*) AS n FROM image_feedback GROUP BY rating",
+            ).all() as Array<{ rating: number; n: number }>;
+            const feedback = {
+              up: feedbackRows.find((r) => r.rating === 1)?.n || 0,
+              down: feedbackRows.find((r) => r.rating === -1)?.n || 0,
+            };
+
+            // 流水线各环节到达/成功统计（仅生图请求）
+            const withRefs = imageRows.filter((r) => (r.ref_count || 0) > 0);
+            const stageStats = {
+              received: imageRows.length,
+              referenceForwarded: withRefs.filter((r) => r.ref_status === "succeeded").length,
+              referenceTotal: withRefs.length,
+              upstreamResponded: imageRows.filter((r) => r.upstream_responded === 1).length,
+              upstreamSuccess: success,
+              imageSaved: imageRows.filter((r) => r.image_saved === 1).length,
+            };
+
             sendJson(res, 200, {
               ok: true,
               stats: {
-                total: logs.length,
+                total: imageRows.length,
                 success,
                 error,
-                running: logs.filter((log) => log.status === "running").length,
-                successRate: logs.length ? Math.round((success / logs.length) * 1000) / 10 : 0,
+                running: imageRows.filter((r) => r.status === "running").length,
+                successRate: imageRows.length ? Math.round((success / imageRows.length) * 1000) / 10 : 0,
                 avgDurationMs,
+                p50DurationMs,
+                p95DurationMs,
+                analysisCount,
+                totalImages,
+                feedback,
                 modelCounts,
                 errorCounts,
+                daily,
+                stageStats,
               },
             });
             return;
@@ -3867,21 +4506,29 @@ function imageProxyPlugin(): PluginOption {
 
           if (path === "/requests" && req.method === "GET") {
             const url = new URL(req.url || "/", "http://localhost");
-            const query = (url.searchParams.get("q") || "").toLowerCase();
+            const query = (url.searchParams.get("q") || "").toLowerCase().trim();
             const status = url.searchParams.get("status") || "";
             const model = url.searchParams.get("model") || "";
-            const logs = store.requestLogs
-              .filter((log) => !status || log.status === status)
-              .filter((log) => !model || log.model === model)
-              .filter((log) => !query || `${log.requestId} ${log.clientId} ${log.prompt} ${log.model} ${log.resolution || ""} ${log.agentName || ""} ${log.agentScenario || ""} ${log.errorMessage || ""}`.toLowerCase().includes(query))
-              .slice(0, 300);
-            sendJson(res, 200, { ok: true, logs });
+            const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+            const limit = Math.min(1000, Math.max(1, Number.parseInt(url.searchParams.get("limit") || "50", 10) || 50));
+            const where: string[] = [];
+            const params: unknown[] = [];
+            if (status) { where.push("status = ?"); params.push(status); }
+            if (model) { where.push("model = ?"); params.push(model); }
+            if (query) { where.push("search LIKE ?"); params.push(`%${query}%`); }
+            const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+            const total = (getDb().prepare(`SELECT COUNT(*) AS n FROM request_logs ${whereSql}`).get(...params) as { n: number }).n;
+            const rows = getDb().prepare(
+              `SELECT data FROM request_logs ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+            ).all(...params, limit, offset) as Array<{ data: string }>;
+            const logs = rows.map((row) => { try { return JSON.parse(row.data); } catch { return null; } }).filter(Boolean);
+            sendJson(res, 200, { ok: true, logs, total, offset, limit });
             return;
           }
 
           if (path.startsWith("/requests/") && req.method === "GET") {
             const requestId = decodeURIComponent(path.replace("/requests/", ""));
-            const log = store.requestLogs.find((record) => record.requestId === requestId);
+            const log = readRequestLogRecord(requestId);
             if (!log) {
               sendJson(res, 404, { ok: false, error: "日志不存在" });
               return;
@@ -3893,10 +4540,13 @@ function imageProxyPlugin(): PluginOption {
           if (path === "/logs/export" && req.method === "GET") {
             const exportedAt = new Date().toISOString();
             const filename = `image-studio-logs-${exportedAt.replace(/[:.]/g, "-")}.json`;
+            const requestLogs = (getDb().prepare("SELECT data FROM request_logs ORDER BY created_at DESC").all() as Array<{ data: string }>)
+              .map((row) => { try { return JSON.parse(row.data); } catch { return null; } })
+              .filter(Boolean);
             const payload = {
               exportedAt,
               exportedBy: user?.username || oauthSession?.username || "unknown",
-              schemaVersion: 1,
+              schemaVersion: 2,
               admins: store.admins.map((admin) => ({
                 username: admin.username,
                 createdAt: admin.createdAt,
@@ -3904,9 +4554,9 @@ function imageProxyPlugin(): PluginOption {
                 mustChangePassword: admin.mustChangePassword,
               })),
               auditLogs: store.auditLogs,
-              requestLogs: store.requestLogs,
+              requestLogs,
               counts: {
-                requestLogs: store.requestLogs.length,
+                requestLogs: requestLogs.length,
                 auditLogs: store.auditLogs.length,
                 admins: store.admins.length,
               },
@@ -3916,7 +4566,143 @@ function imageProxyPlugin(): PluginOption {
             res.setHeader("Cache-Control", "no-store");
             res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
             res.end(JSON.stringify(payload, null, 2));
-            appendAuditLog(user?.username || oauthSession?.username || "oauth_admin", "admin_export_logs", `count=${store.requestLogs.length}`);
+            appendAuditLog(user?.username || oauthSession?.username || "oauth_admin", "admin_export_logs", `count=${requestLogs.length}`);
+            return;
+          }
+
+          const adminName = user?.username || oauthSession?.username || "oauth_admin";
+
+          if (path === "/config" && req.method === "GET") {
+            sendJson(res, 200, { ok: true, config: readConfigStore() });
+            return;
+          }
+
+          if (path === "/config/upstreams" && req.method === "PUT") {
+            const body = await readJsonBody(req);
+            const rawList = Array.isArray(body.upstreams) ? body.upstreams : [];
+            const upstreams: ConfigUpstream[] = rawList.map((raw, index) => {
+              const item = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+              const name = String(item.name || "").trim();
+              if (!name) throw new Error(`第 ${index + 1} 个站点名称不能为空`);
+              if (name.length > 50) throw new Error(`站点名称过长（${name}）`);
+              const baseUrl = validateUpstreamBaseUrl(String(item.baseUrl || ""));
+              return {
+                id: typeof item.id === "string" && item.id ? item.id : `site-${randomUUID().slice(0, 8)}`,
+                name,
+                baseUrl,
+                enabled: item.enabled !== false,
+                note: typeof item.note === "string" ? item.note.slice(0, 200) : "",
+                sort: typeof item.sort === "number" ? item.sort : index + 1,
+              };
+            });
+            if (upstreams.filter((item) => item.enabled).length === 0) {
+              throw new Error("至少需要保留一个启用的站点");
+            }
+            const configStore = readConfigStore();
+            configStore.upstreams = upstreams;
+            writeConfigStore(configStore);
+            appendAuditLog(adminName, "config_update_upstreams", `count=${upstreams.length}`);
+            sendJson(res, 200, { ok: true, config: readConfigStore() });
+            return;
+          }
+
+          if (path === "/config/models" && req.method === "PUT") {
+            const body = await readJsonBody(req);
+            const rawList = Array.isArray(body.models) ? body.models : [];
+            const seen = new Set<string>();
+            const models: ConfigModel[] = rawList.map((raw, index) => {
+              const item = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+              const id = String(item.id || "").trim();
+              if (!id) throw new Error(`第 ${index + 1} 个模型 ID 不能为空`);
+              if (seen.has(id.toLowerCase())) throw new Error(`模型 ID 重复：${id}`);
+              seen.add(id.toLowerCase());
+              const sizing = item.sizing === "official-1k" ? "official-1k" : "explicit-2k4k";
+              return {
+                id,
+                displayName: String(item.displayName || id).trim().slice(0, 80),
+                sizing,
+                enabled: item.enabled !== false,
+                sort: typeof item.sort === "number" ? item.sort : index + 1,
+                tags: Array.isArray(item.tags) ? item.tags.map((t) => String(t)).slice(0, 6) : [],
+              };
+            });
+            if (models.filter((item) => item.enabled).length === 0) {
+              throw new Error("至少需要保留一个启用的模型");
+            }
+            const configStore = readConfigStore();
+            configStore.models = models;
+            writeConfigStore(configStore);
+            appendAuditLog(adminName, "config_update_models", `count=${models.length}`);
+            sendJson(res, 200, { ok: true, config: readConfigStore() });
+            return;
+          }
+
+          if (path === "/config/presets" && req.method === "PUT") {
+            const body = await readJsonBody(req);
+            const presetsBody = body.presets && typeof body.presets === "object" ? body.presets as Record<string, unknown> : {};
+            const configStore = readConfigStore();
+            configStore.presets = {
+              promptStarters: Array.isArray(presetsBody.promptStarters) ? presetsBody.promptStarters : null,
+              stylePresets: Array.isArray(presetsBody.stylePresets) ? presetsBody.stylePresets : null,
+              industryAgents: Array.isArray(presetsBody.industryAgents) ? presetsBody.industryAgents : null,
+              negativePrompt: typeof presetsBody.negativePrompt === "string" ? presetsBody.negativePrompt : null,
+            };
+            writeConfigStore(configStore);
+            appendAuditLog(adminName, "config_update_presets", "presets updated");
+            sendJson(res, 200, { ok: true, config: readConfigStore() });
+            return;
+          }
+
+          if (path === "/config/system-prompts" && req.method === "PUT") {
+            const body = await readJsonBody(req);
+            const sp = body.systemPrompts && typeof body.systemPrompts === "object" ? body.systemPrompts as Record<string, unknown> : {};
+            const configStore = readConfigStore();
+            configStore.systemPrompts = {
+              agentAnalyze: typeof sp.agentAnalyze === "string" && sp.agentAnalyze.trim() ? sp.agentAnalyze : DEFAULT_AGENT_ANALYZE_SYSTEM_PROMPT,
+              promptAnalyze: typeof sp.promptAnalyze === "string" && sp.promptAnalyze.trim() ? sp.promptAnalyze : DEFAULT_PROMPT_ANALYZE_SYSTEM_PROMPT,
+            };
+            writeConfigStore(configStore);
+            appendAuditLog(adminName, "config_update_system_prompts", "system prompts updated");
+            sendJson(res, 200, { ok: true, config: readConfigStore() });
+            return;
+          }
+
+          if (path === "/config/quotas" && req.method === "PUT") {
+            const body = await readJsonBody(req);
+            const q = body.quotas && typeof body.quotas === "object" ? body.quotas as Record<string, unknown> : {};
+            const clamp = (value: unknown, min: number, max: number, fallback: number) => {
+              const num = Math.round(Number(value));
+              return Number.isFinite(num) ? Math.min(max, Math.max(min, num)) : fallback;
+            };
+            const configStore = readConfigStore();
+            configStore.quotas = {
+              squareShelfLimit: clamp(q.squareShelfLimit, 1, 50, configStore.quotas.squareShelfLimit),
+              squareDailyRecommend: clamp(q.squareDailyRecommend, 0, 1000, configStore.quotas.squareDailyRecommend),
+              squareDailyLike: clamp(q.squareDailyLike, 0, 1000, configStore.quotas.squareDailyLike),
+              squareMaxFeed: clamp(q.squareMaxFeed, 1, 100, configStore.quotas.squareMaxFeed),
+              generationDailyLimit: clamp(q.generationDailyLimit, 0, 100000, configStore.quotas.generationDailyLimit ?? 0),
+              userDiskLimitMB: clamp(q.userDiskLimitMB, 0, 1024 * 1024, configStore.quotas.userDiskLimitMB ?? 0),
+            };
+            writeConfigStore(configStore);
+            appendAuditLog(adminName, "config_update_quotas", "quotas updated");
+            sendJson(res, 200, { ok: true, config: readConfigStore() });
+            return;
+          }
+
+          if (path === "/config/reset" && req.method === "POST") {
+            const body = await readJsonBody(req);
+            const section = String(body.section || "");
+            const defaults = defaultConfigStore();
+            const configStore = readConfigStore();
+            if (section === "upstreams") configStore.upstreams = defaults.upstreams;
+            else if (section === "models") configStore.models = defaults.models;
+            else if (section === "presets") configStore.presets = defaults.presets;
+            else if (section === "systemPrompts") configStore.systemPrompts = defaults.systemPrompts;
+            else if (section === "quotas") configStore.quotas = defaults.quotas;
+            else throw new Error("未知的配置分组");
+            writeConfigStore(configStore);
+            appendAuditLog(adminName, "config_reset", section);
+            sendJson(res, 200, { ok: true, config: readConfigStore() });
             return;
           }
 
@@ -3926,7 +4712,7 @@ function imageProxyPlugin(): PluginOption {
         }
       });
 
-      server.middlewares.use("/api/models", async (req, res) => {
+      app.use("/api/models", async (req, res) => {
         if (req.method !== "POST") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
           return;
@@ -3960,7 +4746,7 @@ function imageProxyPlugin(): PluginOption {
         }
       });
 
-      server.middlewares.use("/api/prompt/analyze", async (req, res) => {
+      app.use("/api/prompt/analyze", async (req, res) => {
         if (req.method !== "POST") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
           return;
@@ -4102,7 +4888,7 @@ function imageProxyPlugin(): PluginOption {
         }
       });
 
-      server.middlewares.use("/api/agent/analyze", async (req, res) => {
+      app.use("/api/agent/analyze", async (req, res) => {
         if (req.method !== "POST") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
           return;
@@ -4275,7 +5061,7 @@ function imageProxyPlugin(): PluginOption {
         }
       });
 
-      server.middlewares.use("/api/images/generate", async (req, res) => {
+      app.use("/api/images/generate", async (req, res) => {
         if (req.method !== "POST") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
           return;
@@ -4295,6 +5081,9 @@ function imageProxyPlugin(): PluginOption {
             ? body.request as Record<string, unknown>
             : {};
           const clientId = getString(body, "clientId") || "anonymous";
+          // 图片按用户分目录存储：优先 OAuth 用户名，否则用 clientId
+          const generateOauthSession = getOAuthSession(req);
+          const imageUserDir = generateOauthSession?.username || clientId;
 
           const incomingRefs = Array.isArray(request.referenceImages) ? request.referenceImages : [];
           const referenceTotalBytes = incomingRefs.reduce((sum, image) => {
@@ -4373,11 +5162,46 @@ function imageProxyPlugin(): PluginOption {
             return;
           }
 
+          const allowedModels = enabledModelIds();
+          if (allowedModels.length > 0 && !allowedModels.includes(normalizedModelId(request.model))) {
+            failFast(400, "所选模型不在允许列表中");
+            return;
+          }
+
           if (!apiKey) {
             failFast(400, "API Key 不能为空");
             return;
           }
 
+          // 配额校验：每日生成次数（按 clientId、上海时区自然日）与每用户磁盘占用，0 = 不限
+          const quotaConfig = readConfigStore().quotas;
+          if ((quotaConfig.generationDailyLimit || 0) > 0) {
+            const dayStart = new Date(`${squareDayKey()}T00:00:00+08:00`).getTime();
+            const usedToday = (getDb().prepare(
+              "SELECT COUNT(*) AS n FROM request_logs WHERE request_type = 'image_generation' AND client_id = ? AND created_at >= ? AND request_id != ?",
+            ).get(truncateText(clientId, 120), dayStart, requestId) as { n: number }).n;
+            if (usedToday >= quotaConfig.generationDailyLimit) {
+              failFast(429, `今日生成次数已达上限（${quotaConfig.generationDailyLimit} 次），请明天再试或联系管理员调整配额`);
+              return;
+            }
+          }
+          if ((quotaConfig.userDiskLimitMB || 0) > 0) {
+            const userDirPath = join(LOCAL_IMAGE_DIR, sanitizeUserDir(imageUserDir));
+            let usedBytes = 0;
+            try {
+              if (existsSync(userDirPath)) {
+                for (const file of readdirSync(userDirPath)) {
+                  try { usedBytes += statSync(join(userDirPath, file)).size; } catch { /* 忽略单个文件 */ }
+                }
+              }
+            } catch { /* 目录不可读时不拦截 */ }
+            if (usedBytes >= quotaConfig.userDiskLimitMB * 1024 * 1024) {
+              failFast(429, `图片存储空间已达上限（${quotaConfig.userDiskLimitMB} MB），请联系管理员清理或调整配额`);
+              return;
+            }
+          }
+
+          const upstreamRequestedAt = Date.now();
           const result = protocol === "openai-responses"
             ? await generateOpenAiResponses(baseUrl, apiKey, request, requestId)
             : protocol === "gemini-native"
@@ -4388,53 +5212,83 @@ function imageProxyPlugin(): PluginOption {
                   ? await generateStability(baseUrl, apiKey, request, requestId)
                   : await generateOpenAiCompatible(baseUrl, apiKey, request, requestId, publicBaseUrl);
 
-          const finishedAt = Date.now();
+          const upstreamRespondedAt = Date.now();
+          const finishedAt = upstreamRespondedAt;
           const durationMs = finishedAt - startedAt;
           if (result.ok) {
+            const { saved, publicImages } = persistGeneratedImages(result.images ?? [], { userDir: imageUserDir, requestId });
+            const imageSavedAt = Date.now();
+            const responsePayload = {
+              ok: true,
+              status: result.status,
+              images: publicImages,
+              raw: sanitizeForLog(result.raw),
+              requestId,
+            };
+            const returnedAt = Date.now();
             updateRequestLog(requestId, {
               status: "success",
               httpStatus: result.status || 200,
-              responseBody: sanitizeForLog(result),
+              responseBody: sanitizeForLog(responsePayload),
               referenceUploadStatus: incomingRefs.length === 0 ? "none" : "succeeded",
-              finishedAt,
-              durationMs,
+              finishedAt: returnedAt,
+              durationMs: returnedAt - startedAt,
+              imageSaved: saved.length > 0,
+              savedImages: saved,
+              stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt, imageSavedAt, returnedAt },
             });
-          } else {
-            const summary = safeErrorSummary(result.detail);
-            updateRequestLog(requestId, {
-              status: "error",
-              httpStatus: result.status || 500,
-              errorMessage: summary.message,
-              errorType: summary.type,
-              errorCode: summary.code,
-              errorRaw: summary.raw,
-              responseBody: sanitizeForLog(result),
-              referenceUploadStatus: incomingRefs.length === 0 ? "none" : "failed",
-              finishedAt,
-              durationMs,
-            });
+            sendJson(res, 200, responsePayload);
+            return;
           }
 
-          sendJson(res, result.ok ? 200 : result.status || 500, { ...result, requestId });
+          const summary = safeErrorSummary(result.detail);
+          updateRequestLog(requestId, {
+            status: "error",
+            httpStatus: result.status || 500,
+            errorMessage: summary.message,
+            errorType: summary.type,
+            errorCode: summary.code,
+            errorRaw: summary.raw,
+            errorFull: summary.full,
+            responseBody: sanitizeForLog(result),
+            referenceUploadStatus: incomingRefs.length === 0 ? "none" : "failed",
+            finishedAt,
+            durationMs,
+            stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt },
+          });
+
+          sendJson(res, result.status || 500, { ...result, requestId });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          // undici 的 "terminated" 等错误真正原因在 cause 里，拼进摘要方便一眼看懂
+          const causeError = (error as { cause?: unknown })?.cause;
+          const causeMessage = causeError instanceof Error ? causeError.message : "";
+          const summaryMessage = causeMessage && causeMessage !== message ? `${message}（${causeMessage}）` : message;
           if (logCreated) {
             const finishedAt = Date.now();
             updateRequestLog(requestId, {
               status: "error",
               httpStatus: 500,
-              errorMessage: truncateText(message, 800),
+              errorMessage: truncateText(summaryMessage, 800),
               errorType: "proxy_error",
-              errorRaw: redactImageText(message, 2500),
-              responseBody: sanitizeForLog({ ok: false, detail: { error: message } }),
+              errorRaw: redactImageText(summaryMessage, 2500),
+              errorFull: redactImageText(describeError(error), 60000),
+              responseBody: sanitizeForLog({ ok: false, detail: { error: summaryMessage } }),
               referenceUploadStatus: "failed",
               finishedAt,
               durationMs: finishedAt - startedAt,
             });
           }
-          sendJson(res, isAllowedApiBaseUrlError(error) ? 400 : 500, { ok: false, requestId, detail: { error: message } });
+          sendJson(res, isAllowedApiBaseUrlError(error) ? 400 : 500, { ok: false, requestId, detail: { error: summaryMessage } });
         }
       });
+}
+
+function imageProxyPlugin(): PluginOption {
+  return {
+    name: "image-api-proxy",
+    configureServer(server: ViteDevServer) {
+      registerApiRoutes(server.middlewares as unknown as ApiApp);
     },
   };
 }

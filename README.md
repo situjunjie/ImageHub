@@ -6,7 +6,7 @@
 ![IndexedDB](https://img.shields.io/badge/%E6%95%B0%E6%8D%AE%E5%AD%98%E5%82%A8-%E6%9C%AC%E5%9C%B0%E4%BC%98%E5%85%88-10A37F)
 ![Zero Canvas Deps](https://img.shields.io/badge/%E6%97%A0%E9%99%90%E7%94%BB%E5%B8%83-%E9%9B%B6%E5%A4%96%E9%83%A8%E4%BE%9D%E8%B5%96-8B5CF6)
 
-> 从一句提示词，到一组可复用的视觉资产。把批量生成、无限画布、智能分析、社区广场和本地图库，放进一个安静、清晰、反应迅速的创作空间。生成的每一张图都属于你——图片数据 100% 留在浏览器 IndexedDB，服务端只做代理转发，不落盘任何图片内容。
+> 从一句提示词，到一组可复用的视觉资产。把批量生成、无限画布、智能分析、社区广场和本地图库，放进一个安静、清晰、反应迅速的创作空间。生成的每一张图都属于你——浏览器 IndexedDB 保有完整本地副本，服务端同步落盘一份供管理后台回看，绝不经过任何第三方存储。
 
 ![Image Studio desktop workspace](docs/screenshots/studio-desktop.png)
 
@@ -156,18 +156,19 @@ flowchart LR
 
 ## 数据与隐私策略
 
-Image Studio 采用 **local-first** 设计，隐私保护是产品底线：
+Image Studio 采用 **local-first** 设计，浏览器端始终保有完整数据副本：
 
 | 数据类型 | 存储位置 | 说明 |
 |---------|---------|------|
-| 生成图片 Blob | 浏览器 IndexedDB | 不上传服务端 |
-| 画布节点图片 | 浏览器 IndexedDB | 不上传服务端 |
+| 生成图片 Blob | 浏览器 IndexedDB | 本地图库与历史回溯 |
+| 生成图片文件 | 服务端 `.data/images/` | 生成成功后落盘，前端通过 `/api/images/local/:id` 读取，管理后台可回看 |
+| 画布节点图片 | 浏览器 IndexedDB | 画布状态本地持久化 |
 | 提示词·参数·历史 | 浏览器 IndexedDB | 本地回溯 |
 | API Key | 浏览器 Storage | 服务端仅记录长度和 4 字符前缀 |
 | 广场缩略图 | 服务端 JSON | 用户主动推荐才上传，最长边 1024px |
-| 请求元数据 | 服务端 JSON | 仅记录 model / status / duration / error 类型 |
+| 请求元数据 | 服务端 JSON | 记录 model / status / duration / error 类型及已保存图片的文件引用（最多 5000 条，超出连同图片文件一起清理） |
 
-**绝不记录：** API Key 原文、图片 URL、图片 base64、参考图内容。
+**绝不记录：** API Key 原文、参考图内容（参考图仅内存中转，10 分钟 TTL 后销毁）。
 
 ## API 端点
 

@@ -21,7 +21,9 @@ import {
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
+  Plus,
   RefreshCw,
+  Save,
   Search,
   Send,
   Settings2,
@@ -29,6 +31,8 @@ import {
   Star,
   Square,
   CheckSquare,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
   UploadCloud,
   User,
@@ -227,7 +231,7 @@ type GenerateProxyResponse = {
   ok: boolean;
   requestId?: string;
   status?: number;
-  images?: Array<{ dataUrl: string; revisedPrompt?: string }>;
+  images?: Array<{ dataUrl?: string; url?: string; revisedPrompt?: string }>;
   detail?: unknown;
   raw?: unknown;
 };
@@ -599,11 +603,39 @@ type AdminRequestLog = {
   errorType?: string;
   errorCode?: string;
   errorRaw?: string;
+  errorFull?: string;
   createdAt: number;
   startedAt?: number;
   finishedAt?: number;
   durationMs?: number;
-  imageSaved: false;
+  imageSaved?: boolean;
+  savedImages?: Array<{ id: string; mime: string; bytes: number }>;
+  stages?: {
+    receivedAt?: number;
+    upstreamRequestedAt?: number;
+    upstreamRespondedAt?: number;
+    imageSavedAt?: number;
+    returnedAt?: number;
+  };
+};
+
+type AdminDailyStat = {
+  date: string;
+  total: number;
+  success: number;
+  error: number;
+  images: number;
+  successRate: number;
+  avgDurationMs: number;
+};
+
+type AdminStageStats = {
+  received: number;
+  referenceForwarded: number;
+  referenceTotal: number;
+  upstreamResponded: number;
+  upstreamSuccess: number;
+  imageSaved: number;
 };
 
 type AdminStats = {
@@ -613,8 +645,24 @@ type AdminStats = {
   running: number;
   successRate: number;
   avgDurationMs: number;
+  p50DurationMs?: number;
+  p95DurationMs?: number;
+  analysisCount?: number;
+  totalImages?: number;
+  feedback?: { up: number; down: number };
   modelCounts: Record<string, number>;
   errorCounts: Record<string, number>;
+  daily?: AdminDailyStat[];
+  stageStats?: AdminStageStats;
+};
+
+type ModelStat = {
+  id: string;
+  samples: number;
+  successRate: number;
+  p50DurationMs: number;
+  up: number;
+  down: number;
 };
 
 // ── Canvas Mode Types ──
@@ -1342,6 +1390,84 @@ const INDUSTRY_AGENTS: IndustryAgent[] = [
   },
 ];
 
+type EndpointOption = { value: string; label: string; description: string };
+type RuntimeModelConfig = { id: string; displayName: string; sizing: "explicit-2k4k" | "official-1k"; tags: string[] };
+
+let runtimeEndpoints: EndpointOption[] = [...ALLOWED_API_ENDPOINTS];
+let runtimeModelConfig: RuntimeModelConfig[] = [];
+let runtimePromptStarters = PROMPT_STARTERS;
+let runtimeStylePresets = STYLE_ENHANCEMENT_PRESETS;
+let runtimeIndustryAgents = INDUSTRY_AGENTS;
+let runtimeCommonNegativePrompt = COMMON_AGENT_NEGATIVE_PROMPT;
+
+function normalizeEndpointValue(url: string) {
+  const trimmed = String(url || "").trim();
+  return trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
+}
+
+function runtimeModelIds(): Set<string> {
+  return new Set(runtimeModelConfig.map((m) => m.id.replace(/^models\//, "").trim().toLowerCase()));
+}
+
+function runtimeModelDisplayName(model: string): string {
+  const norm = model.replace(/^models\//, "").trim().toLowerCase();
+  return runtimeModelConfig.find((m) => m.id.replace(/^models\//, "").trim().toLowerCase() === norm)?.displayName || model;
+}
+
+type AppConfigPayload = {
+  upstreams?: Array<{ id: string; name: string; baseUrl: string; note?: string }>;
+  models?: RuntimeModelConfig[];
+  presets?: {
+    promptStarters?: unknown[] | null;
+    stylePresets?: unknown[] | null;
+    industryAgents?: unknown[] | null;
+    negativePrompt?: string | null;
+  };
+};
+
+function applyAppConfig(config: AppConfigPayload | null | undefined) {
+  if (!config) return;
+  if (Array.isArray(config.upstreams) && config.upstreams.length > 0) {
+    const mapped = config.upstreams.map((u) => ({
+      value: normalizeEndpointValue(u.baseUrl),
+      label: u.name,
+      description: u.note || "",
+    }));
+    const oauthExtras = runtimeEndpoints.filter(
+      (ep) => ep.label.includes("OAuth") && !mapped.some((m) => m.value === ep.value),
+    );
+    runtimeEndpoints = [...mapped, ...oauthExtras];
+  }
+  runtimeModelConfig = Array.isArray(config.models) ? config.models : [];
+  const presets = config.presets || {};
+  runtimePromptStarters = Array.isArray(presets.promptStarters) && presets.promptStarters.length > 0
+    ? presets.promptStarters as typeof PROMPT_STARTERS
+    : PROMPT_STARTERS;
+  runtimeStylePresets = Array.isArray(presets.stylePresets) && presets.stylePresets.length > 0
+    ? presets.stylePresets as StyleEnhancement[]
+    : STYLE_ENHANCEMENT_PRESETS;
+  runtimeIndustryAgents = Array.isArray(presets.industryAgents) && presets.industryAgents.length > 0
+    ? presets.industryAgents as IndustryAgent[]
+    : INDUSTRY_AGENTS;
+  runtimeCommonNegativePrompt = typeof presets.negativePrompt === "string" && presets.negativePrompt.trim()
+    ? presets.negativePrompt
+    : COMMON_AGENT_NEGATIVE_PROMPT;
+}
+
+let appConfigPromise: Promise<void> | null = null;
+function fetchAppConfig(force = false): Promise<void> {
+  if (appConfigPromise && !force) return appConfigPromise;
+  appConfigPromise = fetch("/api/config")
+    .then((res) => (res.ok ? res.json() : null))
+    .then((payload) => {
+      if (payload && payload.ok) applyAppConfig(payload);
+    })
+    .catch(() => {
+      // 拉取失败时保留内置默认值
+    });
+  return appConfigPromise;
+}
+
 function createAgentDefaults(agent: IndustryAgent) {
   return agent.fields.reduce<Record<string, string>>((values, field) => {
     values[field.id] = agent.defaultValues[field.id] || field.defaultValue || "";
@@ -1505,6 +1631,19 @@ function formatFileDate(value = Date.now()) {
 function formatBytes(value: number) {
   if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// 错误分类可能是上游直接吐回来的 HTML（如 nginx 404 页），做成可读短标签再展示
+function formatErrorKeyLabel(value: string) {
+  const raw = String(value || "").trim();
+  if (!raw) return "未知错误";
+  if (/<html|<head|<body/i.test(raw)) {
+    const title = raw.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim();
+    const server = raw.match(/<center>([a-z0-9_.-]+)<\/center>\s*<\/body>/i)?.[1]?.trim();
+    const label = title || raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
+    return server ? `${label}（${server}）` : label;
+  }
+  return raw.length > 60 ? `${raw.slice(0, 60)}…` : raw;
 }
 
 function formatCompactDuration(ms = 0) {
@@ -1702,8 +1841,8 @@ function isImageProtocol(value: string | null): value is ImageProtocol {
 
 function normalizeApiBaseUrl(value: string | null | undefined) {
   const normalized = String(value || "").trim().replace(/\/+$/, "");
-  const matched = ALLOWED_API_ENDPOINTS.find((endpoint) => endpoint.value.replace(/\/+$/, "") === normalized);
-  return matched?.value || DEFAULT_API_URL;
+  const matched = runtimeEndpoints.find((endpoint) => endpoint.value.replace(/\/+$/, "") === normalized);
+  return matched?.value || runtimeEndpoints[0]?.value || DEFAULT_API_URL;
 }
 
 function getAspectDefinition(value: string) {
@@ -2475,6 +2614,20 @@ async function dataUrlToBlob(dataUrl: string) {
   return response.blob();
 }
 
+async function generatedImageToBlob(image: { url?: string; dataUrl?: string }): Promise<Blob> {
+  if (image.url) {
+    const response = await fetch(image.url);
+    if (!response.ok) {
+      throw new Error(`读取服务器图片失败（HTTP ${response.status}）`);
+    }
+    return response.blob();
+  }
+  if (image.dataUrl) {
+    return dataUrlToBlob(image.dataUrl);
+  }
+  throw new Error("响应中没有图片数据");
+}
+
 function getImageSize(url: string): Promise<{ width: number; height: number }> {
   return new Promise((resolve, reject) => {
     const image = new Image();
@@ -2827,11 +2980,19 @@ function loadInitialParams(): ImageParams {
 }
 
 function isAllowedImageModel(model: string) {
+  const configured = runtimeModelIds();
+  if (configured.size > 0) {
+    return configured.has(model.replace(/^models\//, "").trim().toLowerCase());
+  }
   return isGptImage2Model(model) || isGemini3ProImageModel(model);
 }
 
 function imageModelPriority(model: string) {
   const normalized = normalizedImageModelId(model);
+  if (runtimeModelConfig.length > 0) {
+    const index = runtimeModelConfig.findIndex((m) => m.id.replace(/^models\//, "").trim().toLowerCase() === normalized);
+    return index >= 0 ? index : 100;
+  }
   if (normalized === GPT_IMAGE_2_MODEL) return 0;
   if (normalized === GPT_IMAGE_2_PRO_MODEL) return 1;
   if (normalized === GPT_IMAGE_2_FAMILY_MODEL) return 2;
@@ -2937,7 +3098,7 @@ function recommendAspectRatioForPrompt(promptText: string, currentAspectRatio: s
 
 function pickStyleEnhancements(promptText: string, mode: AnalysisMode) {
   const text = promptText.toLowerCase();
-  const matched = STYLE_ENHANCEMENT_PRESETS.filter((preset) => {
+  const matched = runtimeStylePresets.filter((preset) => {
     if (/电影|海报|故事|场景|氛围/.test(text) && preset.name === "电影感") return true;
     if (/商品|产品|人像|写真|摄影|头像/.test(text) && preset.name === "商业摄影") return true;
     if (/小红书|封面|公众号|社媒|标题/.test(text) && preset.name === "社媒封面") return true;
@@ -3340,6 +3501,9 @@ export default function App() {
   const [params, setParams] = useState<ImageParams>(loadInitialParams);
   const [prompt, setPrompt] = useState("");
   const [activePage, setActivePage] = useState<AppPage>(pageFromHash);
+  const [configVersion, setConfigVersion] = useState(0);
+  const [modelStats, setModelStats] = useState<Record<string, ModelStat>>({});
+  const [feedbackMap, setFeedbackMap] = useState<Record<string, 1 | -1>>({});
   const [referenceImages, setReferenceImages] = useState<UploadedReference[]>([]);
   const [models, setModels] = useState<string[]>([]);
   const [analysisModels, setAnalysisModels] = useState<string[]>([]);
@@ -3477,8 +3641,15 @@ export default function App() {
   const composerConfigDetail = `${resolvedRequestSize} · ${params.quality} · ${params.outputFormat.toUpperCase()} · 并发 ${params.concurrency}`;
 
   const selectableImageModels = useMemo(
-    () => filterAllowedImageModels([...models, ...PRIMARY_IMAGE_MODELS]),
-    [models],
+    () => {
+      // 配置已加载时，只显示后台模型白名单里启用的模型（精确、按配置排序）
+      if (runtimeModelConfig.length > 0) {
+        return runtimeModelConfig.map((m) => m.id);
+      }
+      return filterAllowedImageModels([...models, ...PRIMARY_IMAGE_MODELS]);
+    },
+    // configVersion 参与依赖：配置拉取完成后重新计算，剔除非白名单模型
+    [models, configVersion],
   );
   const filteredModels = useMemo(() => {
     const query = modelFilter.trim().toLowerCase();
@@ -3525,7 +3696,7 @@ export default function App() {
   const failedVisibleRecordCount = visibleStats.error;
   const isPromptAnalyzing = analysisState.status === "analyzing" || analysisState.status === "receiving";
   const selectedAgent = useMemo(
-    () => INDUSTRY_AGENTS.find((agent) => agent.id === selectedAgentId) || null,
+    () => runtimeIndustryAgents.find((agent) => agent.id === selectedAgentId) || null,
     [selectedAgentId],
   );
   const isAgentEnabled = Boolean(selectedAgent);
@@ -3557,6 +3728,48 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    void fetchAppConfig().then(() => {
+      setConfigVersion((current) => current + 1);
+      setApiConfig((current) => ({ ...current, baseUrl: normalizeApiBaseUrl(current.baseUrl) }));
+    });
+    // 拉取近 7 日各模型真实表现，用于模型选择时展示成功率与 P50
+    void fetch("/api/model-stats")
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload) => {
+        if (payload && payload.ok && Array.isArray(payload.models)) {
+          const map: Record<string, ModelStat> = {};
+          for (const item of payload.models as ModelStat[]) {
+            map[normalizedModelId(item.id)] = item;
+          }
+          setModelStats(map);
+        }
+      })
+      .catch(() => {
+        // 统计拉取失败不影响使用
+      });
+  }, []);
+
+  async function sendImageFeedback(requestId: string | undefined, rating: 1 | -1) {
+    if (!requestId) return;
+    const next = feedbackMap[requestId] === rating ? 0 : rating;
+    setFeedbackMap((current) => {
+      const copy = { ...current };
+      if (next === 0) delete copy[requestId];
+      else copy[requestId] = next as 1 | -1;
+      return copy;
+    });
+    try {
+      await fetch("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requestId, rating: next, clientId: getClientId() }),
+      });
+    } catch {
+      // 反馈失败静默忽略
+    }
+  }
+
+  useEffect(() => {
     const onHashChange = () => {
       setActivePage(pageFromHash());
     };
@@ -3582,8 +3795,8 @@ export default function App() {
         setOauthEnabled(true);
         if (cfg.providerUrl) {
           const normalized = cfg.providerUrl.replace(/\/+$/, "");
-          if (!ALLOWED_API_ENDPOINTS.some((ep) => ep.value.replace(/\/+$/, "") === normalized)) {
-            ALLOWED_API_ENDPOINTS.push({ value: normalized, label: "太极 AI (OAuth)", description: "OAuth 登录服务地址" });
+          if (!runtimeEndpoints.some((ep) => ep.value.replace(/\/+$/, "") === normalized)) {
+            runtimeEndpoints.push({ value: normalized, label: "太极 AI (OAuth)", description: "OAuth 登录服务地址" });
           }
         }
 
@@ -4626,14 +4839,13 @@ export default function App() {
         }),
       });
       const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !payload.images?.[0]?.dataUrl) {
+      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
         throw payload.detail && typeof payload.detail === "object"
           ? { ...payload.detail as Record<string, unknown>, requestId: payload.requestId }
           : { error: payload.detail || payload, requestId: payload.requestId };
       }
 
-      const dataUrl = payload.images[0].dataUrl;
-      const blob = await dataUrlToBlob(dataUrl);
+      const blob = await generatedImageToBlob(payload.images[0]);
       const objectUrl = URL.createObjectURL(blob);
       const { width, height } = await getImageSize(objectUrl);
       const finishedAt = Date.now();
@@ -6741,6 +6953,8 @@ export default function App() {
                       onRecommend={() => void recommendToSquare(job)}
                       recommendState={squareRecommendState[job.id]}
                       canRecommend={canUseSquareIdentity}
+                      feedback={job.requestId ? feedbackMap[job.requestId] : undefined}
+                      onFeedback={(rating) => void sendImageFeedback(job.requestId, rating)}
                     />
                   ))}
                 </div>
@@ -6862,7 +7076,7 @@ export default function App() {
               )}
               {isAgentQuickbarExpanded && (
                 <div className="agent-chip-row" aria-label="行业 Agent 快捷入口">
-                  {INDUSTRY_AGENTS.slice(0, 8).map((agent) => (
+                  {runtimeIndustryAgents.slice(0, 8).map((agent) => (
                     <button
                       type="button"
                       key={agent.id}
@@ -6907,7 +7121,7 @@ export default function App() {
                 </div>
                 <div className="agent-layout">
                   <div className="agent-list" aria-label="行业 Agent 列表">
-                    {INDUSTRY_AGENTS.map((agent) => (
+                    {runtimeIndustryAgents.map((agent) => (
                       <button
                         type="button"
                         key={agent.id}
@@ -7084,7 +7298,7 @@ export default function App() {
                 </button>
               </div>
               <div className="prompt-presets-grid">
-                {PROMPT_STARTERS.map((starter) => (
+                {runtimePromptStarters.map((starter) => (
                   <button
                     type="button"
                     className="prompt-preset-card"
@@ -7510,15 +7724,15 @@ export default function App() {
               value={apiConfig.baseUrl}
               onChange={(event) => setApiConfig((current) => ({ ...current, baseUrl: normalizeApiBaseUrl(event.target.value) }))}
             >
-              {ALLOWED_API_ENDPOINTS.map((endpoint) => (
+              {runtimeEndpoints.map((endpoint) => (
                 <option key={endpoint.value} value={endpoint.value}>
-                  {endpoint.label} · {endpoint.value}
+                  {endpoint.label}
                 </option>
               ))}
             </select>
           </label>
           <div className="endpoint-note">
-            {ALLOWED_API_ENDPOINTS.find((endpoint) => endpoint.value === apiConfig.baseUrl)?.description || "固定服务地址"}
+            {runtimeEndpoints.find((endpoint) => endpoint.value === apiConfig.baseUrl)?.description || "固定服务地址"}
           </div>
           <label>
             <span>API Key</span>
@@ -7618,7 +7832,14 @@ export default function App() {
                   onClick={() => selectImageModel(model)}
                 >
                   <span>{model}</span>
-                  <small>{imageModelLaneLabel(model)}</small>
+                  <small>
+                    {imageModelLaneLabel(model)}
+                    {(() => {
+                      const stat = modelStats[normalizedModelId(model)];
+                      if (!stat || stat.samples < 3) return null;
+                      return ` · 近7日成功率 ${stat.successRate}% · P50 ${formatCompactDuration(stat.p50DurationMs)}`;
+                    })()}
+                  </small>
                 </button>
               ))
             )}
@@ -7813,6 +8034,332 @@ export default function App() {
   );
 }
 
+type AdminConfigUpstream = { id: string; name: string; baseUrl: string; enabled: boolean; note?: string; sort: number };
+type AdminConfigModel = { id: string; displayName: string; sizing: "explicit-2k4k" | "official-1k"; enabled: boolean; sort: number; tags?: string[] };
+type AdminConfigData = {
+  version: number;
+  updatedAt: string;
+  upstreams: AdminConfigUpstream[];
+  models: AdminConfigModel[];
+  presets: {
+    promptStarters: unknown[] | null;
+    stylePresets: unknown[] | null;
+    industryAgents: unknown[] | null;
+    negativePrompt: string | null;
+  };
+  systemPrompts: { agentAnalyze: string; promptAnalyze: string };
+  quotas: { squareShelfLimit: number; squareDailyRecommend: number; squareDailyLike: number; squareMaxFeed: number; generationDailyLimit?: number; userDiskLimitMB?: number };
+};
+
+type ConfigSection = "sites" | "presets" | "system";
+
+function AdminConfigCenter() {
+  const [config, setConfig] = useState<AdminConfigData | null>(null);
+  const [section, setSection] = useState<ConfigSection>("sites");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [saving, setSaving] = useState("");
+
+  const [upstreams, setUpstreams] = useState<AdminConfigUpstream[]>([]);
+  const [models, setModels] = useState<AdminConfigModel[]>([]);
+  const [promptStarters, setPromptStarters] = useState<Array<{ label: string; tag: string; prompt: string }>>([]);
+  const [stylePresets, setStylePresets] = useState<StyleEnhancement[]>([]);
+  const [negativePrompt, setNegativePrompt] = useState("");
+  const [industryAgents, setIndustryAgents] = useState<IndustryAgent[]>([]);
+  const [openAgentId, setOpenAgentId] = useState("");
+  const [agentAnalyze, setAgentAnalyze] = useState("");
+  const [promptAnalyze, setPromptAnalyze] = useState("");
+  const [quotas, setQuotas] = useState({ squareShelfLimit: 4, squareDailyRecommend: 10, squareDailyLike: 10, squareMaxFeed: 20, generationDailyLimit: 0, userDiskLimitMB: 0 });
+
+  function hydrate(data: AdminConfigData) {
+    setConfig(data);
+    setUpstreams(data.upstreams.map((u) => ({ ...u })));
+    setModels(data.models.map((m) => ({ ...m, tags: m.tags || [] })));
+    setPromptStarters((Array.isArray(data.presets.promptStarters) ? data.presets.promptStarters : PROMPT_STARTERS) as Array<{ label: string; tag: string; prompt: string }>);
+    setStylePresets((Array.isArray(data.presets.stylePresets) ? data.presets.stylePresets : STYLE_ENHANCEMENT_PRESETS) as StyleEnhancement[]);
+    setNegativePrompt(typeof data.presets.negativePrompt === "string" ? data.presets.negativePrompt : COMMON_AGENT_NEGATIVE_PROMPT);
+    setIndustryAgents((Array.isArray(data.presets.industryAgents) ? data.presets.industryAgents : INDUSTRY_AGENTS) as IndustryAgent[]);
+    setAgentAnalyze(data.systemPrompts.agentAnalyze);
+    setPromptAnalyze(data.systemPrompts.promptAnalyze);
+    setQuotas({ generationDailyLimit: 0, userDiskLimitMB: 0, ...data.quotas });
+  }
+
+  async function loadConfig() {
+    setError("");
+    try {
+      const response = await fetch("/api/admin/config", { credentials: "same-origin" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw payload;
+      hydrate(payload.config as AdminConfigData);
+    } catch (err) {
+      setError(formatError(err));
+    }
+  }
+
+  useEffect(() => {
+    void loadConfig();
+  }, []);
+
+  async function saveSection(path: string, body: unknown, label: string) {
+    setError("");
+    setNotice("");
+    setSaving(label);
+    try {
+      const response = await fetch(`/api/admin/config/${path}`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw payload;
+      hydrate(payload.config as AdminConfigData);
+      void fetchAppConfig(true);
+      setNotice(`${label}已保存，配置版本 v${payload.config.version}`);
+    } catch (err) {
+      setError(formatError(err));
+    } finally {
+      setSaving("");
+    }
+  }
+
+  async function resetSection(sectionKey: string, label: string) {
+    if (!window.confirm(`确定要把「${label}」恢复为内置默认值吗？当前修改将被覆盖。`)) return;
+    setError("");
+    setNotice("");
+    try {
+      const response = await fetch("/api/admin/config/reset", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ section: sectionKey }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw payload;
+      hydrate(payload.config as AdminConfigData);
+      void fetchAppConfig(true);
+      setNotice(`${label}已恢复默认`);
+    } catch (err) {
+      setError(formatError(err));
+    }
+  }
+
+  if (!config) {
+    return (
+      <section className="admin-panel">
+        <div className="admin-checking"><Loader2 className="spin" size={20} /><span>正在读取配置...</span></div>
+        {error && <div className="admin-error">{error}</div>}
+      </section>
+    );
+  }
+
+  return (
+    <section className="admin-config">
+      <div className="admin-config-subnav">
+        <button type="button" className={section === "sites" ? "active" : ""} onClick={() => setSection("sites")}>站点与模型</button>
+        <button type="button" className={section === "presets" ? "active" : ""} onClick={() => setSection("presets")}>提示词与场景</button>
+        <button type="button" className={section === "system" ? "active" : ""} onClick={() => setSection("system")}>系统设置</button>
+        <span className="admin-config-version">配置版本 v{config.version}</span>
+      </div>
+      {error && <div className="admin-error">{error}</div>}
+      {notice && <div className="admin-notice">{notice}</div>}
+
+      {section === "sites" && (
+        <div className="admin-config-body">
+          <div className="admin-config-block">
+            <div className="admin-config-block-head">
+              <strong>上游站点</strong>
+              <div className="admin-panel-actions">
+                <button type="button" className="subtle-button" onClick={() => void resetSection("upstreams", "上游站点")}><RefreshCw size={14} /> 恢复默认</button>
+                <button type="button" className="subtle-button" onClick={() => setUpstreams((cur) => [...cur, { id: "", name: "", baseUrl: "https://", enabled: true, note: "", sort: cur.length + 1 }])}><Plus size={14} /> 添加站点</button>
+              </div>
+            </div>
+            <div className="admin-config-rows">
+              {upstreams.map((item, index) => (
+                <div className="admin-config-row" key={index}>
+                  <input placeholder="站点名称" value={item.name} onChange={(e) => setUpstreams((cur) => cur.map((u, i) => i === index ? { ...u, name: e.target.value } : u))} />
+                  <input className="mono" placeholder="https://example.com/ 或 http://IP[:端口]" value={item.baseUrl} onChange={(e) => setUpstreams((cur) => cur.map((u, i) => i === index ? { ...u, baseUrl: e.target.value } : u))} />
+                  <input placeholder="备注" value={item.note || ""} onChange={(e) => setUpstreams((cur) => cur.map((u, i) => i === index ? { ...u, note: e.target.value } : u))} />
+                  <label className="admin-config-toggle"><input type="checkbox" checked={item.enabled} onChange={(e) => setUpstreams((cur) => cur.map((u, i) => i === index ? { ...u, enabled: e.target.checked } : u))} /> 启用</label>
+                  <button type="button" className="admin-icon-button" title="删除" onClick={() => setUpstreams((cur) => cur.filter((_, i) => i !== index))}><Trash2 size={15} /></button>
+                </div>
+              ))}
+            </div>
+            <button type="button" className="primary-button admin-config-save" disabled={saving === "上游站点"} onClick={() => void saveSection("upstreams", { upstreams }, "上游站点")}>
+              {saving === "上游站点" ? <Loader2 size={15} className="spin" /> : <Save size={15} />} 保存站点
+            </button>
+          </div>
+
+          <div className="admin-config-block">
+            <div className="admin-config-block-head">
+              <strong>模型白名单</strong>
+              <div className="admin-panel-actions">
+                <button type="button" className="subtle-button" onClick={() => void resetSection("models", "模型白名单")}><RefreshCw size={14} /> 恢复默认</button>
+                <button type="button" className="subtle-button" onClick={() => setModels((cur) => [...cur, { id: "", displayName: "", sizing: "official-1k", enabled: true, sort: cur.length + 1, tags: [] }])}><Plus size={14} /> 添加模型</button>
+              </div>
+            </div>
+            <div className="admin-config-rows">
+              {models.map((item, index) => (
+                <div className="admin-config-row admin-config-row-model" key={index}>
+                  <input className="mono" placeholder="模型 ID（精确）" value={item.id} onChange={(e) => setModels((cur) => cur.map((m, i) => i === index ? { ...m, id: e.target.value } : m))} />
+                  <input placeholder="展示名" value={item.displayName} onChange={(e) => setModels((cur) => cur.map((m, i) => i === index ? { ...m, displayName: e.target.value } : m))} />
+                  <select value={item.sizing} onChange={(e) => setModels((cur) => cur.map((m, i) => i === index ? { ...m, sizing: e.target.value as AdminConfigModel["sizing"] } : m))}>
+                    <option value="explicit-2k4k">2K / 4K 显式尺寸</option>
+                    <option value="official-1k">官方 1K</option>
+                  </select>
+                  <label className="admin-config-toggle"><input type="checkbox" checked={item.enabled} onChange={(e) => setModels((cur) => cur.map((m, i) => i === index ? { ...m, enabled: e.target.checked } : m))} /> 启用</label>
+                  <button type="button" className="admin-icon-button" title="删除" onClick={() => setModels((cur) => cur.filter((_, i) => i !== index))}><Trash2 size={15} /></button>
+                </div>
+              ))}
+            </div>
+            <p className="admin-muted admin-config-hint"><ShieldCheck size={13} /> 模型为精确匹配名单；站点地址支持 http/https 与 IP，但内网、回环及云元数据地址（127.x / 192.168.x / 169.254.x 等）会被拒绝。所有变更写入审计日志并递增版本号。</p>
+            <button type="button" className="primary-button admin-config-save" disabled={saving === "模型白名单"} onClick={() => void saveSection("models", { models }, "模型白名单")}>
+              {saving === "模型白名单" ? <Loader2 size={15} className="spin" /> : <Save size={15} />} 保存模型
+            </button>
+          </div>
+        </div>
+      )}
+
+      {section === "presets" && (
+        <div className="admin-config-body">
+          <div className="admin-config-block">
+            <div className="admin-config-block-head"><strong>示例提示词</strong>
+              <button type="button" className="subtle-button" onClick={() => setPromptStarters((cur) => [...cur, { label: "", tag: "", prompt: "" }])}><Plus size={14} /> 添加</button>
+            </div>
+            <div className="admin-config-rows">
+              {promptStarters.map((item, index) => (
+                <div className="admin-config-preset-row" key={index}>
+                  <div className="admin-config-preset-head">
+                    <input placeholder="标题" value={item.label} onChange={(e) => setPromptStarters((cur) => cur.map((p, i) => i === index ? { ...p, label: e.target.value } : p))} />
+                    <input placeholder="标签" value={item.tag} onChange={(e) => setPromptStarters((cur) => cur.map((p, i) => i === index ? { ...p, tag: e.target.value } : p))} />
+                    <button type="button" className="admin-icon-button" title="删除" onClick={() => setPromptStarters((cur) => cur.filter((_, i) => i !== index))}><Trash2 size={15} /></button>
+                  </div>
+                  <textarea placeholder="提示词内容" value={item.prompt} onChange={(e) => setPromptStarters((cur) => cur.map((p, i) => i === index ? { ...p, prompt: e.target.value } : p))} />
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="admin-config-block">
+            <div className="admin-config-block-head"><strong>风格增强预设</strong>
+              <button type="button" className="subtle-button" onClick={() => setStylePresets((cur) => [...cur, { name: "", description: "", promptFragment: "" }])}><Plus size={14} /> 添加</button>
+            </div>
+            <div className="admin-config-rows">
+              {stylePresets.map((item, index) => (
+                <div className="admin-config-preset-row" key={index}>
+                  <div className="admin-config-preset-head">
+                    <input placeholder="名称" value={item.name} onChange={(e) => setStylePresets((cur) => cur.map((p, i) => i === index ? { ...p, name: e.target.value } : p))} />
+                    <input placeholder="描述" value={item.description} onChange={(e) => setStylePresets((cur) => cur.map((p, i) => i === index ? { ...p, description: e.target.value } : p))} />
+                    <button type="button" className="admin-icon-button" title="删除" onClick={() => setStylePresets((cur) => cur.filter((_, i) => i !== index))}><Trash2 size={15} /></button>
+                  </div>
+                  <textarea placeholder="风格片段（追加到提示词）" value={item.promptFragment} onChange={(e) => setStylePresets((cur) => cur.map((p, i) => i === index ? { ...p, promptFragment: e.target.value } : p))} />
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="admin-config-block">
+            <div className="admin-config-block-head"><strong>通用负面提示词</strong></div>
+            <textarea className="admin-config-fulltext" value={negativePrompt} onChange={(e) => setNegativePrompt(e.target.value)} />
+          </div>
+
+          <div className="admin-config-block">
+            <div className="admin-config-block-head"><strong>行业 Agent 场景</strong>
+              <button type="button" className="subtle-button" onClick={() => {
+                const template = (INDUSTRY_AGENTS[0] ? JSON.parse(JSON.stringify(INDUSTRY_AGENTS[0])) : null) as IndustryAgent | null;
+                if (!template) return;
+                template.id = `agent-${Date.now()}`;
+                template.name = "新场景";
+                setIndustryAgents((cur) => [...cur, template]);
+                setOpenAgentId(template.id);
+              }}><Plus size={14} /> 添加场景（克隆）</button>
+            </div>
+            <div className="admin-config-agent-list">
+              {industryAgents.map((agent, index) => (
+                <div className="admin-config-agent" key={agent.id || index}>
+                  <div className="admin-config-agent-head" onClick={() => setOpenAgentId((cur) => cur === agent.id ? "" : agent.id)}>
+                    <ChevronRight size={14} className={openAgentId === agent.id ? "rotated" : ""} />
+                    <strong>{agent.name || "未命名场景"}</strong>
+                    <span className="admin-muted">{agent.tag}</span>
+                    <button type="button" className="admin-icon-button" title="删除" onClick={(e) => { e.stopPropagation(); setIndustryAgents((cur) => cur.filter((_, i) => i !== index)); }}><Trash2 size={15} /></button>
+                  </div>
+                  {openAgentId === agent.id && (
+                    <div className="admin-config-agent-body">
+                      <div className="admin-config-grid2">
+                        <label>名称<input value={agent.name} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, name: e.target.value } : a))} /></label>
+                        <label>标签<input value={agent.tag} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, tag: e.target.value } : a))} /></label>
+                        <label>图标<input value={agent.icon} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, icon: e.target.value } : a))} /></label>
+                        <label>推荐比例<input value={agent.recommendedRatio} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, recommendedRatio: e.target.value } : a))} /></label>
+                      </div>
+                      <label>场景描述<textarea value={agent.scenario} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, scenario: e.target.value } : a))} /></label>
+                      <label>介绍<textarea value={agent.description} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, description: e.target.value } : a))} /></label>
+                      <label>稳定版提示词结构<textarea value={agent.promptStructures?.stable || ""} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, promptStructures: { ...a.promptStructures, stable: e.target.value } } : a))} /></label>
+                      <label>创意版提示词结构<textarea value={agent.promptStructures?.creative || ""} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, promptStructures: { ...a.promptStructures, creative: e.target.value } } : a))} /></label>
+                      <label>商业版提示词结构<textarea value={agent.promptStructures?.commercial || ""} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, promptStructures: { ...a.promptStructures, commercial: e.target.value } } : a))} /></label>
+                      <label>负面提示词<textarea value={agent.negativePrompt} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, negativePrompt: e.target.value } : a))} /></label>
+                      <label>质检清单（每行一项）<textarea value={(agent.qualityChecklist || []).join("\n")} onChange={(e) => setIndustryAgents((cur) => cur.map((a, i) => i === index ? { ...a, qualityChecklist: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) } : a))} /></label>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="admin-config-actions">
+            <button type="button" className="subtle-button" onClick={() => void resetSection("presets", "提示词与场景")}><RefreshCw size={14} /> 全部恢复默认</button>
+            <button type="button" className="primary-button admin-config-save" disabled={saving === "提示词与场景"} onClick={() => void saveSection("presets", { presets: { promptStarters, stylePresets, industryAgents, negativePrompt } }, "提示词与场景")}>
+              {saving === "提示词与场景" ? <Loader2 size={15} className="spin" /> : <Save size={15} />} 保存提示词与场景
+            </button>
+          </div>
+        </div>
+      )}
+
+      {section === "system" && (
+        <div className="admin-config-body">
+          <div className="admin-config-block">
+            <div className="admin-config-block-head"><strong>Agent 分析 System Prompt</strong>
+              <span className="admin-muted">{agentAnalyze.length} 字</span>
+            </div>
+            <textarea className="admin-config-fulltext tall" value={agentAnalyze} onChange={(e) => setAgentAnalyze(e.target.value)} />
+          </div>
+          <div className="admin-config-block">
+            <div className="admin-config-block-head"><strong>提示词安全分析 System Prompt</strong>
+              <span className="admin-muted">{promptAnalyze.length} 字</span>
+            </div>
+            <textarea className="admin-config-fulltext tall" value={promptAnalyze} onChange={(e) => setPromptAnalyze(e.target.value)} />
+          </div>
+          <div className="admin-config-actions">
+            <button type="button" className="subtle-button" onClick={() => void resetSection("systemPrompts", "系统提示词")}><RefreshCw size={14} /> 恢复默认提示词</button>
+            <button type="button" className="primary-button admin-config-save" disabled={saving === "系统提示词"} onClick={() => void saveSection("system-prompts", { systemPrompts: { agentAnalyze, promptAnalyze } }, "系统提示词")}>
+              {saving === "系统提示词" ? <Loader2 size={15} className="spin" /> : <Save size={15} />} 保存提示词
+            </button>
+          </div>
+
+          <div className="admin-config-block">
+            <div className="admin-config-block-head"><strong>配额管理</strong>
+              <span className="admin-muted">生成类配额填 0 表示不限制</span>
+            </div>
+            <div className="admin-config-grid2">
+              <label>每用户每日生成上限（次，0 不限）<input type="number" min={0} value={quotas.generationDailyLimit} onChange={(e) => setQuotas((q) => ({ ...q, generationDailyLimit: Number(e.target.value) }))} /></label>
+              <label>每用户图片磁盘上限（MB，0 不限）<input type="number" min={0} value={quotas.userDiskLimitMB} onChange={(e) => setQuotas((q) => ({ ...q, userDiskLimitMB: Number(e.target.value) }))} /></label>
+              <label>广场货架上限（每人展示）<input type="number" min={1} value={quotas.squareShelfLimit} onChange={(e) => setQuotas((q) => ({ ...q, squareShelfLimit: Number(e.target.value) }))} /></label>
+              <label>广场每日推荐上限<input type="number" min={0} value={quotas.squareDailyRecommend} onChange={(e) => setQuotas((q) => ({ ...q, squareDailyRecommend: Number(e.target.value) }))} /></label>
+              <label>广场每日点赞上限<input type="number" min={0} value={quotas.squareDailyLike} onChange={(e) => setQuotas((q) => ({ ...q, squareDailyLike: Number(e.target.value) }))} /></label>
+              <label>广场信息流单页上限<input type="number" min={1} value={quotas.squareMaxFeed} onChange={(e) => setQuotas((q) => ({ ...q, squareMaxFeed: Number(e.target.value) }))} /></label>
+            </div>
+            <div className="admin-config-actions">
+              <button type="button" className="subtle-button" onClick={() => void resetSection("quotas", "配额")}><RefreshCw size={14} /> 恢复默认</button>
+              <button type="button" className="primary-button admin-config-save" disabled={saving === "配额"} onClick={() => void saveSection("quotas", { quotas }, "配额")}>
+                {saving === "配额" ? <Loader2 size={15} className="spin" /> : <Save size={15} />} 保存配额
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function AdminApp({
   onBackHome,
   onEnterStudio,
@@ -7825,6 +8372,7 @@ function AdminApp({
   onOauthLogin: () => void;
 }) {
   const [user, setUser] = useState<AdminUserView | null>(null);
+  const [adminTab, setAdminTab] = useState<"overview" | "logs" | "config">("overview");
   const [isChecking, setIsChecking] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [loginForm, setLoginForm] = useState({ username: "admin", password: "" });
@@ -7835,6 +8383,8 @@ function AdminApp({
   const [logs, setLogs] = useState<AdminRequestLog[]>([]);
   const [logStatus, setLogStatus] = useState("");
   const [logQuery, setLogQuery] = useState("");
+  const [logLimit, setLogLimit] = useState(50);
+  const [logTotal, setLogTotal] = useState(0);
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
   const [isExportingSquare, setIsExportingSquare] = useState(false);
   const [expandedLogId, setExpandedLogId] = useState("");
@@ -7848,7 +8398,7 @@ function AdminApp({
     void refreshDashboard();
     const timer = window.setInterval(() => void refreshDashboard({ quiet: true }), 10_000);
     return () => window.clearInterval(timer);
-  }, [user?.username, user?.mustChangePassword, logStatus, logQuery]);
+  }, [user?.username, user?.mustChangePassword, logStatus, logQuery, logLimit]);
 
   async function adminFetch<T>(path: string, init: RequestInit = {}) {
     const response = await fetch(`/api/admin${path}`, {
@@ -7990,13 +8540,15 @@ function AdminApp({
       const query = new URLSearchParams();
       if (logStatus) query.set("status", logStatus);
       if (logQuery.trim()) query.set("q", logQuery.trim());
+      query.set("limit", String(logLimit));
       const [statsPayload, logsPayload, squarePayload] = await Promise.all([
         adminFetch<{ ok: true; stats: AdminStats }>("/stats"),
-        adminFetch<{ ok: true; logs: AdminRequestLog[] }>(`/requests?${query.toString()}`),
+        adminFetch<{ ok: true; logs: AdminRequestLog[]; total?: number }>(`/requests?${query.toString()}`),
         squareAdminFetch<{ ok: true; overview: SquareAdminOverview }>("/overview"),
       ]);
       setStats(statsPayload.stats);
       setLogs(logsPayload.logs);
+      setLogTotal(logsPayload.total ?? logsPayload.logs.length);
       setSquareOverview(squarePayload.overview);
       setExpandedLogId((current) =>
         logsPayload.logs.some((log) => log.requestId === current) ? current : "",
@@ -8174,11 +8726,20 @@ function AdminApp({
         </div>
       </header>
 
+      <nav className="admin-tabs">
+        <button type="button" className={adminTab === "overview" ? "active" : ""} onClick={() => setAdminTab("overview")}>概览</button>
+        <button type="button" className={adminTab === "logs" ? "active" : ""} onClick={() => setAdminTab("logs")}>请求日志</button>
+        <button type="button" className={adminTab === "config" ? "active" : ""} onClick={() => setAdminTab("config")}>接口配置</button>
+      </nav>
+
+      {adminTab === "config" && <AdminConfigCenter />}
+
+      {adminTab === "overview" && (<>
       <section className="admin-stat-grid">
-        <AdminStatCard label="总请求" value={stats?.total ?? 0} />
+        <AdminStatCard label="生图请求" value={stats?.total ?? 0} />
         <AdminStatCard label="成功率" value={`${stats?.successRate ?? 0}%`} tone="success" />
         <AdminStatCard label="失败" value={stats?.error ?? 0} tone="error" />
-        <AdminStatCard label="平均耗时" value={formatCompactDuration(stats?.avgDurationMs ?? 0)} />
+        <AdminStatCard label="耗时 P50 · P95" value={`${formatCompactDuration(stats?.p50DurationMs ?? 0)} · ${formatCompactDuration(stats?.p95DurationMs ?? 0)}`} />
         <AdminStatCard label="广场展示" value={squareOverview?.activeItems ?? 0} />
         <AdminStatCard label="推荐尝试" value={squareOverview?.totalRecommendAttempts ?? 0} />
         <AdminStatCard label="替换率" value={`${squareOverview?.replacementRate ?? 0}%`} />
@@ -8212,7 +8773,7 @@ function AdminApp({
           ) : (
             topErrors.map(([error, count]) => (
               <div className="admin-rank-row" key={error}>
-                <span title={error}>{error}</span>
+                <span title={error}>{formatErrorKeyLabel(error)}</span>
                 <strong>{count}</strong>
               </div>
             ))
@@ -8281,14 +8842,85 @@ function AdminApp({
         </article>
       </section>
 
+      <section className="admin-panel admin-section">
+        <div className="admin-panel-title">
+          <Settings2 size={17} />
+          <strong>生图链路各环节</strong>
+          <span className="admin-muted admin-stage-caption">仅统计生图请求 · 共 {stats?.stageStats?.received ?? 0} 次</span>
+        </div>
+        <div className="admin-stage-flow">
+          {(() => {
+            const ss = stats?.stageStats;
+            const base = ss?.received || 0;
+            const pct = (n: number) => base ? Math.round((n / base) * 1000) / 10 : 0;
+            const steps = [
+              { key: "received", label: "接收请求", value: ss?.received ?? 0, sub: "100%" },
+              { key: "ref", label: "参考图转发", value: ss?.referenceForwarded ?? 0, sub: `${ss?.referenceForwarded ?? 0}/${ss?.referenceTotal ?? 0}` },
+              { key: "upstream", label: "上游返回", value: ss?.upstreamResponded ?? 0, sub: `${pct(ss?.upstreamResponded ?? 0)}%` },
+              { key: "success", label: "生成成功", value: ss?.upstreamSuccess ?? 0, sub: `${pct(ss?.upstreamSuccess ?? 0)}%` },
+              { key: "saved", label: "图片落盘", value: ss?.imageSaved ?? 0, sub: `${pct(ss?.imageSaved ?? 0)}%` },
+            ];
+            return steps.map((step, index) => (
+              <Fragment key={step.key}>
+                {index > 0 && <ChevronRight size={16} className="admin-stage-arrow" />}
+                <div className="admin-stage-step">
+                  <strong>{step.value}</strong>
+                  <span>{step.label}</span>
+                  <em>{step.sub}</em>
+                </div>
+              </Fragment>
+            ));
+          })()}
+        </div>
+      </section>
+
+      <section className="admin-panel admin-section">
+        <div className="admin-panel-title admin-panel-title-spread">
+          <div><BarChart3 size={17} /><strong>每日趋势</strong></div>
+          <span className="admin-muted">累计生成图片 {stats?.totalImages ?? 0} 张 · 好评 {stats?.feedback?.up ?? 0} · 差评 {stats?.feedback?.down ?? 0} · 分析类请求 {stats?.analysisCount ?? 0} 次</span>
+        </div>
+        <div className="admin-table-wrap">
+          <table className="admin-table admin-daily-table">
+            <thead>
+              <tr><th>日期</th><th>请求</th><th>成功</th><th>失败</th><th>图片</th><th>成功率</th><th>平均耗时</th></tr>
+            </thead>
+            <tbody>
+              {(stats?.daily?.length ?? 0) === 0 ? (
+                <tr><td colSpan={7} className="admin-empty-cell">暂无数据</td></tr>
+              ) : (
+                stats?.daily?.map((day) => (
+                  <tr key={day.date}>
+                    <td>{day.date}</td>
+                    <td>{day.total}</td>
+                    <td className="admin-cell-success">{day.success}</td>
+                    <td className="admin-cell-error">{day.error}</td>
+                    <td>{day.images}</td>
+                    <td>{day.successRate}%</td>
+                    <td>{formatCompactDuration(day.avgDurationMs)}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      </>)}
+
+      {adminTab === "logs" && (
       <section className="admin-panel admin-log-panel">
         <div className="admin-log-toolbar">
           <div>
             <strong>请求记录</strong>
-            <span>点击任意请求可查看脱敏请求参数、上游 payload 与返回内容；图片内容不会记录。</span>
+            <span>点击任意请求可查看脱敏请求参数、上游 payload、返回内容与已保存的生成图片。</span>
           </div>
           <div className="admin-filter-row">
-            <select value={logStatus} onChange={(event) => setLogStatus(event.target.value)}>
+            <select
+              value={logStatus}
+              onChange={(event) => {
+                setLogStatus(event.target.value);
+                setLogLimit(50);
+              }}
+            >
               <option value="">全部状态</option>
               <option value="running">运行中</option>
               <option value="success">成功</option>
@@ -8296,7 +8928,10 @@ function AdminApp({
             </select>
             <input
               value={logQuery}
-              onChange={(event) => setLogQuery(event.target.value)}
+              onChange={(event) => {
+                setLogQuery(event.target.value);
+                setLogLimit(50);
+              }}
               placeholder="搜索 requestID / 提示词 / 模型"
             />
           </div>
@@ -8373,8 +9008,47 @@ function AdminApp({
                               <strong>请求详情</strong>
                               <span>{log.requestId} · {log.endpoint}</span>
                             </div>
-                            <span className="admin-log-safety">图片内容已脱敏，不记录 API Key 原文</span>
+                            <span className="admin-log-safety">不记录 API Key 原文；生成图片保存在服务器本地</span>
                           </div>
+                          {log.stages && (log.stages.upstreamRequestedAt || log.stages.returnedAt) && (() => {
+                            const s = log.stages;
+                            const start = s.receivedAt || log.startedAt || log.createdAt;
+                            const seg = (from?: number, to?: number) => (typeof from === "number" && typeof to === "number" && to >= from) ? to - from : null;
+                            const rows = [
+                              { label: "接收 → 请求上游", ms: seg(start, s.upstreamRequestedAt) },
+                              { label: "上游生成（含参考图转发）", ms: seg(s.upstreamRequestedAt, s.upstreamRespondedAt) },
+                              { label: "图片落盘", ms: seg(s.upstreamRespondedAt, s.imageSavedAt) },
+                              { label: "生成本地链接 → 返回", ms: seg(s.imageSavedAt, s.returnedAt) },
+                            ].filter((row) => row.ms !== null);
+                            return (
+                              <div className="admin-stage-timeline">
+                                <span className="admin-stage-timeline-title">生图链路各环节耗时</span>
+                                <div className="admin-stage-timeline-rows">
+                                  {rows.map((row) => (
+                                    <div className="admin-stage-timeline-row" key={row.label}>
+                                      <span>{row.label}</span>
+                                      <strong>{formatCompactDuration(row.ms || 0)}</strong>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })()}
+                          {log.savedImages && log.savedImages.length > 0 && (
+                            <div className="admin-log-images">
+                              {log.savedImages.map((image) => (
+                                <a
+                                  key={image.id}
+                                  href={`/api/images/local/${image.id}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  title={`${image.mime} · ${formatBytes(image.bytes)}`}
+                                >
+                                  <img src={`/api/images/local/${image.id}`} alt="生成图片" loading="lazy" />
+                                </a>
+                              ))}
+                            </div>
+                          )}
                           <div className="admin-log-detail-grid">
                             <AdminJsonBlock title="请求参数" value={log.requestParams || {
                               protocol: log.protocol,
@@ -8412,6 +9086,16 @@ function AdminApp({
                               errorRaw: log.errorRaw,
                             }} />
                           </div>
+                          {log.status === "error" && log.errorFull && (
+                            <div className="admin-error-full">
+                              <div className="admin-error-full-head">
+                                <AlertCircle size={14} />
+                                <strong>完整错误内容</strong>
+                                <span className="admin-muted">上游/中转站原始返回，仅脱敏图片数据</span>
+                              </div>
+                              <pre>{log.errorFull}</pre>
+                            </div>
+                          )}
                         </td>
                       </tr>
                     )}
@@ -8421,7 +9105,20 @@ function AdminApp({
             </tbody>
           </table>
         </div>
+        <div className="admin-log-footer">
+          <span>已加载 {logs.length} / 共 {logTotal} 条历史记录</span>
+          {logs.length < logTotal && logLimit < 1000 && (
+            <button
+              type="button"
+              onClick={() => setLogLimit((current) => Math.min(current + 50, 1000))}
+              disabled={isLoadingLogs}
+            >
+              {isLoadingLogs ? "加载中..." : "加载更多"}
+            </button>
+          )}
+        </div>
       </section>
+      )}
     </main>
   );
 }
@@ -8970,14 +9667,13 @@ function CanvasPage({
         }),
       });
       const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !payload.images?.[0]?.dataUrl) {
+      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
         const detail = payload.detail && typeof payload.detail === "object"
           ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
           : payload.detail || "生成失败";
         throw new Error(String(detail));
       }
-      const dataUrl = payload.images[0].dataUrl;
-      const blob = await dataUrlToBlob(dataUrl);
+      const blob = await generatedImageToBlob(payload.images[0]);
       const objectUrl = URL.createObjectURL(blob);
       const { width, height } = await getImageSize(objectUrl);
       const duration = Date.now() - startedAt;
@@ -9101,14 +9797,13 @@ function CanvasPage({
         }),
       });
       const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !payload.images?.[0]?.dataUrl) {
+      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
         const detail = payload.detail && typeof payload.detail === "object"
           ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
           : payload.detail || "生成失败";
         throw new Error(String(detail));
       }
-      const dataUrl = payload.images[0].dataUrl;
-      const blob = await dataUrlToBlob(dataUrl);
+      const blob = await generatedImageToBlob(payload.images[0]);
       const objectUrl = URL.createObjectURL(blob);
       const { width, height } = await getImageSize(objectUrl);
       const duration = Date.now() - startedAt;
@@ -9186,14 +9881,13 @@ function CanvasPage({
         }),
       });
       const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !payload.images?.[0]?.dataUrl) {
+      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
         const detail = payload.detail && typeof payload.detail === "object"
           ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
           : payload.detail || "生成失败";
         throw new Error(String(detail));
       }
-      const dataUrl = payload.images[0].dataUrl;
-      const blob = await dataUrlToBlob(dataUrl);
+      const blob = await generatedImageToBlob(payload.images[0]);
       const objectUrl = URL.createObjectURL(blob);
       const { width, height } = await getImageSize(objectUrl);
       const duration = Date.now() - startedAt;
@@ -10010,7 +10704,7 @@ function HomePage({ onEnter, onSquare, onAdmin, onCanvas, oauthUser, onOauthLogo
           </p>
         </div>
         <div className="home-agent-grid">
-          {INDUSTRY_AGENTS.slice(0, 6).map((agent) => (
+          {runtimeIndustryAgents.slice(0, 6).map((agent) => (
             <article className="home-agent-card" key={agent.id}>
               <div>
                 <span>{agent.icon}</span>
@@ -10662,6 +11356,8 @@ const JobCard = memo(function JobCard({
   onRecommend,
   recommendState,
   canRecommend,
+  feedback,
+  onFeedback,
 }: {
   job: Job;
   highlighted: boolean;
@@ -10677,6 +11373,8 @@ const JobCard = memo(function JobCard({
   onRecommend: () => void;
   recommendState?: SquareRecommendStatus;
   canRecommend: boolean;
+  feedback?: 1 | -1;
+  onFeedback?: (rating: 1 | -1) => void;
 }) {
   const [tickNow, setTickNow] = useState(() => Date.now());
   useEffect(() => {
@@ -10811,6 +11509,26 @@ const JobCard = memo(function JobCard({
                 <Download size={16} />
               </button>
             )}
+            {job.status === "success" && onFeedback && (
+              <button
+                type="button"
+                className={`icon-button feedback-button ${feedback === 1 ? "feedback-up-active" : ""}`}
+                title="好评：这张图符合预期"
+                onClick={() => onFeedback(1)}
+              >
+                <ThumbsUp size={16} />
+              </button>
+            )}
+            {job.status === "success" && onFeedback && (
+              <button
+                type="button"
+                className={`icon-button feedback-button ${feedback === -1 ? "feedback-down-active" : ""}`}
+                title="差评：这张图不符合预期"
+                onClick={() => onFeedback(-1)}
+              >
+                <ThumbsDown size={16} />
+              </button>
+            )}
             {job.status === "error" && (
               <button type="button" className="icon-button" title="查看失败详情" onClick={onPreview}>
                 <AlertCircle size={16} />
@@ -10843,7 +11561,8 @@ const JobCard = memo(function JobCard({
   previous.selectionMode === next.selectionMode &&
   previous.selectable === next.selectable &&
   previous.recommendState === next.recommendState &&
-  previous.canRecommend === next.canRecommend
+  previous.canRecommend === next.canRecommend &&
+  previous.feedback === next.feedback
 );
 
 function SidebarToggleButton({
