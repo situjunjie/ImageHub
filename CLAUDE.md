@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Product
 
-ImageHub / Image Studio (`codex-image-batch-studio` in package.json) — a local-first batch image-generation workbench. The user fills in an upstream API URL + key, picks an `image-2`-class model, and submits batches; the browser keeps a full copy in IndexedDB, and generated images are also persisted server-side under `.data/images/` (served via `/api/images/local/:id`) so the admin dashboard can review them alongside request logs. Four major feature surfaces: **Studio** (batch generation), **Canvas** (infinite canvas generation mode), **Square** (community gallery with recommend/like), and **Agent Mode A** (NLP-driven brochure planning). Admin dashboard tracks request metadata plus saved-image file references — API keys are never persisted server-side. README.md (Chinese) is the canonical product spec; `docs/agent-mode-brochure-prd.md` is the Agent Mode A spec; `docs/canvas-mode-prd.md` is the Canvas Mode spec.
+ImageHub / Image Studio (`codex-image-batch-studio` in package.json) — a local-first batch image-generation workbench. The user fills in an upstream API URL + key, picks an `image-2`-class model, and submits batches; the browser keeps a full copy in IndexedDB, and generated images are also persisted server-side under `.data/images/` (served via the two-segment `/api/images/local/<userDir>/<file>`) so the admin dashboard can review them alongside request logs. Four major feature surfaces: **Studio** (batch generation), **Canvas** (infinite canvas generation mode), **Square** (community gallery with recommend/like), and **Agent Mode A** (NLP-driven brochure planning). Admin dashboard tracks request metadata plus saved-image file references — API keys are never persisted server-side. README.md (Chinese) is the canonical product spec; `docs/agent-mode-brochure-prd.md` is the Agent Mode A spec; `docs/canvas-mode-prd.md` is the Canvas Mode spec.
 
 ## Commands
 
@@ -25,15 +25,15 @@ Admin defaults: `admin` / `admin123456` at `http://localhost:8877/#admin`. Overr
 
 ## Architecture — the non-obvious parts
 
-**The entire backend lives inside `vite.config.ts`** (~4220 lines). It registers a custom Vite plugin whose `configureServer` middleware implements every `/api/*` route. There is no `server/`, `api/`, or `backend/` directory. When the task involves request logging, admin auth, the upstream proxy, or reference-image temp URLs, edit `vite.config.ts`, not files under `src/`.
+**The entire backend lives inside `vite.config.ts`** (~5350 lines) — every `/api/*` route is implemented in the exported `registerApiRoutes(app)` function there. `server/index.ts` (~140 lines) is only a thin production host: it mounts that same function on a plain Node http server and adds static hosting. There is no `api/` or `backend/` directory, and no per-route files. When the task involves request logging, admin auth, the upstream proxy, or reference-image temp URLs, edit `vite.config.ts`, not `server/index.ts` and not files under `src/`.
 
 Server-side route groups:
-- `/api/models`, `/api/images/generate`, `/api/temp-reference/:id` — core generation proxy.
+- `/api/models`, `/api/images/generate`, `/api/prompt/analyze` (SSE), `/api/reference-images/:id` — core generation proxy. Note the reference route is `/api/reference-images/:id`; there is no `/api/temp-reference`.
 - `/api/admin/*` (login, logout, change-password, stats, requests, me) — admin dashboard.
 - `/api/square/*` (feed, quota, recommend, like, image/:id, admin/overview, admin/export) — community gallery. Data persisted to `.data/square-store.json`. Feed/quota GET endpoints authenticate via `x-imagehub-api-key` header (not query params). Thumbnails are served as binary from `/api/square/image/:id` with long cache headers — the feed response returns `thumbnailUrl` (not inline base64).
 - `/api/agent/analyze` — Agent Mode A intent classification (single_image, multi_image_batch, brochure_project, page_refine).
 
-**The entire frontend lives inside `src/App.tsx`** (~11200 lines). One monolithic component handles home, studio, canvas, square, and admin views via an `activePage` state switch (`"home" | "studio" | "square" | "admin" | "canvas"`) — there is no router, no Redux/Zustand, no React Context for app state. State is `useState` + `useRef` (the generation queue uses `pendingQueueRef` deliberately to avoid re-renders mid-pump). Styles are in `src/styles.css` (~7900 lines) as plain CSS with custom properties.
+**The entire frontend lives inside `src/App.tsx`** (~12400 lines). One monolithic component handles home, studio, canvas, square, and admin views via an `activePage` state switch (`"home" | "studio" | "square" | "admin" | "canvas"`) — there is no router, no Redux/Zustand, no React Context for app state. State is `useState` + `useRef` (the generation queue uses `pendingQueueRef` deliberately to avoid re-renders mid-pump). Styles are in `src/styles.css` (~8650 lines) as plain CSS with custom properties.
 
 **Canvas Mode (infinite canvas):** `CanvasPage` component — a 2D pan/zoom canvas where users generate images as nodes and build visual iteration trees. URL hash `#canvas`. Layout: left = infinite canvas (DOM + CSS `transform` approach), right = 360px collapsible panel. Nodes stored as `CanvasNode[]` with position/status/image data. Edges (`CanvasEdge[]`) visualize parent→child optimization lineage via SVG bezier curves. Canvas state persisted to IndexedDB stores `canvas-state` (single "current" key) and `canvas-images` (keyed by nodeId). Key state: `canvasNodes`, `canvasEdges`, `viewport` ({x,y,zoom}), `selectedNodeId`, `panelMode` ("generate" | "optimize"). Generation reuses existing `/api/images/generate` — no new backend endpoints. Reference image compression for optimization uses `createSquareThumbnail()` (max edge 1024px, WebP 0.82).
 
@@ -54,10 +54,11 @@ Server-side route groups:
 **Generation pipeline:**
 1. Client builds `Job` objects, pushes them onto `pendingQueueRef.current`, and `pumpQueue()` drains them respecting client-side `concurrency` (1–6).
 2. Each job POSTs to `/api/images/generate` with `{ baseUrl, apiKey, request: { protocol, model, prompt, referenceImages, aspectRatio, seed, ... } }`.
-3. Reference images are sent as data URLs; the Vite middleware stashes them in an in-memory `temporaryReferences` Map with a ~10-minute TTL, generates `/api/temp-reference/{id}` URLs, and forwards those URLs (not base64) to the upstream `/v1/images/generations` endpoint.
+3. Reference images are sent as data URLs; the middleware stashes them in an in-memory `temporaryReferences` Map with a ~10-minute TTL, generates `/api/reference-images/{id}` URLs, and forwards those URLs (not base64) to the upstream `/v1/images/generations` endpoint.
 4. On success the server persists each generated image to `.data/images/<userDir>/<requestId>[-<index>].<ext>` (`persistGeneratedImages`) and replaces the base64 `dataUrl` in the response with a local URL (`/api/images/local/<userDir>/<file>`, served with immutable cache headers). The SQLite request record stores `imageSaved` + `savedImages` metadata (id=relative path, mime, bytes) — the admin dashboard renders these as thumbnails in the log detail view. Records are capped at 5000; trimmed ones get their image files deleted too (`deleteSavedImages`).
-5. Server logs request metadata — `requestId`, prompt, model, params, status, duration, error class, saved-image file references — to `.data/admin-store.json`. Never the API key.
-6. Client fetches the image blob from the local URL (`generatedImageToBlob`, with `dataUrl` fallback) and stores the Blob + history record in IndexedDB as before.
+5. Server logs request metadata — `requestId`, prompt, model, params, status, duration, error class, saved-image file references — to the `request_logs` SQLite table (see Data storage above; **not** `.data/admin-store.json`, which now holds only admin users + audit logs). Never the API key.
+6. Both success and error responses carry a `stages` object (`receivedAt`, `upstreamRequestedAt`, `upstreamRespondedAt`, and on success `imageSavedAt`/`returnedAt`). The frontend keeps it on the job/record (`JobStages`) to render real per-phase timing; the admin log detail renders it too. Add new timestamps to both response branches or the error path silently loses them.
+7. Client fetches the image blob from the local URL (`generatedImageToBlob`, with `dataUrl` fallback) and stores the Blob + history record in IndexedDB as before.
 
 **Config center (admin-managed whitelists + presets):** Since 2026-07 the site/model whitelists and the built-in presets are **runtime-configurable via the admin dashboard**, no longer hardcoded. Backend store: `.data/config-store.json` (`ConfigStore` type, `ensureConfigStore`/`readConfigStore`/`writeConfigStore` + in-memory `configStoreCache`), seeded from the former constants on first run. Public snapshot at `GET /api/config` (enabled items only, excludes systemPrompts/quotas); admin CRUD under `/api/admin/config`, `/api/admin/config/{upstreams,models,presets,system-prompts,quotas}` (PUT) and `/api/admin/config/reset` (POST). Every write bumps `version`, updates `updatedAt`, and appends an audit log.
 - Upstream sites: managed in admin (name + baseUrl + enabled), served to the frontend. Server-side validation in `validateUpstreamBaseUrl` allows http OR https and IP addresses (so users can point at a bare-IP relay), but still blocks internal/loopback/link-local hosts via `INTERNAL_HOST_PATTERN` (127.x, 10.x, 192.168.x, 172.16–31.x, 169.254.x cloud-metadata, localhost, `*.local`) as SSRF protection. `normalizeAllowedApiBaseUrl` reads enabled upstreams (plus `ALLOWED_API_BASE_URLS` as a permanent fallback that also carries the OAuth provider). At least one enabled site required.
@@ -73,7 +74,21 @@ If a task seems to require loosening the internal-host constraint in `validateUp
 
 **Admin auth:** scrypt-hashed password persisted in `.data/admin-store.json`; in-memory session map with ~8h TTL; cookie-based. The first login forces a password reset.
 
-**Frontend version banner:** `vite.config.ts` computes `FRONTEND_BUILD_VERSION` from the latest mtime across `src/`, `vite.config.ts`, and `package.json`; the client polls `/build-version.json` to detect deploys. Don't strip this if you're refactoring the config.
+**Design system (in-flight, 2026-07):** `src/styles.css` is being converged onto a token set defined in `:root` at the top of the file; `docs/design-refresh-prd.md` is the canonical spec. **Write new CSS with these tokens, not literal values** — hardcoding a hex color, a `border-radius: 14px`, or a card shadow silently regresses the refresh. The token groups and the rules they encode:
+- Surfaces layer by **transparency overlay, not solid greys and not shadows**: `--bg`/`--surface`/`--surface-soft`/`--overlay-1`/`--overlay-2`, hairline `--border`/`--border-strong`.
+- Radius encodes component role, five tiers only: `--r-pill` (buttons/chips) > `--r-panel` 16 (containers) > `--r-card` 12 > `--r-input` 10 > `--r-thumb` 8.
+- Motion has two tiers plus a shared curve: `--dur-fast`/`--dur-base`/`--dur-layout` + `--ease`. Animate only `transform`/`opacity`. **`transition: all` is banned** (currently 0 occurrences — keep it that way).
+- Shadows are for floating layers only (`--shadow-popover`); cards get hairline + overlay instead.
+- Color follows 60/30/10 — brand green ≤10% of screen, reserved for brand moments; semantic `--blue`/`--amber`/`--red` carry state.
+- Typography: ≤3 font weights, hierarchy from size/whitespace rather than bold. Global baselines already set at the top of styles.css: `:focus-visible` ring on all interactive elements, `font-variant-numeric: tabular-nums` on body, and a `prefers-reduced-motion` block.
+
+Status: P1 (token convergence) is applied but **uncommitted** on `main`; P2–P4 (Studio focus layout, deep-linkable admin tabs, canvas perf) are unimplemented. PRD §六 revises §四's original plan on four points — read §六 before acting on the earlier sections, notably: Studio keeps its compact bottom composer when history exists (hero centering is the empty state only), and high-frequency generation params must NOT be collapsed.
+
+**Scoped dark mode (canvas page, 2026-07-25):** there is still no global `prefers-color-scheme` rule, but §六.4's "image-evaluation surfaces need dark" is now satisfied for Canvas via **scoped token overrides**: `.canvas-page` redefines `--bg`/`--surface`/`--text`/`--border`/… inside its own scope, so every descendant inherits dark automatically. The viewport itself sits one step darker (`#141312`) than the frame (`#232220`) to read as a recessed board. **This is the pattern to copy for any future dark surface** — don't add a parallel `.dark-*` class tree. Consequence to watch: any shared component that hardcodes a light background while taking `color` from a token will invert-fail inside such a scope (this is exactly how `.subtle-button` dropped to a 1.06 contrast ratio — it's now `background: var(--surface)`). When adding shared components, take **both** color and background from tokens.
+
+**Home page (rebuilt 2026-07-25):** `HomePage` is no longer a static marketing page — it is a controlled component taking 11 props (prompt state, models, modelStats, recentRecords, oauth callbacks) and owns one `useEffect` that fetches `/api/square/feed`. Two things are load-bearing: the auto-model-verify effect's gate is `activePage !== "studio" && activePage !== "home"` — narrowing it back to studio-only silently makes the home submit button permanently disabled (`canGenerate` depends on `isModelConnectionVerified`); and `submitFromHome` writes the prompt into global state **before** navigating, with `homeSubmitPendingRef` (15s window) auto-firing generation once ready, so a not-yet-verified key never costs the user their input. Spec: `docs/home-refresh-prd.md`.
+
+**Frontend version banner:** `FRONTEND_BUILD_VERSION` is `process.env.FRONTEND_BUILD_VERSION` (sanitized) or, failing that, the module-load timestamp `new Date()` formatted as Asia/Shanghai `YYYYMMDDHHmmssSSS` — it is **not** derived from file mtimes. It reaches the client three ways: a `/build-version.json` endpoint (dev middleware + `emitFile` at build), the `__FRONTEND_BUILD_VERSION__` define, and an `assets/v<version>-[name]-[hash]` output filename prefix. The client polls every 5 min (plus on focus/visibility) and reloads with `?app_v=`. Don't strip this if you're refactoring the config.
 
 ## Privacy model — do not break
 
@@ -91,10 +106,19 @@ If a change would require crossing one of the remaining lines, raise it with the
 - `src/main.tsx` — React mount point.
 - `src/styles.css` — global CSS.
 - `src/assets/` — logo + screenshot images used by the home page.
-- `vite.config.ts` — Vite config **and** the entire backend middleware.
+- `vite.config.ts` — Vite config **and** the entire backend middleware (`registerApiRoutes`).
+- `server/index.ts` — production host: mounts `registerApiRoutes` on plain Node http + serves `dist/`.
+- `deploy.sh` — server deployment driver (`start|stop|restart|status|systemd`).
+- `docs/design-refresh-prd.md` — design system / UI refresh spec (canonical; read §六 revisions).
+- `docs/home-refresh-prd.md` — home page rebuild spec (H1–H4 shipped; §十一 records actual deviations).
+- `.claude/skills/ui-ux-pro-max/` — third-party UI/UX rule database (MIT, from `nextlevelbuilder/ui-ux-pro-max-skill`); consulted for design decisions, not part of the build.
 - `docs/agent-mode-brochure-prd.md` — Agent Mode A product spec (canonical).
 - `docs/canvas-mode-prd.md` — Canvas Mode (infinite canvas) product spec.
+- `docs/admin-config-center-prd.md` — config center spec.
 - `docs/screenshots/` — README screenshots (committed).
-- `.data/admin-store.json` — runtime admin + request-log store; gitignored.
+- `.data/imagehub.db` — SQLite: request logs, daily stats, image feedback; gitignored.
+- `.data/admin-store.json` — admin users + audit logs; gitignored.
+- `.data/config-store.json` — runtime config (upstreams, models, presets, quotas); gitignored.
 - `.data/square-store.json` — community gallery data; gitignored.
-- `dist/`, `node_modules/`, `generated_images/`, `screenshot-*.png` — gitignored.
+- `.data/images/<userDir>/` — persisted generated images; gitignored.
+- `dist/`, `server-dist/`, `node_modules/`, `generated_images/`, `screenshot-*.png` — gitignored.

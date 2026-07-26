@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   ArrowRight,
+  ArrowUp,
   BarChart3,
   Bot,
   CheckCircle2,
@@ -53,9 +54,6 @@ import {
   useRef,
   useState,
 } from "react";
-import homeHeroImage from "./assets/home-hero.png";
-import homePromptPreview from "./assets/home-prompt-preview.png";
-import homeStudioPreview from "./assets/home-studio-preview.png";
 import imageStudioLogo from "./assets/image-studio-logo.svg";
 
 type ImageProtocol =
@@ -117,6 +115,14 @@ type JobStatus = "queued" | "running" | "success" | "error";
 
 type ErrorDetail = unknown;
 
+type JobStages = {
+  receivedAt?: number;
+  upstreamRequestedAt?: number;
+  upstreamRespondedAt?: number;
+  imageSavedAt?: number;
+  returnedAt?: number;
+};
+
 type Job = {
   id: string;
   requestId?: string;
@@ -133,8 +139,11 @@ type Job = {
   startedAt?: number;
   finishedAt?: number;
   durationMs?: number;
+  stages?: JobStages;
   imageBlob?: Blob;
   imageUrl?: string;
+  // 列表渲染用；imageUrl 始终指向原图，供预览/下载使用
+  thumbUrl?: string;
   width?: number;
   height?: number;
   revisedPrompt?: string;
@@ -166,6 +175,10 @@ type StoredHistoryRecord = {
   finishedAt?: number;
   durationMs?: number;
   imageBlob?: Blob;
+  // 列表用缩略图（512px WebP）。用存储换时间：省的是位图解码内存，不是磁盘。
+  thumbBlob?: Blob;
+  thumbWidth?: number;
+  thumbHeight?: number;
   width?: number;
   height?: number;
   revisedPrompt?: string;
@@ -179,6 +192,7 @@ type StoredHistoryRecord = {
 type HistoryRecord = Omit<StoredHistoryRecord, "referenceImages"> & {
   referenceImages: UploadedReference[];
   objectUrl?: string;
+  thumbUrl?: string;
 };
 
 type ModelLoadState = {
@@ -234,6 +248,7 @@ type GenerateProxyResponse = {
   images?: Array<{ dataUrl?: string; url?: string; revisedPrompt?: string }>;
   detail?: unknown;
   raw?: unknown;
+  stages?: JobStages;
 };
 
 type AnalysisMode = "send" | "optimize" | "params" | "risk" | "style";
@@ -417,7 +432,9 @@ type AgentModeState = {
 type PreviewItem = {
   id: string;
   requestId?: string;
+  // url 永远是原图。thumbUrl 只用于加载过渡期的占位，绝不作为最终画质呈现。
   url?: string;
+  thumbUrl?: string;
   protocol?: ImageProtocol;
   prompt: string;
   model: string;
@@ -609,7 +626,7 @@ type AdminRequestLog = {
   finishedAt?: number;
   durationMs?: number;
   imageSaved?: boolean;
-  savedImages?: Array<{ id: string; mime: string; bytes: number }>;
+  savedImages?: Array<{ id: string; mime: string; bytes: number; thumbId?: string; thumbBytes?: number }>;
   stages?: {
     receivedAt?: number;
     upstreamRequestedAt?: number;
@@ -688,7 +705,9 @@ type CanvasNode = {
   duration?: number;
   imageWidth?: number;
   imageHeight?: number;
+  // objectUrl 是原图（下载/优化取参考图用）；thumbUrl 是画布上渲染用的缩略图
   objectUrl?: string;
+  thumbUrl?: string;
 };
 
 type CanvasEdge = {
@@ -1593,6 +1612,17 @@ function getClientId() {
   return next;
 }
 
+// 本项目是 hash 路由，但 /admin、/studio 这类 path 直链是所有人都会先试的写法
+// （服务端 SPA fallback 会返回 index.html，hash 为空就落回首页，看起来像"打不开"）。
+// 在 React 挂载前把 path 规范化成 hash，之后全程仍只走 hash 一套逻辑。
+(function normalizePathToHash() {
+  if (typeof window === "undefined" || window.location.hash) return;
+  const path = window.location.pathname.replace(/^\/+|\/+$/g, "").toLowerCase();
+  if (path === "studio" || path === "canvas" || path === "square" || path === "admin") {
+    window.history.replaceState(null, "", `/#${path}`);
+  }
+})();
+
 function pageFromHash(): AppPage {
   if (window.location.hash === "#studio") return "studio";
   if (window.location.hash === "#square") return "square";
@@ -2164,6 +2194,8 @@ function historyRecordToJob(record: HistoryRecord): Job {
     durationMs: record.durationMs,
     imageBlob: record.imageBlob,
     imageUrl: record.objectUrl,
+    // 漏了这行会让主画廊对所有从 IndexedDB 读回的记录退回原图（缩略图只对本次会话生成的图生效）
+    thumbUrl: record.thumbUrl,
     width: record.width,
     height: record.height,
     revisedPrompt: record.revisedPrompt,
@@ -2197,6 +2229,7 @@ function mergeHistoryRecords(current: HistoryRecord[], incoming: HistoryRecord[]
     if (seen.has(record.id)) {
       const existing = current.find((item) => item.id === record.id);
       if (record.objectUrl && record.objectUrl !== existing?.objectUrl) URL.revokeObjectURL(record.objectUrl);
+      if (record.thumbUrl && record.thumbUrl !== existing?.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
       return;
     }
     seen.add(record.id);
@@ -2212,6 +2245,7 @@ function mergeHistoricalJobs(current: Job[], incoming: Job[]) {
     if (seen.has(record.id)) {
       const existing = current.find((item) => item.id === record.id);
       if (record.imageUrl && record.imageUrl !== existing?.imageUrl) URL.revokeObjectURL(record.imageUrl);
+      if (record.thumbUrl && record.thumbUrl !== existing?.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
       return;
     }
     seen.add(record.id);
@@ -2267,6 +2301,7 @@ async function getHistoryRecordsPage({
       params: normalizeImageParams(record.params),
       referenceImages: normalizeStoredReferenceImages(record.referenceImages),
       objectUrl: record.imageBlob ? URL.createObjectURL(record.imageBlob) : undefined,
+      thumbUrl: record.thumbBlob ? URL.createObjectURL(record.thumbBlob) : undefined,
     });
     const finish = (records: StoredHistoryRecord[]) => {
       const page = records.slice(0, limit).map(toHistoryRecord);
@@ -2388,6 +2423,11 @@ async function loadCanvasStateFromDB(): Promise<CanvasPersistedState | null> {
   });
 }
 
+// 画布缩略图复用同一个 store，key 加 :thumb 后缀——避免升 IndexedDB 版本，且对老数据天然兼容
+function canvasThumbKey(nodeId: string) {
+  return `${nodeId}:thumb`;
+}
+
 async function saveCanvasImageToDB(nodeId: string, blob: Blob): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
@@ -2463,6 +2503,66 @@ function createReferenceThumbnail(dataUrl: string, maxEdge = 160): Promise<strin
     };
     image.onerror = () => reject(new Error("无法读取参考图缩略图"));
     image.src = dataUrl;
+  });
+}
+
+const LIST_THUMB_MAX_EDGE = 512;
+const LIST_THUMB_QUALITY = 0.78;
+
+// 列表缩略图：等比缩放不裁剪。收益在位图解码内存（2048² 原图解码后 16.8MB，512² 只要 1MB）。
+// 与 createSquareThumbnail 的区别：入参出参都是 Blob，且小图也会重编码——因为目标是压像素数，
+// 原图哪怕体积小，解码后的位图内存仍由像素数决定。
+function createListThumbnail(blob: Blob): Promise<{ blob: Blob; width: number; height: number } | null> {
+  return new Promise((resolve) => {
+    const sourceUrl = URL.createObjectURL(blob);
+    const image = new Image();
+    const cleanup = () => URL.revokeObjectURL(sourceUrl);
+    image.onload = () => {
+      const naturalWidth = image.naturalWidth;
+      const naturalHeight = image.naturalHeight;
+      const longestEdge = Math.max(naturalWidth, naturalHeight);
+      if (!longestEdge) {
+        cleanup();
+        resolve(null);
+        return;
+      }
+      const scale = Math.min(1, LIST_THUMB_MAX_EDGE / longestEdge);
+      const width = Math.max(1, Math.round(naturalWidth * scale));
+      const height = Math.max(1, Math.round(naturalHeight * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { alpha: true });
+      if (!context) {
+        cleanup();
+        resolve(null);
+        return;
+      }
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
+      context.drawImage(image, 0, 0, width, height);
+      cleanup();
+      canvas.toBlob(
+        (result) => {
+          if (result) {
+            resolve({ blob: result, width, height });
+            return;
+          }
+          // WebP 编码失败降级 PNG；再失败就放弃缩略图，渲染点会回退原图
+          canvas.toBlob(
+            (png) => resolve(png ? { blob: png, width, height } : null),
+            "image/png",
+          );
+        },
+        "image/webp",
+        LIST_THUMB_QUALITY,
+      );
+    };
+    image.onerror = () => {
+      cleanup();
+      resolve(null);
+    };
+    image.src = sourceUrl;
   });
 }
 
@@ -2614,18 +2714,66 @@ async function dataUrlToBlob(dataUrl: string) {
   return response.blob();
 }
 
+// 原图不可用的原因分类：预览/下载要据此给出具体提示，绝不能静默降级成缩略图
+type FullImageFailReason = "purged" | "lost" | "network";
+
+class FullImageError extends Error {
+  reason: FullImageFailReason;
+  status?: number;
+  constructor(reason: FullImageFailReason, message: string, status?: number) {
+    super(message);
+    this.name = "FullImageError";
+    this.reason = reason;
+    this.status = status;
+  }
+}
+
+function describeFullImageError(error: unknown): { title: string; hint: string; canRetry: boolean } {
+  const reason = error instanceof FullImageError ? error.reason : "network";
+  if (reason === "purged") {
+    return {
+      title: "原图已被服务器清理",
+      hint: "请求日志超过 5000 条时会自动清理最早的图片文件。",
+      canRetry: false,
+    };
+  }
+  if (reason === "lost") {
+    return {
+      title: "本地图片数据已丢失",
+      hint: "可能是浏览器清理了存储空间。",
+      canRetry: true,
+    };
+  }
+  const status = error instanceof FullImageError ? error.status : undefined;
+  return {
+    title: status ? `原图加载失败（HTTP ${status}）` : "原图加载失败",
+    hint: "可能是网络问题或服务暂时不可用。",
+    canRetry: true,
+  };
+}
+
 async function generatedImageToBlob(image: { url?: string; dataUrl?: string }): Promise<Blob> {
   if (image.url) {
-    const response = await fetch(image.url);
+    let response: Response;
+    try {
+      response = await fetch(image.url);
+    } catch {
+      throw new FullImageError("network", "读取服务器图片失败（网络错误）");
+    }
     if (!response.ok) {
-      throw new Error(`读取服务器图片失败（HTTP ${response.status}）`);
+      // 404 = 文件已被日志裁剪清理，与网络故障是两回事，提示文案也不同
+      throw new FullImageError(
+        response.status === 404 ? "purged" : "network",
+        `读取服务器图片失败（HTTP ${response.status}）`,
+        response.status,
+      );
     }
     return response.blob();
   }
   if (image.dataUrl) {
     return dataUrlToBlob(image.dataUrl);
   }
-  throw new Error("响应中没有图片数据");
+  throw new FullImageError("lost", "响应中没有图片数据");
 }
 
 function getImageSize(url: string): Promise<{ width: number; height: number }> {
@@ -3500,6 +3648,9 @@ export default function App() {
   const [apiConfig, setApiConfig] = useState<ApiConfig>(loadInitialApiConfig);
   const [params, setParams] = useState<ImageParams>(loadInitialParams);
   const [prompt, setPrompt] = useState("");
+  const [homePrompt, setHomePrompt] = useState("");
+  // 首页提交后落进 studio 的待办（时间戳 + 提示词快照），等 canRequestGenerate 就绪后自动发车
+  const homeSubmitPendingRef = useRef<{ at: number; prompt: string } | null>(null);
   const [activePage, setActivePage] = useState<AppPage>(pageFromHash);
   const [configVersion, setConfigVersion] = useState(0);
   const [modelStats, setModelStats] = useState<Record<string, ModelStat>>({});
@@ -3727,26 +3878,85 @@ export default function App() {
     void loadSidebarRecordsPage();
   }, []);
 
+  // 老记录回填缩略图：分批小步跑，避免一次解码大量原图把主线程顶住。
+  // 失败或没跑到的记录，渲染点一律 `thumbUrl ?? objectUrl` 回退原图，不影响使用。
+  // 注意：本 effect 内部会 setSidebarRecords（即它自己的依赖），所以不能用 cleanup 里的 cancelled 标志
+  // 来中断循环——那会导致每写回 1 条就自我取消，"每批 6 条"永远不成立，还白算一次解码。
+  // 改为：running ref 防重入 + 卸载标志只在真正卸载时置位。
+  const backfillRunningRef = useRef(false);
+  const backfillDoneRef = useRef(new Set<string>());
+  const isUnmountedRef = useRef(false);
+  const sidebarRecordsRef = useRef<HistoryRecord[]>([]);
+  sidebarRecordsRef.current = sidebarRecords;
+  useEffect(() => () => { isUnmountedRef.current = true; }, []);
+
+  useEffect(() => {
+    if (backfillRunningRef.current) return;
+    const timer = window.setTimeout(async () => {
+      if (backfillRunningRef.current || isUnmountedRef.current) return;
+      const pending = sidebarRecordsRef.current
+        .filter((record) => record.imageBlob && !record.thumbBlob && !backfillDoneRef.current.has(record.id))
+        .slice(0, 6);
+      if (pending.length === 0) return;
+      backfillRunningRef.current = true;
+      try {
+        for (const record of pending) {
+          if (isUnmountedRef.current) return;
+          backfillDoneRef.current.add(record.id);
+          const thumb = await createListThumbnail(record.imageBlob as Blob);
+          if (!thumb) continue;
+          const { objectUrl: _o, thumbUrl: _t, ...stored } = record;
+          try {
+            await saveHistoryRecord({ ...stored, thumbBlob: thumb.blob, thumbWidth: thumb.width, thumbHeight: thumb.height });
+          } catch {
+            continue;
+          }
+          if (isUnmountedRef.current) return;
+          const thumbUrl = URL.createObjectURL(thumb.blob);
+          const patch = { thumbBlob: thumb.blob, thumbWidth: thumb.width, thumbHeight: thumb.height, thumbUrl };
+          setSidebarRecords((current) => current.map((r) => (r.id === record.id ? { ...r, ...patch } : r)));
+          setVisibleRecords((current) => current.map((j) => (j.id === record.id ? { ...j, thumbUrl } : j)));
+        }
+      } finally {
+        backfillRunningRef.current = false;
+      }
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [sidebarRecords]);
+
   useEffect(() => {
     void fetchAppConfig().then(() => {
       setConfigVersion((current) => current + 1);
       setApiConfig((current) => ({ ...current, baseUrl: normalizeApiBaseUrl(current.baseUrl) }));
     });
     // 拉取近 7 日各模型真实表现，用于模型选择时展示成功率与 P50
-    void fetch("/api/model-stats")
-      .then((response) => (response.ok ? response.json() : null))
-      .then((payload) => {
-        if (payload && payload.ok && Array.isArray(payload.models)) {
-          const map: Record<string, ModelStat> = {};
-          for (const item of payload.models as ModelStat[]) {
-            map[normalizedModelId(item.id)] = item;
+    const loadModelStats = () => {
+      void fetch("/api/model-stats")
+        .then((response) => (response.ok ? response.json() : null))
+        .then((payload) => {
+          if (payload && payload.ok && Array.isArray(payload.models)) {
+            const map: Record<string, ModelStat> = {};
+            for (const item of payload.models as ModelStat[]) {
+              map[normalizedModelId(item.id)] = item;
+            }
+            setModelStats(map);
           }
-          setModelStats(map);
-        }
-      })
-      .catch(() => {
-        // 统计拉取失败不影响使用
-      });
+        })
+        .catch(() => {
+          // 统计拉取失败不影响使用
+        });
+    };
+    loadModelStats();
+    // 回到页面时静默刷新（60s 节流）——批量跑完切回来能看到最新成功率
+    let lastStatsAt = Date.now();
+    const onVisible = () => {
+      if (!document.hidden && Date.now() - lastStatsAt > 60_000) {
+        lastStatsAt = Date.now();
+        loadModelStats();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
   async function sendImageFeedback(requestId: string | undefined, rating: 1 | -1) {
@@ -3991,7 +4201,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (activePage !== "studio") return;
+    // 首页也要参与静默验证：首页输入框依赖 canGenerate，否则提交按钮永远不可用
+    if (activePage !== "studio" && activePage !== "home") return;
     const apiKey = apiConfig.apiKey.trim();
     if (apiKey.length < API_KEY_MIN_LENGTH) {
       lastAutoModelLoadKeyRef.current = "";
@@ -4032,6 +4243,24 @@ export default function App() {
 
     return () => window.clearTimeout(timer);
   }, [activePage, apiConfig.apiKey, apiConfig.baseUrl, apiConfig.protocol, verifiedModelKey]);
+
+  // 首页提交的待办：落进 studio 后一旦具备生成条件就自动发车；15 秒内没就绪则交还给用户手动点
+  useEffect(() => {
+    const pending = homeSubmitPendingRef.current;
+    if (!pending || activePage !== "studio") return;
+    if (Date.now() - pending.at > 15000) {
+      homeSubmitPendingRef.current = null;
+      return;
+    }
+    // 提示词已被用户改动 → 放弃自动发车，交还控制权，避免用半截提示词消耗额度
+    if (prompt !== pending.prompt) {
+      homeSubmitPendingRef.current = null;
+      return;
+    }
+    if (!canRequestGenerate) return;
+    homeSubmitPendingRef.current = null;
+    void requestStartBatch();
+  }, [activePage, canRequestGenerate, prompt]);
 
   useEffect(() => {
     const marker = mainLoadMoreRef.current;
@@ -4287,12 +4516,14 @@ export default function App() {
     setSidebarRecords((current) => {
       current.forEach((record) => {
         if (deleteIdSet.has(record.id) && record.objectUrl) URL.revokeObjectURL(record.objectUrl);
+        if (deleteIdSet.has(record.id) && record.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
       });
       return current.filter((record) => !deleteIdSet.has(record.id));
     });
     setVisibleRecords((current) => {
       current.forEach((record) => {
         if (deleteIdSet.has(record.id) && record.imageUrl) URL.revokeObjectURL(record.imageUrl);
+        if (deleteIdSet.has(record.id) && record.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
       });
       return current.filter((record) => !deleteIdSet.has(record.id));
     });
@@ -4316,6 +4547,7 @@ export default function App() {
     setSidebarRecords((current) => {
       current.forEach((record) => {
         if (failedIds.has(record.id) && record.objectUrl) URL.revokeObjectURL(record.objectUrl);
+        if (failedIds.has(record.id) && record.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
       });
       return current.filter((record) => !failedIds.has(record.id) && record.status !== "error");
     });
@@ -4323,6 +4555,7 @@ export default function App() {
       current.forEach((record) => {
         if ((failedIds.has(record.id) || record.status === "error") && record.imageUrl) {
           URL.revokeObjectURL(record.imageUrl);
+          if (record.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
         }
       });
       return current.filter((record) => !failedIds.has(record.id) && record.status !== "error");
@@ -4841,8 +5074,8 @@ export default function App() {
       const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
       if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
         throw payload.detail && typeof payload.detail === "object"
-          ? { ...payload.detail as Record<string, unknown>, requestId: payload.requestId }
-          : { error: payload.detail || payload, requestId: payload.requestId };
+          ? { ...payload.detail as Record<string, unknown>, requestId: payload.requestId, stages: payload.stages }
+          : { error: payload.detail || payload, requestId: payload.requestId, stages: payload.stages };
       }
 
       const blob = await generatedImageToBlob(payload.images[0]);
@@ -4884,6 +5117,7 @@ export default function App() {
         startedAt,
         finishedAt,
         durationMs,
+        stages: payload.stages,
       });
 
       const historyRecord: StoredHistoryRecord = {
@@ -4918,6 +5152,33 @@ export default function App() {
         referenceImages: normalizeStoredReferenceImages(historyRecord.referenceImages),
         objectUrl,
       }]));
+
+      // 缩略图在图已经显示之后再算：解码 + WebP 编码是主线程活儿，不能挡在用户看到图之前。
+      // 失败或未完成时，所有渲染点的 `thumbUrl ?? objectUrl` 会回退原图。
+      void createListThumbnail(blob).then(async (thumb) => {
+        if (!thumb) return;
+        const patch = { thumbBlob: thumb.blob, thumbWidth: thumb.width, thumbHeight: thumb.height };
+        try {
+          await saveHistoryRecord({ ...historyRecord, ...patch });
+        } catch {
+          return;
+        }
+        const thumbUrl = URL.createObjectURL(thumb.blob);
+        patchVisibleRecord(job.id, { thumbUrl });
+        setSidebarRecords((current) => current.map((r) => (r.id === job.id ? { ...r, ...patch, thumbUrl } : r)));
+        if (payload.requestId) {
+          // 供管理后台列表用；fire-and-forget，失败不影响用户
+          void blobToDataUrl(thumb.blob)
+            .then((thumbnailDataUrl) =>
+              fetch("/api/images/thumb", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ requestId: payload.requestId, index: 0, thumbnailDataUrl, clientId: getClientId() }),
+              }),
+            )
+            .catch(() => undefined);
+        }
+      });
     } catch (error) {
       const finishedAt = Date.now();
       const durationMs = finishedAt - startedAt;
@@ -4988,7 +5249,10 @@ export default function App() {
         },
         error: safeLogError(errorDetail),
       });
-      patchVisibleRecord(job.id, { requestId, status: "error", errorDetail, startedAt, finishedAt, durationMs });
+      const errorStages = errorDetail && typeof errorDetail === "object" && "stages" in errorDetail
+        ? (errorDetail as { stages?: JobStages }).stages
+        : undefined;
+      patchVisibleRecord(job.id, { requestId, status: "error", errorDetail, startedAt, finishedAt, durationMs, stages: errorStages });
       const historyRecord: StoredHistoryRecord = {
         id: job.id,
         requestId,
@@ -6123,12 +6387,14 @@ export default function App() {
     setSidebarRecords((current) => {
       current.forEach((record) => {
         if (record.id === id && record.objectUrl) URL.revokeObjectURL(record.objectUrl);
+        if (record.id === id && record.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
       });
       return current.filter((record) => record.id !== id);
     });
     setVisibleRecords((current) => {
       current.forEach((record) => {
         if (record.id === id && record.imageUrl) URL.revokeObjectURL(record.imageUrl);
+        if (record.id === id && record.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
       });
       return current.filter((record) => record.id !== id);
     });
@@ -6144,12 +6410,14 @@ export default function App() {
     await clearHistoryRecords();
     sidebarRecords.forEach((record) => {
       if (record.objectUrl) URL.revokeObjectURL(record.objectUrl);
+      if (record.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
     });
     setSidebarRecords([]);
     setVisibleRecords((current) => {
       current.forEach((record) => {
         if ((record.status === "success" || record.status === "error") && record.imageUrl) {
           URL.revokeObjectURL(record.imageUrl);
+          if (record.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
         }
       });
       return current.filter((record) => record.status === "queued" || record.status === "running");
@@ -6537,11 +6805,13 @@ export default function App() {
   }
 
   function previewCurrent(item: Job | HistoryRecord) {
+    // 只取原图字段。列表用的缩略图另走 thumbUrl，绝不能混进来当预览主图。
     const url = (item as Job).imageUrl || (item as HistoryRecord).objectUrl;
     setPreviewItem({
       id: item.id,
       requestId: item.requestId,
       url,
+      thumbUrl: (item as Job).thumbUrl || (item as HistoryRecord).thumbUrl,
       protocol: (item as Job).protocol || (item as HistoryRecord).protocol,
       prompt: item.prompt,
       model: item.model,
@@ -6570,6 +6840,17 @@ export default function App() {
       setOnboardingStep(0);
       setIsSettingsOpen(true);
     }
+  }
+
+  // 首页输入框提交：无条件先接住提示词再跳转，未就绪也不丢失用户输入
+  function submitFromHome() {
+    const value = homePrompt.trim();
+    if (!value) return;
+    setPrompt(value);
+    setHomePrompt("");
+    // 连同提示词快照一起记：用户若在 studio 改写了提示词，说明他要自己接管，待办必须作废而不是抢跑
+    homeSubmitPendingRef.current = { at: Date.now(), prompt: value };
+    enterStudio();
   }
 
   function enterAdmin() {
@@ -6640,7 +6921,25 @@ export default function App() {
     return (
       <>
         {frontendUpdateNotice}
-        <HomePage onEnter={enterStudio} onSquare={enterSquare} onAdmin={enterAdmin} onCanvas={enterCanvas} oauthUser={oauthUser} onOauthLogout={oauthLogout} />
+        <HomePage
+          onEnter={enterStudio}
+          onSquare={enterSquare}
+          onAdmin={enterAdmin}
+          onCanvas={enterCanvas}
+          oauthUser={oauthUser}
+          onOauthLogout={oauthLogout}
+          oauthEnabled={oauthEnabled}
+          onOauthLogin={oauthLogin}
+          homePrompt={homePrompt}
+          onHomePromptChange={setHomePrompt}
+          onHomeSubmit={submitFromHome}
+          models={selectableImageModels}
+          modelStats={modelStats}
+          selectedModel={selectedModel}
+          onSelectModel={selectImageModel}
+          recentRecords={sidebarRecords}
+          hasApiKey={apiConfig.apiKey.trim().length >= API_KEY_MIN_LENGTH}
+        />
       </>
     );
   }
@@ -6755,8 +7054,8 @@ export default function App() {
                 onClick={() => focusSidebarRecord(record)}
               >
                 <div className={`history-thumb ${record.status}`}>
-                  {record.objectUrl ? (
-                    <img src={record.objectUrl} alt="" />
+                  {(record.thumbUrl ?? record.objectUrl) ? (
+                    <img src={record.thumbUrl ?? record.objectUrl} alt="" loading="lazy" decoding="async" />
                   ) : (
                     <AlertCircle size={18} />
                   )}
@@ -7918,31 +8217,6 @@ export default function App() {
             </>
           )}
           <label>
-            <span>质量</span>
-            <select
-              value={params.quality}
-              disabled={!protocolDefinition.supportsQuality}
-              onChange={(event) => updateParams({ quality: event.target.value })}
-            >
-              <option value="auto">auto</option>
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
-            </select>
-          </label>
-          <label>
-            <span>格式</span>
-            <select
-              value={params.outputFormat}
-              disabled={!protocolDefinition.supportsOutputFormat}
-              onChange={(event) => updateParams({ outputFormat: event.target.value as ImageParams["outputFormat"] })}
-            >
-              <option value="png">PNG</option>
-              <option value="jpeg">JPEG</option>
-              <option value="webp">WebP</option>
-            </select>
-          </label>
-          <label>
             <span>张数</span>
             <input
               type="number"
@@ -7962,33 +8236,68 @@ export default function App() {
               onChange={(event) => updateParams({ concurrency: Number(event.target.value) })}
             />
           </label>
-          <label title="生成失败时（5xx / 429 / 网络错误）自动重试的次数。范围 0–5，默认 2。">
-            <span>失败自动重试</span>
-            <input
-              type="number"
-              min={0}
-              max={5}
-              value={params.retryLimit}
-              onChange={(event) => updateParams({ retryLimit: Number(event.target.value) })}
-            />
-          </label>
-          <label>
-            <span>Seed</span>
-            <input value={params.seed} onChange={(event) => updateParams({ seed: event.target.value })} />
-          </label>
         </section>
 
-        <section className="settings-section">
-          <label>
-            <span>负面提示词</span>
-            <textarea
-              value={params.negativePrompt}
-              rows={3}
-              onChange={(event) => updateParams({ negativePrompt: event.target.value })}
-              placeholder="不想出现的内容"
-            />
-          </label>
-        </section>
+        {/* 低频参数按使用频率折叠（设计修订 §六.2）：高频的张数/比例/分辨率保持一击可达 */}
+        <details className="settings-advanced">
+          <summary>
+            <ChevronRight size={14} />
+            高级参数
+            <small>质量 · 格式 · 重试 · Seed · 负面词</small>
+          </summary>
+          <div className="settings-section compact-grid">
+            <label>
+              <span>质量</span>
+              <select
+                value={params.quality}
+                disabled={!protocolDefinition.supportsQuality}
+                onChange={(event) => updateParams({ quality: event.target.value })}
+              >
+                <option value="auto">auto</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+              </select>
+            </label>
+            <label>
+              <span>格式</span>
+              <select
+                value={params.outputFormat}
+                disabled={!protocolDefinition.supportsOutputFormat}
+                onChange={(event) => updateParams({ outputFormat: event.target.value as ImageParams["outputFormat"] })}
+              >
+                <option value="png">PNG</option>
+                <option value="jpeg">JPEG</option>
+                <option value="webp">WebP</option>
+              </select>
+            </label>
+            <label title="生成失败时（5xx / 429 / 网络错误）自动重试的次数。范围 0–5，默认 2。">
+              <span>失败自动重试</span>
+              <input
+                type="number"
+                min={0}
+                max={5}
+                value={params.retryLimit}
+                onChange={(event) => updateParams({ retryLimit: Number(event.target.value) })}
+              />
+            </label>
+            <label>
+              <span>Seed</span>
+              <input value={params.seed} onChange={(event) => updateParams({ seed: event.target.value })} />
+            </label>
+          </div>
+          <div className="settings-section">
+            <label>
+              <span>负面提示词</span>
+              <textarea
+                value={params.negativePrompt}
+                rows={3}
+                onChange={(event) => updateParams({ negativePrompt: event.target.value })}
+                placeholder="不想出现的内容"
+              />
+            </label>
+          </div>
+        </details>
       </aside>
 
       {previewItem && (
@@ -8372,7 +8681,16 @@ function AdminApp({
   onOauthLogin: () => void;
 }) {
   const [user, setUser] = useState<AdminUserView | null>(null);
-  const [adminTab, setAdminTab] = useState<"overview" | "logs" | "config">("overview");
+  // Tab 状态进 URL（#admin / #admin/logs / #admin/config），可深链与刷新保持
+  const [adminTab, setAdminTab] = useState<"overview" | "logs" | "config">(() => {
+    if (window.location.hash.startsWith("#admin/logs")) return "logs";
+    if (window.location.hash.startsWith("#admin/config")) return "config";
+    return "overview";
+  });
+  const selectAdminTab = (tab: "overview" | "logs" | "config") => {
+    setAdminTab(tab);
+    window.location.hash = tab === "overview" ? "#admin" : `#admin/${tab}`;
+  };
   const [isChecking, setIsChecking] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [loginForm, setLoginForm] = useState({ username: "admin", password: "" });
@@ -8396,9 +8714,13 @@ function AdminApp({
   useEffect(() => {
     if (!user || user.mustChangePassword) return;
     void refreshDashboard();
-    const timer = window.setInterval(() => void refreshDashboard({ quiet: true }), 10_000);
+    const timer = window.setInterval(() => {
+      // 后台标签页不轮询，避免无人观看时每 10s 拉取大量日志
+      if (document.hidden) return;
+      void refreshDashboard({ quiet: true });
+    }, 10_000);
     return () => window.clearInterval(timer);
-  }, [user?.username, user?.mustChangePassword, logStatus, logQuery, logLimit]);
+  }, [user?.username, user?.mustChangePassword, logStatus, logQuery, logLimit, adminTab]);
 
   async function adminFetch<T>(path: string, init: RequestInit = {}) {
     const response = await fetch(`/api/admin${path}`, {
@@ -8537,22 +8859,27 @@ function AdminApp({
   async function refreshDashboard(options: { quiet?: boolean } = {}) {
     if (!options.quiet) setIsLoadingLogs(true);
     try {
+      // 按当前 Tab 拉取：概览只要 stats + 广场，日志 Tab 才拉日志，配置 Tab 自管不拉
+      const wantOverview = adminTab === "overview";
+      const wantLogs = adminTab === "logs";
       const query = new URLSearchParams();
       if (logStatus) query.set("status", logStatus);
       if (logQuery.trim()) query.set("q", logQuery.trim());
       query.set("limit", String(logLimit));
       const [statsPayload, logsPayload, squarePayload] = await Promise.all([
-        adminFetch<{ ok: true; stats: AdminStats }>("/stats"),
-        adminFetch<{ ok: true; logs: AdminRequestLog[]; total?: number }>(`/requests?${query.toString()}`),
-        squareAdminFetch<{ ok: true; overview: SquareAdminOverview }>("/overview"),
+        wantOverview ? adminFetch<{ ok: true; stats: AdminStats }>("/stats") : Promise.resolve(null),
+        wantLogs ? adminFetch<{ ok: true; logs: AdminRequestLog[]; total?: number }>(`/requests?${query.toString()}`) : Promise.resolve(null),
+        wantOverview ? squareAdminFetch<{ ok: true; overview: SquareAdminOverview }>("/overview") : Promise.resolve(null),
       ]);
-      setStats(statsPayload.stats);
-      setLogs(logsPayload.logs);
-      setLogTotal(logsPayload.total ?? logsPayload.logs.length);
-      setSquareOverview(squarePayload.overview);
-      setExpandedLogId((current) =>
-        logsPayload.logs.some((log) => log.requestId === current) ? current : "",
-      );
+      if (statsPayload) setStats(statsPayload.stats);
+      if (squarePayload) setSquareOverview(squarePayload.overview);
+      if (logsPayload) {
+        setLogs(logsPayload.logs);
+        setLogTotal(logsPayload.total ?? logsPayload.logs.length);
+        setExpandedLogId((current) =>
+          logsPayload.logs.some((log) => log.requestId === current) ? current : "",
+        );
+      }
     } catch (error) {
       setAdminError(formatError(error));
       if ((error as { mustChangePassword?: boolean })?.mustChangePassword) {
@@ -8727,9 +9054,9 @@ function AdminApp({
       </header>
 
       <nav className="admin-tabs">
-        <button type="button" className={adminTab === "overview" ? "active" : ""} onClick={() => setAdminTab("overview")}>概览</button>
-        <button type="button" className={adminTab === "logs" ? "active" : ""} onClick={() => setAdminTab("logs")}>请求日志</button>
-        <button type="button" className={adminTab === "config" ? "active" : ""} onClick={() => setAdminTab("config")}>接口配置</button>
+        <button type="button" className={adminTab === "overview" ? "active" : ""} onClick={() => selectAdminTab("overview")}>概览</button>
+        <button type="button" className={adminTab === "logs" ? "active" : ""} onClick={() => selectAdminTab("logs")}>请求日志</button>
+        <button type="button" className={adminTab === "config" ? "active" : ""} onClick={() => selectAdminTab("config")}>接口配置</button>
       </nav>
 
       {adminTab === "config" && <AdminConfigCenter />}
@@ -9044,7 +9371,13 @@ function AdminApp({
                                   rel="noreferrer"
                                   title={`${image.mime} · ${formatBytes(image.bytes)}`}
                                 >
-                                  <img src={`/api/images/local/${image.id}`} alt="生成图片" loading="lazy" />
+                                  {/* 列表用缩略图，点开 <a> 才取原图；老记录无 thumbId 时回退原图 */}
+                                  <img
+                                    src={`/api/images/local/${image.thumbId ?? image.id}`}
+                                    alt="生成图片"
+                                    loading="lazy"
+                                    decoding="async"
+                                  />
                                 </a>
                               ))}
                             </div>
@@ -9153,6 +9486,63 @@ function AdminJsonBlock({ title, value }: { title: string; value: unknown }) {
 // Canvas Page Component
 // ══════════════════════════════════════
 
+// 画布节点：memo 化 —— 拖拽/生成时只重渲染发生变化的节点（性能关键路径）
+type CanvasNodeHandlers = {
+  onNodePointerDown: (e: React.PointerEvent, node: CanvasNode) => void;
+  onNodeOptimize: (node: CanvasNode) => void;
+};
+
+const CanvasNodeView = memo(function CanvasNodeView({
+  node,
+  selected,
+  dragging,
+  handlersRef,
+}: {
+  node: CanvasNode;
+  selected: boolean;
+  dragging: boolean;
+  handlersRef: { current: CanvasNodeHandlers };
+}) {
+  return (
+    <div
+      className={`canvas-node ${node.status} ${selected ? "selected" : ""} ${dragging ? "dragging" : ""}`}
+      style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
+      onPointerDown={(e) => handlersRef.current.onNodePointerDown(e, node)}
+      onDoubleClick={() => {
+        if (node.status === "success") handlersRef.current.onNodeOptimize(node);
+      }}
+    >
+      {node.status === "success" && node.objectUrl && (
+        <img src={node.thumbUrl ?? node.objectUrl} alt="" draggable={false} className="canvas-node-image" />
+      )}
+      {node.status === "generating" && (
+        <div className="canvas-node-skeleton">
+          <Loader2 size={24} className="spin" />
+          <span>生成中...</span>
+        </div>
+      )}
+      {node.status === "error" && (
+        <div className="canvas-node-error-content">
+          <AlertCircle size={20} />
+          <span>{node.error || "生成失败"}</span>
+        </div>
+      )}
+      {node.status === "success" && (
+        <>
+          <span className="canvas-node-badge">{node.model}</span>
+          {node.duration != null && (
+            <span className="canvas-node-duration">{formatDuration(node.duration)}</span>
+          )}
+        </>
+      )}
+    </div>
+  );
+}, (prev, next) =>
+  prev.node === next.node &&
+  prev.selected === next.selected &&
+  prev.dragging === next.dragging
+);
+
 function CanvasPage({
   apiConfig,
   selectedModel: globalSelectedModel,
@@ -9202,11 +9592,54 @@ function CanvasPage({
   const edgesRef = useRef(canvasEdges);
   edgesRef.current = canvasEdges;
   const viewportRef = useRef(viewport);
-  viewportRef.current = viewport;
+  const transformLayerRef = useRef<HTMLDivElement | null>(null);
+  const viewportRafRef = useRef(0);
+  const wheelCommitTimerRef = useRef(0);
+
+  // 性能：平移/缩放手势期间直接写 DOM transform（零 React 重渲染），手势结束才提交 state
+  const applyViewportToDom = () => {
+    const vp = viewportRef.current;
+    const layer = transformLayerRef.current;
+    if (layer) {
+      layer.style.transform = `translate(${-vp.x * vp.zoom}px, ${-vp.y * vp.zoom}px) scale(${vp.zoom})`;
+    }
+    const el = containerRef.current;
+    if (el) {
+      if (vp.zoom < 0.25) {
+        el.style.backgroundImage = "none";
+      } else {
+        const spacing = vp.zoom < 0.5 ? 40 : 20;
+        const rendered = spacing * vp.zoom;
+        el.style.backgroundImage = `radial-gradient(circle, rgba(245, 244, 239, 0.2) ${Math.max(1, vp.zoom)}px, transparent ${Math.max(1, vp.zoom)}px)`;
+        el.style.backgroundSize = `${rendered}px ${rendered}px`;
+        el.style.backgroundPosition = `${(-vp.x * vp.zoom) % rendered}px ${(-vp.y * vp.zoom) % rendered}px`;
+      }
+    }
+  };
+  const scheduleViewportPaint = () => {
+    if (viewportRafRef.current) return;
+    viewportRafRef.current = requestAnimationFrame(() => {
+      viewportRafRef.current = 0;
+      applyViewportToDom();
+    });
+  };
+  useEffect(() => {
+    // 只有 state 提交时才同步 ref（避免手势中的后台重渲染把 ref 打回旧值）
+    viewportRef.current = viewport;
+    applyViewportToDom();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewport]);
+
   const isPanningRef = useRef(false);
   const isDraggingNodeRef = useRef(false);
   const panStartRef = useRef({ screenX: 0, screenY: 0, vpX: 0, vpY: 0 });
   const dragStartRef = useRef({ nodeId: "", startX: 0, startY: 0, screenX: 0, screenY: 0 });
+  // 节点事件经 ref 转发：memo 组件不因 handler 身份变化而重渲染，也不会捕获过期闭包
+  const canvasNodeHandlersRef = useRef<CanvasNodeHandlers>({ onNodePointerDown: () => {}, onNodeOptimize: () => {} });
+  canvasNodeHandlersRef.current = {
+    onNodePointerDown: (e, node) => handleNodePointerDown(e, node),
+    onNodeOptimize: (node) => void enterOptimizeMode(node),
+  };
   const saveTimerRef = useRef<number>(0);
   const toastTimerRef = useRef<number>(0);
 
@@ -9229,7 +9662,7 @@ function CanvasPage({
     window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = window.setTimeout(() => {
       const state: CanvasPersistedState = {
-        nodes: nodesRef.current.map(({ objectUrl: _objectUrl, ...rest }) => rest),
+        nodes: nodesRef.current.map(({ objectUrl: _objectUrl, thumbUrl: _thumbUrl, ...rest }) => rest),
         edges: edgesRef.current,
         viewport: viewportRef.current,
         lastSavedAt: Date.now(),
@@ -9247,10 +9680,16 @@ function CanvasPage({
         if (cancelled || !saved) { setCanvasLoaded(true); return; }
         const loadedNodes: CanvasNode[] = [];
         for (const node of saved.nodes) {
+          if (cancelled) break;
           if (node.status === "success") {
             const blob = await loadCanvasImageFromDB(node.id);
             if (blob) {
-              loadedNodes.push({ ...node, objectUrl: URL.createObjectURL(blob) });
+              const thumbBlob = await loadCanvasImageFromDB(canvasThumbKey(node.id));
+              loadedNodes.push({
+                ...node,
+                objectUrl: URL.createObjectURL(blob),
+                thumbUrl: thumbBlob ? URL.createObjectURL(thumbBlob) : undefined,
+              });
             } else {
               loadedNodes.push({ ...node, status: "error", error: "图片数据丢失" });
             }
@@ -9261,12 +9700,18 @@ function CanvasPage({
             loadedNodes.push(node);
           }
         }
-        if (!cancelled) {
-          setCanvasNodes(loadedNodes);
-          setCanvasEdges(saved.edges || []);
-          setViewport(saved.viewport || { x: 0, y: 0, zoom: 1 });
-          setCanvasLoaded(true);
+        if (cancelled) {
+          // 中途离开画布：已建好的 objectUrl / thumbUrl 不会进入 state，必须就地回收
+          loadedNodes.forEach((n) => {
+            if (n.objectUrl) URL.revokeObjectURL(n.objectUrl);
+            if (n.thumbUrl) URL.revokeObjectURL(n.thumbUrl);
+          });
+          return;
         }
+        setCanvasNodes(loadedNodes);
+        setCanvasEdges(saved.edges || []);
+        setViewport(saved.viewport || { x: 0, y: 0, zoom: 1 });
+        setCanvasLoaded(true);
       } catch {
         if (!cancelled) setCanvasLoaded(true);
       }
@@ -9277,7 +9722,10 @@ function CanvasPage({
   // ── Cleanup objectUrls on unmount ──
   useEffect(() => {
     return () => {
-      nodesRef.current.forEach((n) => { if (n.objectUrl) URL.revokeObjectURL(n.objectUrl); });
+      nodesRef.current.forEach((n) => {
+        if (n.objectUrl) URL.revokeObjectURL(n.objectUrl);
+        if (n.thumbUrl) URL.revokeObjectURL(n.thumbUrl);
+      });
     };
   }, []);
 
@@ -9285,7 +9733,7 @@ function CanvasPage({
   useEffect(() => {
     const handler = () => {
       const state: CanvasPersistedState = {
-        nodes: nodesRef.current.map(({ objectUrl: _objectUrl, ...rest }) => rest),
+        nodes: nodesRef.current.map(({ objectUrl: _objectUrl, thumbUrl: _thumbUrl, ...rest }) => rest),
         edges: edgesRef.current,
         viewport: viewportRef.current,
         lastSavedAt: Date.now(),
@@ -9382,25 +9830,30 @@ function CanvasPage({
       e.preventDefault();
       const vp = viewportRef.current;
       if (e.ctrlKey || e.metaKey) {
-        // Zoom
+        // Zoom —— 手势期间只写 ref + rAF 直绘，停止 140ms 后提交 state
         const factor = e.deltaY > 0 ? 1 / 1.08 : 1.08;
         const nz = clampZoomVal(vp.zoom * factor);
         const rect = el!.getBoundingClientRect();
         const cx = (e.clientX - rect.left) / vp.zoom + vp.x;
         const cy = (e.clientY - rect.top) / vp.zoom + vp.y;
-        setViewport({
+        viewportRef.current = {
           x: cx - (e.clientX - rect.left) / nz,
           y: cy - (e.clientY - rect.top) / nz,
           zoom: nz,
-        });
+        };
       } else {
         // Pan
-        setViewport({
+        viewportRef.current = {
           x: vp.x + e.deltaX / vp.zoom,
           y: vp.y + e.deltaY / vp.zoom,
           zoom: vp.zoom,
-        });
+        };
       }
+      scheduleViewportPaint();
+      window.clearTimeout(wheelCommitTimerRef.current);
+      wheelCommitTimerRef.current = window.setTimeout(() => {
+        setViewport({ ...viewportRef.current });
+      }, 140);
     }
 
     el.addEventListener("wheel", onWheel, { passive: false });
@@ -9423,6 +9876,7 @@ function CanvasPage({
     if (e.button === 1 || e.button === 2 || (e.button === 0 && isSpaceHeld)) {
       e.preventDefault();
       isPanningRef.current = true;
+      containerRef.current?.classList.add("is-panning");
       panStartRef.current = {
         screenX: e.clientX,
         screenY: e.clientY,
@@ -9447,11 +9901,12 @@ function CanvasPage({
     if (isPanningRef.current) {
       const ps = panStartRef.current;
       const vp = viewportRef.current;
-      setViewport({
+      viewportRef.current = {
         x: ps.vpX - (e.clientX - ps.screenX) / vp.zoom,
         y: ps.vpY - (e.clientY - ps.screenY) / vp.zoom,
         zoom: vp.zoom,
-      });
+      };
+      scheduleViewportPaint();
     }
   }
 
@@ -9462,6 +9917,9 @@ function CanvasPage({
     }
     if (isPanningRef.current) {
       isPanningRef.current = false;
+      containerRef.current?.classList.remove("is-panning");
+      // 手势结束提交 state，让 minimap/网格与 React 树同步
+      setViewport({ ...viewportRef.current });
     }
   }
 
@@ -9550,6 +10008,7 @@ function CanvasPage({
   function confirmDeleteNode(id: string) {
     const node = canvasNodes.find((n) => n.id === id);
     if (node?.objectUrl) URL.revokeObjectURL(node.objectUrl);
+    if (node?.thumbUrl) URL.revokeObjectURL(node.thumbUrl);
     setCanvasNodes((prev) => prev.filter((n) => n.id !== id));
     setCanvasEdges((prev) => prev.filter((edge) => edge.fromNodeId !== id && edge.toNodeId !== id));
     if (selectedNodeId === id) {
@@ -9562,6 +10021,7 @@ function CanvasPage({
     }
     setShowDeleteConfirm(null);
     void deleteCanvasImageFromDB(id);
+    void deleteCanvasImageFromDB(canvasThumbKey(id));
   }
 
   // ── Download node ──
@@ -9676,6 +10136,9 @@ function CanvasPage({
       const blob = await generatedImageToBlob(payload.images[0]);
       const objectUrl = URL.createObjectURL(blob);
       const { width, height } = await getImageSize(objectUrl);
+      // 画布节点用缩略图渲染：30 节点画布的位图内存从 ~500MB 降到 ~30MB
+      const thumb = await createListThumbnail(blob);
+      const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
       const duration = Date.now() - startedAt;
       const adjustedH = Math.round(nodeW * (height / width));
 
@@ -9684,6 +10147,7 @@ function CanvasPage({
           ...n,
           status: "success" as const,
           objectUrl,
+          thumbUrl,
           width: nodeW,
           height: adjustedH,
           imageWidth: width,
@@ -9692,6 +10156,7 @@ function CanvasPage({
         } : n
       ));
       await saveCanvasImageToDB(nodeId, blob);
+      if (thumb) await saveCanvasImageToDB(canvasThumbKey(nodeId), thumb.blob);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setCanvasNodes((prev) => prev.map((n) =>
@@ -9806,6 +10271,9 @@ function CanvasPage({
       const blob = await generatedImageToBlob(payload.images[0]);
       const objectUrl = URL.createObjectURL(blob);
       const { width, height } = await getImageSize(objectUrl);
+      // 画布节点用缩略图渲染：30 节点画布的位图内存从 ~500MB 降到 ~30MB
+      const thumb = await createListThumbnail(blob);
+      const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
       const duration = Date.now() - startedAt;
       const adjustedH = Math.round(nodeW * (height / width));
 
@@ -9814,6 +10282,7 @@ function CanvasPage({
           ...n,
           status: "success" as const,
           objectUrl,
+          thumbUrl,
           width: nodeW,
           height: adjustedH,
           imageWidth: width,
@@ -9822,6 +10291,7 @@ function CanvasPage({
         } : n
       ));
       await saveCanvasImageToDB(nodeId, blob);
+      if (thumb) await saveCanvasImageToDB(canvasThumbKey(nodeId), thumb.blob);
       // Auto-select new node for chaining
       setSelectedNodeId(nodeId);
     } catch (err) {
@@ -9890,6 +10360,9 @@ function CanvasPage({
       const blob = await generatedImageToBlob(payload.images[0]);
       const objectUrl = URL.createObjectURL(blob);
       const { width, height } = await getImageSize(objectUrl);
+      // 画布节点用缩略图渲染：30 节点画布的位图内存从 ~500MB 降到 ~30MB
+      const thumb = await createListThumbnail(blob);
+      const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
       const duration = Date.now() - startedAt;
       const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
       const adjustedH = Math.round(nodeW * (height / width));
@@ -9899,6 +10372,7 @@ function CanvasPage({
           ...n,
           status: "success" as const,
           objectUrl,
+          thumbUrl,
           width: nodeW,
           height: adjustedH,
           imageWidth: width,
@@ -9908,6 +10382,7 @@ function CanvasPage({
         } : n
       ));
       await saveCanvasImageToDB(node.id, blob);
+      if (thumb) await saveCanvasImageToDB(canvasThumbKey(node.id), thumb.blob);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setCanvasNodes((prev) => prev.map((n) =>
@@ -9974,7 +10449,7 @@ function CanvasPage({
     const ox = (-viewport.x * viewport.zoom) % rendered;
     const oy = (-viewport.y * viewport.zoom) % rendered;
     return {
-      backgroundImage: `radial-gradient(circle, #e5e5e5 ${Math.max(1, viewport.zoom)}px, transparent ${Math.max(1, viewport.zoom)}px)`,
+      backgroundImage: `radial-gradient(circle, rgba(245, 244, 239, 0.2) ${Math.max(1, viewport.zoom)}px, transparent ${Math.max(1, viewport.zoom)}px)`,
       backgroundSize: `${rendered}px ${rendered}px`,
       backgroundPosition: `${ox}px ${oy}px`,
     };
@@ -10018,7 +10493,7 @@ function CanvasPage({
 
       {/* Canvas viewport */}
       <div
-        className={`canvas-viewport ${isSpaceHeld ? "is-space-held" : ""} ${isPanningRef.current ? "is-panning" : ""}`}
+        className={`canvas-viewport ${isSpaceHeld ? "is-space-held" : ""}`}
         ref={containerRef}
         onPointerDown={handleCanvasPointerDown}
         onPointerMove={handleCanvasPointerMove}
@@ -10026,9 +10501,10 @@ function CanvasPage({
         onContextMenu={handleContextMenu}
         style={gridStyle}
       >
-        {/* Transform layer */}
+        {/* Transform layer —— 手势期间由 applyViewportToDom 直接驱动 */}
         <div
           className="canvas-transform-layer"
+          ref={transformLayerRef}
           style={{
             transform: `translate(${-viewport.x * viewport.zoom}px, ${-viewport.y * viewport.zoom}px) scale(${viewport.zoom})`,
           }}
@@ -10060,46 +10536,15 @@ function CanvasPage({
             })}
           </svg>
 
-          {/* Nodes */}
+          {/* Nodes —— memo 化，拖拽时只重渲染被拖节点 */}
           {canvasNodes.map((node) => (
-            <div
+            <CanvasNodeView
               key={node.id}
-              className={`canvas-node ${node.status} ${selectedNodeId === node.id ? "selected" : ""} ${isDraggingNodeRef.current && dragStartRef.current.nodeId === node.id ? "dragging" : ""}`}
-              style={{
-                left: node.x,
-                top: node.y,
-                width: node.width,
-                height: node.height,
-              }}
-              onPointerDown={(e) => handleNodePointerDown(e, node)}
-              onDoubleClick={() => {
-                if (node.status === "success") void enterOptimizeMode(node);
-              }}
-            >
-              {node.status === "success" && node.objectUrl && (
-                <img src={node.objectUrl} alt="" draggable={false} className="canvas-node-image" />
-              )}
-              {node.status === "generating" && (
-                <div className="canvas-node-skeleton">
-                  <Loader2 size={24} className="spin" />
-                  <span>生成中...</span>
-                </div>
-              )}
-              {node.status === "error" && (
-                <div className="canvas-node-error-content">
-                  <AlertCircle size={20} />
-                  <span>{node.error || "生成失败"}</span>
-                </div>
-              )}
-              {node.status === "success" && (
-                <>
-                  <span className="canvas-node-badge">{node.model}</span>
-                  {node.duration != null && (
-                    <span className="canvas-node-duration">{formatDuration(node.duration)}</span>
-                  )}
-                </>
-              )}
-            </div>
+              node={node}
+              selected={selectedNodeId === node.id}
+              dragging={isDraggingNodeRef.current && dragStartRef.current.nodeId === node.id}
+              handlersRef={canvasNodeHandlersRef}
+            />
           ))}
         </div>
 
@@ -10518,225 +10963,276 @@ function CanvasPage({
   );
 }
 
-function HomePage({ onEnter, onSquare, onAdmin, onCanvas, oauthUser, onOauthLogout }: {
+const HOME_FEED_TABS: Array<{ value: SquareFeedTab; label: string }> = [
+  { value: "hot", label: "热门" },
+  { value: "latest", label: "最新" },
+  { value: "top_week", label: "本周" },
+  { value: "top_month", label: "本月" },
+];
+
+function HomePage({
+  onEnter,
+  onSquare,
+  onAdmin,
+  onCanvas,
+  oauthUser,
+  onOauthLogout,
+  oauthEnabled,
+  onOauthLogin,
+  homePrompt,
+  onHomePromptChange,
+  onHomeSubmit,
+  models,
+  modelStats,
+  selectedModel,
+  onSelectModel,
+  recentRecords,
+  hasApiKey,
+}: {
   onEnter: () => void; onSquare: () => void; onAdmin: () => void; onCanvas: () => void;
   oauthUser: { sub: string; username: string; displayName: string; email: string; role: number; group: string } | null;
   onOauthLogout: () => void;
+  oauthEnabled: boolean;
+  onOauthLogin: () => void;
+  homePrompt: string;
+  onHomePromptChange: (value: string) => void;
+  onHomeSubmit: () => void;
+  models: string[];
+  modelStats: Record<string, ModelStat>;
+  selectedModel: string;
+  onSelectModel: (model: string) => void;
+  recentRecords: HistoryRecord[];
+  hasApiKey: boolean;
 }) {
-  const featureBands = [
-    {
-      title: "统一记录流",
-      body: "所有生成任务按时间自然归档，最新作品永远在最前。灵感、失败、重试和成片不再散落在不同页面。",
-    },
-    {
-      title: "发送前智能分析",
-      body: "在真正消耗生图额度前，先检查提示词风险、参数匹配度和可能失败的环节，再把建议交还给创作者决定。",
-    },
-    {
-      title: "本地图库资产",
-      body: "图片、参数、提示词和错误详情保存在当前浏览器本地。作品属于你的工作台，不被服务端额外留存。",
-    },
-  ];
-  const metrics = [
-    { value: "20/页", label: "按需懒加载" },
-    { value: "并行队列", label: "生成中继续提交" },
-    { value: "本地优先", label: "IndexedDB 保存" },
-  ];
-  const detailItems = [
-    "提示词优化、风格增强、失败预判和参数推荐被收进同一个发送流程。",
-    "左右侧栏可收起，主画布为图片记录让出更多空间。",
-    "多选、全选已显示、反选、批量下载和清除失败，让图库管理更接近专业素材库。",
-  ];
-  const scrollToSection = (sectionId: string) => {
-    document.getElementById(sectionId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  const [feedTab, setFeedTab] = useState<SquareFeedTab>("hot");
+  const [feedItems, setFeedItems] = useState<SquareFeedItem[]>([]);
+  const [feedLoading, setFeedLoading] = useState(true);
+  const promptRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // 灵感发现：/api/square/feed 匿名可用，首页只拉一页（20 条足够铺满两屏）
+  useEffect(() => {
+    let cancelled = false;
+    setFeedLoading(true);
+    fetch(`/api/square/feed?tab=${feedTab}&limit=20`, { credentials: "same-origin" })
+      .then((res) => res.json())
+      .then((data: SquareFeedResponse) => {
+        if (cancelled) return;
+        setFeedItems(Array.isArray(data?.items) ? data.items : []);
+      })
+      .catch(() => {
+        if (!cancelled) setFeedItems([]);
+      })
+      .finally(() => {
+        if (!cancelled) setFeedLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [feedTab]);
+
+  const focusPrompt = () => {
+    promptRef.current?.focus();
+    promptRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   };
+
+  const agents = runtimeIndustryAgents.slice(0, 6);
+  const recent = recentRecords.filter((record) => record.thumbUrl || record.objectUrl).slice(0, 8);
+  const showLoginHint = oauthEnabled && !oauthUser && !hasApiKey;
 
   return (
     <main className="home-page">
-      <section
-        className="home-hero"
-        style={{
-          backgroundImage: `linear-gradient(90deg, rgba(247, 247, 245, 0.96) 0%, rgba(247, 247, 245, 0.84) 34%, rgba(247, 247, 245, 0.1) 72%), url(${homeHeroImage})`,
-        }}
-      >
-        <img className="home-hero-logo" src={imageStudioLogo} alt="" aria-hidden="true" />
-        <nav className="home-nav">
-          <div className="home-brand">
-            <span>
-              <img src={imageStudioLogo} alt="" />
-            </span>
-            <strong>Image Studio</strong>
-          </div>
-          <div className="home-nav-links" aria-label="首页导航">
-            <button type="button" onClick={() => scrollToSection("home-product")}>
-              工作台
-            </button>
-            <button type="button" onClick={() => scrollToSection("home-analysis")}>
-              智能分析
-            </button>
-            <button type="button" onClick={() => scrollToSection("home-agents")}>
-              行业 Agent
-            </button>
-            <button type="button" onClick={onSquare}>
-              广场
-            </button>
-            <button type="button" onClick={onCanvas}>
-              画布
-            </button>
-            <button type="button" onClick={() => scrollToSection("home-local")}>
-              本地优先
-            </button>
-          </div>
-          <div className="home-nav-actions">
-            <button type="button" className="home-nav-action" onClick={onEnter}>
-              打开工作台
-            </button>
-            <button type="button" className="home-nav-action" onClick={onSquare}>
-              进入广场
-            </button>
-            <button type="button" className="home-nav-action" onClick={onCanvas}>
-              画布模式
-            </button>
-            <button type="button" className="home-admin-link" onClick={onAdmin}>
-              <ShieldCheck size={16} />
-              管理后台
-            </button>
-            {oauthUser && (
-              <div className="oauth-user-info">
-                <User size={16} />
-                <span className="oauth-user-name">{oauthUser.displayName || oauthUser.username}</span>
-                <button type="button" className="oauth-logout-btn" onClick={onOauthLogout}>退出</button>
-              </div>
-            )}
-          </div>
-        </nav>
+      {showLoginHint && (
+        <div className="home-statusbar">
+          <span>登录太极 AI 账号即可直接开始，无需手动填写 API Key。</span>
+          <button type="button" onClick={onOauthLogin}>
+            登录
+          </button>
+        </div>
+      )}
 
-        <div className="home-hero-copy">
-          <span className="home-kicker">AI image workspace</span>
-          <h1>Image Studio</h1>
-          <p>
-            从一句提示词，到一组可复用的视觉资产。把智能分析、批量生成、并行队列和本地图库，放进一个安静、清晰、反应迅速的创作空间。
-          </p>
-          <div className="home-hero-actions">
-            <button type="button" className="home-primary" onClick={onEnter}>
-              开始生成
-              <ArrowRight size={18} />
-            </button>
-            <button type="button" className="home-secondary" onClick={() => scrollToSection("home-flow")}>
-              了解流程
-            </button>
-            <button type="button" className="home-secondary" onClick={onSquare}>
-              浏览广场
-            </button>
-            <button type="button" className="home-secondary" onClick={onCanvas}>
-              画布模式
-            </button>
-          </div>
-          <div className="home-metric-row" aria-label="产品能力摘要">
-            {metrics.map((metric) => (
-              <div className="home-metric" key={metric.label}>
-                <strong>{metric.value}</strong>
-                <span>{metric.label}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      <section className="home-flow" id="home-flow">
-        <div className="home-section-copy">
-          <span className="home-kicker">Built for creation</span>
-          <h2>一个屏幕，完成从构思到归档。</h2>
-          <p>
-            首页不再只是入口，而是产品能力的缩影：先让用户看到真实工作台，再用更少的文字说明它为什么值得信任。
-          </p>
-        </div>
-        <div className="home-feature-grid">
-          {featureBands.map((feature) => (
-            <article className="home-feature" key={feature.title}>
-              <strong>{feature.title}</strong>
-              <p>{feature.body}</p>
-            </article>
-          ))}
-        </div>
-      </section>
-
-      <section className="home-product-showcase" id="home-product">
-        <div className="home-showcase-copy">
-          <span className="home-kicker">Studio overview</span>
-          <h2>让生成记录，成为可以继续工作的画布。</h2>
-          <p>
-            中间区域统一展示全部生成记录，左侧保留最近记录入口，右侧承载配置。用户可以在生成中继续提交新批次，让探索过程保持连续。
-          </p>
-        </div>
-        <figure className="home-preview-frame home-preview-frame-wide">
-          <img src={homeStudioPreview} alt="Image Studio 工作台截图，展示生成记录流、左侧历史和右侧配置面板" />
-        </figure>
-      </section>
-
-      <section className="home-analysis-showcase" id="home-analysis">
-        <div className="home-analysis-media">
-          <img src={homePromptPreview} alt="Image Studio 提示词输入和预设提示词截图" />
-        </div>
-        <div className="home-showcase-copy">
-          <span className="home-kicker">Prompt intelligence</span>
-          <h2>发送之前，先把想法打磨到更接近成片。</h2>
-          <p>
-            默认开启自动优化。系统会在提交前分析提示词、推荐参数、预判失败原因，并把风格增强建议收束成可执行的生成方案。
-          </p>
-          <ul className="home-detail-list">
-            {detailItems.map((item) => (
-              <li key={item}>
-                <CheckCircle2 size={17} />
-                <span>{item}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      </section>
-
-      <section className="home-agent-section" id="home-agents">
-        <div className="home-section-copy">
-          <span className="home-kicker">Industry agents</span>
-          <h2>不是模板，是为行业准备的生图流程。</h2>
-          <p>
-            选择一个行业 Agent，填写业务目标，系统会自动补全 Brief、生成三套提示词、推荐比例和负面提示词，再进入发送前分析与批量生成。
-          </p>
-        </div>
-        <div className="home-agent-grid">
-          {runtimeIndustryAgents.slice(0, 6).map((agent) => (
-            <article className="home-agent-card" key={agent.id}>
-              <div>
-                <span>{agent.icon}</span>
-                <strong>{agent.name}</strong>
-              </div>
-              <p>{agent.description}</p>
-              <small>{agent.scenario}</small>
-              <button type="button" onClick={onEnter}>
-                进入工作台
-                <ArrowRight size={15} />
-              </button>
-            </article>
-          ))}
-        </div>
-      </section>
-
-      <section className="home-insight" id="home-local">
-        <div>
-          <span className="home-kicker">Private by design</span>
-          <h2>作品留在本地。创作更安心。</h2>
-        </div>
-        <p>
-          生成图片和历史仅保存到当前浏览器本地，服务端只做无状态协议转发。你可以批量下载、清理失败记录，也可以在下一次打开时继续查看自己的素材库。
-        </p>
-        <button type="button" className="home-primary dark" onClick={onEnter}>
-          进入工作台
-          <ArrowRight size={18} />
+      <header className="home-topbar">
+        <button type="button" className="home-brand" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}>
+          <img src={imageStudioLogo} alt="" aria-hidden="true" />
+          <strong>Image Studio</strong>
         </button>
+        <nav className="home-topnav" aria-label="主导航">
+          <button type="button" onClick={onEnter}>工作台</button>
+          <button type="button" onClick={onCanvas}>画布</button>
+          <button type="button" onClick={onSquare}>广场</button>
+        </nav>
+        <div className="home-topbar-end">
+          {oauthUser ? (
+            <div className="home-account">
+              <User size={15} />
+              <span>{oauthUser.displayName || oauthUser.username}</span>
+              <button type="button" onClick={onOauthLogout}>退出</button>
+            </div>
+          ) : oauthEnabled ? (
+            <button type="button" className="home-login" onClick={onOauthLogin}>
+              登录
+            </button>
+          ) : null}
+          <button type="button" className="home-admin-icon" onClick={onAdmin} aria-label="管理后台" title="管理后台">
+            <ShieldCheck size={16} />
+          </button>
+        </div>
+      </header>
+
+      <section className="home-hero">
+        <h1>Image Studio</h1>
+        <p className="home-hero-sub">一句提示词，一组可复用的视觉资产。</p>
+
+        <div className="home-composer">
+          <textarea
+            ref={promptRef}
+            value={homePrompt}
+            onChange={(event) => onHomePromptChange(event.target.value)}
+            onKeyDown={(event) => {
+              // 中文/日文输入法选词时的回车属于组合态，必须放行，否则会用半截拼音提前提交
+              if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                onHomeSubmit();
+              }
+            }}
+            placeholder="描述你想生成的图片，例如：温暖木质感的咖啡厅菜单海报"
+            rows={3}
+          />
+          <div className="home-composer-bar">
+            <button type="button" className="home-composer-attach" onClick={onEnter} aria-label="添加参考图" title="在工作台添加参考图">
+              <ImagePlus size={17} />
+            </button>
+            <button
+              type="button"
+              className="home-composer-send"
+              onClick={onHomeSubmit}
+              disabled={!homePrompt.trim()}
+              aria-label="开始生成"
+            >
+              <ArrowUp size={18} />
+            </button>
+          </div>
+        </div>
+
+        <div className="home-chips" role="group" aria-label="模型与场景">
+          {models.slice(0, 4).map((model) => {
+            const stat = modelStats[normalizedModelId(model)];
+            const active = normalizedModelId(model) === normalizedModelId(selectedModel);
+            return (
+              <button
+                type="button"
+                key={model}
+                className={`home-chip${active ? " is-active" : ""}`}
+                onClick={() => onSelectModel(model)}
+              >
+                {runtimeModelDisplayName(model)}
+                {stat && stat.samples >= 3 && <em>· {stat.successRate}%</em>}
+              </button>
+            );
+          })}
+          {agents.length > 0 && <span className="home-chip-divider" aria-hidden="true" />}
+          {agents.map((agent) => (
+            <button
+              type="button"
+              key={agent.id}
+              className="home-chip home-chip-agent"
+              onClick={() => {
+                onHomePromptChange(agent.scenario);
+                focusPrompt();
+              }}
+              title={agent.description}
+            >
+              <span aria-hidden="true">{agent.icon}</span>
+              {agent.name}
+            </button>
+          ))}
+        </div>
       </section>
+
+      {recent.length > 0 && (
+        <section className="home-recent">
+          <div className="home-section-head">
+            <h2>最近生成</h2>
+            <button type="button" onClick={onEnter}>
+              查看全部
+              <ChevronRight size={15} />
+            </button>
+          </div>
+          <div className="home-recent-row">
+            <button type="button" className="home-recent-new" onClick={focusPrompt}>
+              <Plus size={18} />
+              <span>新建生成</span>
+            </button>
+            {recent.map((record) => (
+              <button type="button" className="home-recent-card" key={record.id} onClick={onEnter} title={record.prompt}>
+                <img src={record.thumbUrl ?? record.objectUrl} alt="" loading="lazy" decoding="async" />
+                <span>{record.prompt.slice(0, 18)}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section className="home-inspire">
+        <div className="home-section-head">
+          <h2>灵感发现</h2>
+          <button type="button" onClick={onSquare}>
+            进入广场
+            <ChevronRight size={15} />
+          </button>
+        </div>
+        <div className="home-inspire-tabs" role="group" aria-label="灵感分类">
+          {HOME_FEED_TABS.map((tab) => (
+            <button
+              type="button"
+              key={tab.value}
+              className={`home-chip${feedTab === tab.value ? " is-active" : ""}`}
+              onClick={() => setFeedTab(tab.value)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+        {feedLoading ? (
+          <div className="home-inspire-empty">正在加载灵感…</div>
+        ) : feedItems.length === 0 ? (
+          <div className="home-inspire-empty">还没有作品被推荐到广场，去生成第一张吧。</div>
+        ) : (
+          <div className="home-masonry">
+            {feedItems.map((item) => (
+              <button type="button" className="home-masonry-item" key={item.id} onClick={onSquare} title={item.prompt}>
+                <img
+                  src={item.thumbnailUrl}
+                  alt=""
+                  loading="lazy"
+                  style={{ aspectRatio: item.width && item.height ? `${item.width} / ${item.height}` : "1 / 1" }}
+                />
+                <span className="home-masonry-meta">
+                  <span>{item.recommenderLabel || "匿名创作者"}</span>
+                  <span className="home-masonry-like">
+                    <Heart size={12} />
+                    {item.likeCount}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <footer className="home-footer">
+        <span>本地优先 · 图片与历史保存在当前浏览器，服务端仅保留一份供后台回看</span>
+        <span className="home-footer-meta">
+          <span>v{CURRENT_FRONTEND_VERSION}</span>
+          <a href="https://github.com/d100000/ImageHub" target="_blank" rel="noreferrer noopener">
+            GitHub
+          </a>
+        </span>
+      </footer>
     </main>
   );
 }
+
 
 function SquarePage({
   apiKey,
@@ -11203,7 +11699,7 @@ function OnboardingGuide({
     {
       target: "api",
       title: "连接你的生图服务",
-      body: "先在右侧配置里选择服务地址并填入 API Key。地址已被限制为两个固定入口，避免请求落到未知服务。",
+      body: "先在右侧配置里选择服务地址并填入 API Key。可用地址由管理后台统一配置，避免请求落到未知服务。",
       status: apiKeyReady ? "API Key 已填写" : "等待填写 API Key",
     },
     {
@@ -11341,6 +11837,51 @@ function OnboardingGuide({
   );
 }
 
+// 签名元素：生成链路脉冲线 —— 段宽 = 各环节真实耗时占比（接收→上游生成→落盘→返回），
+// 失败时停在断掉的那一段并转红；运行中为品牌色流光。结构装置编码真实信息，非装饰。
+function JobPulseLine({ status, stages }: { status: JobStatus; stages?: JobStages }) {
+  if (status === "queued") return null;
+  if (status === "running") {
+    return (
+      <div className="pulse-line running" aria-hidden="true">
+        <span />
+      </div>
+    );
+  }
+  const s = stages;
+  if (!s?.receivedAt || !s.upstreamRequestedAt) {
+    return status === "error" ? (
+      <div className="pulse-line" aria-hidden="true"><span className="err" style={{ flexGrow: 1 }} /></div>
+    ) : null;
+  }
+  const segments: Array<{ key: string; label: string; ms: number | null }> = [
+    { key: "recv", label: "接收→请求上游", ms: s.upstreamRequestedAt - s.receivedAt },
+    { key: "gen", label: "上游生成", ms: s.upstreamRespondedAt ? s.upstreamRespondedAt - s.upstreamRequestedAt : null },
+    { key: "save", label: "图片落盘", ms: s.imageSavedAt && s.upstreamRespondedAt ? s.imageSavedAt - s.upstreamRespondedAt : null },
+    { key: "ret", label: "返回", ms: s.returnedAt && s.imageSavedAt ? s.returnedAt - s.imageSavedAt : null },
+  ];
+  const failedIndex = status === "error" ? segments.findIndex((seg) => seg.ms === null) : -1;
+  const title = segments
+    .filter((seg) => seg.ms !== null)
+    .map((seg) => `${seg.label} ${formatCompactDuration(seg.ms || 0)}`)
+    .join(" · ");
+  return (
+    <div className={`pulse-line ${status === "error" ? "failed" : "done"}`} title={`生成链路：${title}`}>
+      {segments.map((seg, index) => {
+        if (seg.ms === null && index !== failedIndex) return null;
+        const isFailed = index === failedIndex || (status === "error" && index === segments.length - 1 && failedIndex === -1);
+        return (
+          <span
+            key={seg.key}
+            className={isFailed ? "err" : ""}
+            style={{ flexGrow: Math.max(seg.ms ?? 120, 40) }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
 const JobCard = memo(function JobCard({
   job,
   highlighted,
@@ -11414,7 +11955,8 @@ const JobCard = memo(function JobCard({
         )}
         {job.status === "success" && job.imageUrl && (
           <button type="button" className="preview-button" onClick={onPreview} title="预览图片">
-            <img src={job.imageUrl} alt="" loading="lazy" decoding="async" />
+            {/* 列表用缩略图；无缩略图的老记录回退原图，不会白屏 */}
+            <img src={job.thumbUrl ?? job.imageUrl} alt="" loading="lazy" decoding="async" />
             <span>
               <Maximize2 size={16} />
             </span>
@@ -11551,6 +12093,8 @@ const JobCard = memo(function JobCard({
             )}
           </div>
         </div>
+
+        <JobPulseLine status={job.status} stages={job.stages} />
       </div>
     </article>
   );
@@ -12103,8 +12647,22 @@ function ImagePreviewModal({
   canRecommend: boolean;
 }) {
   const [isFullscreen, setIsFullscreen] = useState(false);
+  // 原图加载三态：loading 期间用缩略图作底但必须有可见的加载提示；error 时清掉缩略图并明确报错
+  const [fullImageState, setFullImageState] = useState<"loading" | "ready" | "error">("loading");
+  const [fullImageAttempt, setFullImageAttempt] = useState(0);
   const previewClass = aspectClass(item.width, item.height, item.params.aspectRatio);
   const hasImage = Boolean(item.url);
+  const fullImageFail = item.url
+    ? { title: "原图加载失败", hint: "可能是网络问题，或图片已被服务器清理。", canRetry: true }
+    : { title: "本地图片数据已丢失", hint: "可能是浏览器清理了存储空间。", canRetry: false };
+  const retryFullImage = () => {
+    setFullImageState("loading");
+    setFullImageAttempt((n) => n + 1);
+  };
+  useEffect(() => {
+    setFullImageState("loading");
+    setFullImageAttempt(0);
+  }, [item.id, item.url]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
@@ -12123,14 +12681,40 @@ function ImagePreviewModal({
       <button className="preview-backdrop" type="button" aria-label="关闭预览" onClick={onClose} />
       <div className={`preview-shell ${isFullscreen ? "is-fullscreen" : ""}`}>
         <div className={`preview-stage ${hasImage ? previewClass : "is-error-detail"}`}>
-          {hasImage ? (
+          {hasImage && fullImageState === "error" ? (
+            // 原图不可用：明确报错，绝不用缩略图充数（生图工具靠原图判断成片质量）
+            <div className="preview-error-frame">
+              <AlertCircle size={30} />
+              <strong>{fullImageFail.title}</strong>
+              <span>{fullImageFail.hint}</span>
+              {fullImageFail.canRetry && (
+                <button type="button" className="subtle-button" onClick={retryFullImage}>
+                  <RefreshCw size={15} />
+                  重试
+                </button>
+              )}
+              {item.requestId && <code>requestID: {item.requestId}</code>}
+            </div>
+          ) : hasImage ? (
             <button
               type="button"
-              className="preview-image-frame"
+              className={`preview-image-frame${fullImageState === "loading" ? " is-loading-full" : ""}`}
               title={isFullscreen ? "退出全屏查看" : "全屏查看图片"}
               onClick={() => setIsFullscreen((value) => !value)}
             >
-              <img src={item.url} alt="" />
+              <img
+                key={fullImageAttempt}
+                src={item.url}
+                alt=""
+                onLoad={() => setFullImageState("ready")}
+                onError={() => setFullImageState("error")}
+              />
+              {fullImageState === "loading" && (
+                <span className="preview-loading-hint">
+                  <Loader2 size={14} className="spin" />
+                  正在加载原图…
+                </span>
+              )}
             </button>
           ) : (
             <div className="preview-error-frame">

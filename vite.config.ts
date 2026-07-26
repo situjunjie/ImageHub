@@ -149,6 +149,10 @@ type SavedImageMeta = {
   id: string;
   mime: string;
   bytes: number;
+  // 列表缩略图（客户端生成后随生成请求回传）。绝不能作为 savedImages 的新数组元素，
+  // 否则 image_count 列与 daily_stats.images 会把缩略图当成额外生成的图片重复计数。
+  thumbId?: string;
+  thumbBytes?: number;
 };
 
 type RequestStages = {
@@ -544,11 +548,16 @@ function ensureSquareStore() {
   }
 }
 
+// 内存缓存（与 configStoreCache 同模式）：首页灵感流一次访问会打 1 次 feed + 20 次缩略图，
+// 每次都全量 JSON.parse 这个可达数 MB 的文件，缓存后只在写入时失效。
+let squareStoreCache: SquareStore | null = null;
+
 function readSquareStore(): SquareStore {
+  if (squareStoreCache) return squareStoreCache;
   ensureSquareStore();
   try {
     const parsed = JSON.parse(readFileSync(SQUARE_STORE_PATH, "utf8"));
-    return {
+    const store: SquareStore = {
       ...emptySquareStore(),
       ...parsed,
       items: Array.isArray(parsed.items) ? parsed.items : [],
@@ -558,6 +567,8 @@ function readSquareStore(): SquareStore {
       quotas: Array.isArray(parsed.quotas) ? parsed.quotas : [],
       moderationAudits: Array.isArray(parsed.moderationAudits) ? parsed.moderationAudits : [],
     };
+    squareStoreCache = store;
+    return store;
   } catch {
     return emptySquareStore();
   }
@@ -572,6 +583,7 @@ function writeSquareStore(store: SquareStore) {
   store.quotas = store.quotas.slice(0, 5000);
   store.moderationAudits = store.moderationAudits.slice(0, 5000);
   writeFileSync(SQUARE_STORE_PATH, JSON.stringify(store, null, 2));
+  squareStoreCache = store;
 }
 
 function appendAuditLog(username: string, action: string, detail?: string) {
@@ -1015,7 +1027,7 @@ function sanitizeUserDir(value: string): string {
 
 // 图片按 <用户目录>/<生成ID>-<序号>.<ext> 存储，用户目录取自 OAuth 用户名或 clientId
 function persistGeneratedImages(
-  images: Array<{ dataUrl: string; revisedPrompt?: string }>,
+  images: Array<{ dataUrl: string; revisedPrompt?: string; thumbnailDataUrl?: string }>,
   options: { userDir: string; requestId: string },
 ) {
   const saved: SavedImageMeta[] = [];
@@ -1034,7 +1046,27 @@ function persistGeneratedImages(
       const fileName = images.length > 1 ? `${options.requestId}-${index}.${ext}` : `${options.requestId}.${ext}`;
       const relativePath = `${userDir}/${fileName}`;
       writeFileSync(join(LOCAL_IMAGE_DIR, userDir, fileName), buffer);
-      saved.push({ id: relativePath, mime: IMAGE_EXT_MIME[ext] || mime, bytes: buffer.length });
+      const meta: SavedImageMeta = { id: relativePath, mime: IMAGE_EXT_MIME[ext] || mime, bytes: buffer.length };
+      // 缩略图与原图同级目录、`-thumb` 后缀：单层路径才能通过 LOCAL_IMAGE_PATH_PATTERN，
+      // 也才能被 userDiskLimitMB 的非递归 readdirSync 统计到
+      const thumbMatch = image.thumbnailDataUrl
+        ? /^data:(image\/[a-zA-Z+.-]+);base64,(.*)$/.exec(image.thumbnailDataUrl)
+        : null;
+      if (thumbMatch) {
+        try {
+          const thumbExt = IMAGE_MIME_EXT[thumbMatch[1].toLowerCase()] || "webp";
+          const thumbBuffer = Buffer.from(thumbMatch[2].replace(/\s+/g, ""), "base64");
+          const thumbName = images.length > 1
+            ? `${options.requestId}-${index}-thumb.${thumbExt}`
+            : `${options.requestId}-thumb.${thumbExt}`;
+          writeFileSync(join(LOCAL_IMAGE_DIR, userDir, thumbName), thumbBuffer);
+          meta.thumbId = `${userDir}/${thumbName}`;
+          meta.thumbBytes = thumbBuffer.length;
+        } catch {
+          // 缩略图失败不影响原图落盘，前端会回退原图
+        }
+      }
+      saved.push(meta);
       return { url: `${LOCAL_IMAGE_URL_PREFIX}${relativePath}`, revisedPrompt: image.revisedPrompt };
     } catch {
       return { dataUrl: image.dataUrl, revisedPrompt: image.revisedPrompt };
@@ -1046,11 +1078,14 @@ function persistGeneratedImages(
 function deleteSavedImages(saved?: SavedImageMeta[]) {
   if (!Array.isArray(saved)) return;
   for (const image of saved) {
-    if (!image || typeof image.id !== "string" || !LOCAL_IMAGE_PATH_PATTERN.test(image.id) || image.id.includes("..")) continue;
-    try {
-      unlinkSync(join(LOCAL_IMAGE_DIR, image.id));
-    } catch {
-      // 文件可能已被清理，忽略
+    if (!image) continue;
+    for (const id of [image.id, image.thumbId]) {
+      if (typeof id !== "string" || !LOCAL_IMAGE_PATH_PATTERN.test(id) || id.includes("..")) continue;
+      try {
+        unlinkSync(join(LOCAL_IMAGE_DIR, id));
+      } catch {
+        // 文件可能已被清理，忽略
+      }
     }
   }
 }
@@ -1121,6 +1156,7 @@ function safeErrorSummary(detail: unknown) {
 
 // ── SQLite 请求/生成记录存储 ──
 const REQUEST_LOG_LIMIT = 5000;
+const THUMBNAIL_MAX_BYTES = 512 * 1024;
 let sqliteDb: Database.Database | null = null;
 
 function getDb(): Database.Database {
@@ -4014,6 +4050,75 @@ export function registerApiRoutes(app: ApiApp) {
       });
 
       // 生成结果反馈：rating 1 好评 / -1 差评 / 0 清除
+      // 缩略图回传：缩略图必须等原图生成完才能做，所以无法在生成请求里带上，需要这条独立通道。
+      // 与 /api/feedback 同为公开端点：只允许给已存在的记录补缩略图，不能凭空创建文件。
+      app.use("/api/images/thumb", async (req, res) => {
+        if (req.method !== "POST") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        try {
+          const body = await readJsonBody(req);
+          const requestId = getString(body, "requestId");
+          const index = Math.max(0, Math.floor(Number(body.index) || 0));
+          const dataUrl = getString(body, "thumbnailDataUrl");
+          const match = /^data:(image\/[a-zA-Z+.-]+);base64,(.*)$/.exec(dataUrl);
+          if (!requestId || !match) {
+            sendJson(res, 400, { ok: false, error: "参数不合法" });
+            return;
+          }
+          const log = readRequestLogRecord(requestId);
+          const savedImages = log?.savedImages;
+          const target = savedImages?.[index];
+          if (!log || !target) {
+            sendJson(res, 404, { ok: false, error: "请求记录或图片不存在" });
+            return;
+          }
+          // 必须是这条生成记录的发起方本人。否则只要拿到 requestId（广场 feed 就会返回它），
+          // 任何人都能往别人的图片目录写 512KB 内容并永久占住缩略图位。
+          const clientId = getString(body, "clientId");
+          if (!clientId || !log.clientId || clientId !== log.clientId) {
+            sendJson(res, 403, { ok: false, error: "无权为该记录上传缩略图" });
+            return;
+          }
+          if (target.thumbId) {
+            sendJson(res, 200, { ok: true, thumbId: target.thumbId, skipped: true });
+            return;
+          }
+          const buffer = Buffer.from(match[2].replace(/\s+/g, ""), "base64");
+          if (buffer.length > THUMBNAIL_MAX_BYTES) {
+            sendJson(res, 413, { ok: false, error: "缩略图过大" });
+            return;
+          }
+          // 缩略图必须落在原图同一目录、同一 requestId 前缀，杜绝借这个公开接口往任意路径写文件
+          const slash = target.id.indexOf("/");
+          const userDir = slash > 0 ? target.id.slice(0, slash) : "";
+          if (!userDir || !/^[A-Za-z0-9_-]{1,64}$/.test(userDir)) {
+            sendJson(res, 400, { ok: false, error: "图片路径不合法" });
+            return;
+          }
+          const ext = IMAGE_MIME_EXT[match[1].toLowerCase()] || "webp";
+          const thumbName = (savedImages?.length || 0) > 1
+            ? `${requestId}-${index}-thumb.${ext}`
+            : `${requestId}-thumb.${ext}`;
+          const thumbId = `${userDir}/${thumbName}`;
+          if (!LOCAL_IMAGE_PATH_PATTERN.test(thumbId) || thumbId.includes("..")) {
+            sendJson(res, 400, { ok: false, error: "图片路径不合法" });
+            return;
+          }
+          const dir = join(LOCAL_IMAGE_DIR, userDir);
+          if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+          writeFileSync(join(LOCAL_IMAGE_DIR, thumbId), buffer);
+          const nextSaved = savedImages.map((item, i) =>
+            i === index ? { ...item, thumbId, thumbBytes: buffer.length } : item,
+          );
+          updateRequestLog(requestId, { savedImages: nextSaved });
+          sendJson(res, 200, { ok: true, thumbId });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      });
+
       app.use("/api/feedback", async (req, res) => {
         if (req.method !== "POST") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
@@ -4242,8 +4347,9 @@ export function registerApiRoutes(app: ApiApp) {
             if (apikeyRes) {
               try {
                 const apikeyData = await apikeyRes.json() as Record<string, unknown>;
-                console.log("[OAuth] /oauth2/apikey response:", JSON.stringify(apikeyData));
                 apiKey = String(apikeyData.api_key || apikeyData.apiKey || apikeyData.key || "");
+                // 隐私红线：绝不打印响应体本身（里面就是 Key 原文），只记录取到与否
+                console.log("[OAuth] /oauth2/apikey resolved:", apiKey ? `yes(len=${apiKey.length})` : "no");
               } catch { /* ignore */ }
             }
 
@@ -5218,14 +5324,16 @@ export function registerApiRoutes(app: ApiApp) {
           if (result.ok) {
             const { saved, publicImages } = persistGeneratedImages(result.images ?? [], { userDir: imageUserDir, requestId });
             const imageSavedAt = Date.now();
+            const returnedAt = Date.now();
             const responsePayload = {
               ok: true,
               status: result.status,
               images: publicImages,
               raw: sanitizeForLog(result.raw),
               requestId,
+              // 链路阶段时间戳：前端脉冲线用它渲染各环节真实耗时占比
+              stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt, imageSavedAt, returnedAt },
             };
-            const returnedAt = Date.now();
             updateRequestLog(requestId, {
               status: "success",
               httpStatus: result.status || 200,
@@ -5257,7 +5365,11 @@ export function registerApiRoutes(app: ApiApp) {
             stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt },
           });
 
-          sendJson(res, result.status || 500, { ...result, requestId });
+          sendJson(res, result.status || 500, {
+            ...result,
+            requestId,
+            stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt },
+          });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           // undici 的 "terminated" 等错误真正原因在 cause 里，拼进摘要方便一眼看懂

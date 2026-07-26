@@ -2,22 +2,30 @@
   color-scheme: light;
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #f7f7f5;
-  color: #111111;
+  background: #f7f6f2;
+  color: #16150f;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  --bg: #f7f7f5;
+
+  /* ── 画布与表面：暖纸白 + 透明度分层（design-refresh-prd §4.1）── */
+  --bg: #f7f6f2;
   --surface: #ffffff;
-  --surface-soft: #f3f3f0;
-  --surface-hover: #ececea;
-  --border: #deded8;
-  --border-strong: #c9c9c2;
+  --surface-soft: #f2f1ec;
+  --surface-hover: rgba(22, 21, 15, 0.04);
+  --overlay-1: rgba(22, 21, 15, 0.04);
+  --overlay-2: rgba(22, 21, 15, 0.07);
+  --border: rgba(22, 21, 15, 0.1);
+  --border-strong: rgba(22, 21, 15, 0.18);
   --paper: var(--surface);
   --paper-muted: var(--surface-soft);
-  --text: #111111;
-  --muted: #666660;
-  --muted-soft: #8a8a84;
+
+  /* ── 文本：暖黑三级 ── */
+  --text: #16150f;
+  --muted: #6b6a62;
+  --muted-soft: #9b9a90;
+
+  /* ── 品牌与语义分离：品牌绿只做品牌时刻 ── */
   --green: #10a37f;
   --green-soft: #e7f8f2;
   --blue: #2563eb;
@@ -26,8 +34,44 @@
   --amber-soft: #fff7df;
   --red: #d92d20;
   --red-soft: #fff0ef;
+
+  /* ── 圆角五档：圆角即角色 ── */
+  --r-pill: 999px;
+  --r-panel: 16px;
+  --r-card: 12px;
+  --r-input: 10px;
+  --r-thumb: 8px;
+
+  /* ── 动效两档 + 标准缓动 ── */
+  --dur-fast: 150ms;
+  --dur-base: 200ms;
+  --dur-layout: 400ms;
+  --ease: cubic-bezier(0.23, 1, 0.32, 1);
+
+  /* ── 阴影：仅浮层可用；卡片一律 hairline + overlay ── */
+  --shadow: 0 1px 2px rgba(22, 21, 15, 0.05);
+  --shadow-popover: 0 8px 24px rgba(22, 21, 15, 0.12);
   --focus-ring: rgba(16, 163, 127, 0.24);
-  --shadow: 0 10px 28px rgba(17, 17, 17, 0.07);
+}
+
+/* 全局工程基线（Vercel 规范）：可见焦点环 / 等宽数字 / 减动效豁免 */
+:where(a, button, input, textarea, select, summary, [tabindex]):focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px rgba(16, 163, 127, 0.55);
+}
+
+body {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 * {
@@ -165,7 +209,7 @@ button:disabled {
 .empty-state strong {
   display: block;
   font-size: 15px;
-  font-weight: 720;
+  font-weight: 500;
 }
 
 .brand span,
@@ -203,7 +247,7 @@ button:disabled {
   border-color: var(--border-strong);
   background: #fff;
   color: var(--text);
-  font-weight: 650;
+  font-weight: 500;
 }
 
 .new-task:hover,
@@ -223,518 +267,632 @@ textarea:focus-visible {
 }
 
 .home-page {
+  /* 必须是 height 而非 min-height：全局 body 是 overflow:hidden，
+     容器高度不受限时 overflow-y:auto 永远不会触发，底部内容会被截断 */
   height: 100vh;
+  height: 100dvh;
   overflow-x: hidden;
   overflow-y: auto;
-  scroll-behavior: smooth;
-  background: #f5f5f2;
+  background: var(--bg);
   color: var(--text);
 }
 
-.home-hero {
-  position: relative;
+/* ── 状态条：仅在「未登录且未配置 Key」时渲染，不常驻 ── */
+.home-statusbar {
   display: flex;
-  min-height: 88svh;
-  flex-direction: column;
+  align-items: center;
   justify-content: center;
-  overflow: hidden;
-  background-position: center;
-  background-size: cover;
-  padding: 104px clamp(20px, 5vw, 72px) 72px;
+  gap: 12px;
+  min-height: 44px;
+  padding: 8px 20px;
+  background: var(--blue-soft);
+  color: var(--text);
+  font-size: 14px;
 }
 
-.home-nav {
-  position: absolute;
+.home-statusbar button {
+  height: 28px;
+  padding: 0 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.home-statusbar button:hover {
+  background: var(--overlay-1);
+}
+
+/* ── 顶栏：从 14 个入口收敛到 5 个 ── */
+.home-topbar {
+  position: sticky;
   top: 0;
-  right: 0;
-  left: 0;
-  z-index: 2;
-  display: flex;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
-  min-height: 72px;
   gap: 16px;
-  padding: 16px clamp(20px, 5vw, 72px);
-  border-bottom: 1px solid rgba(17, 17, 17, 0.06);
-  background: rgba(247, 247, 244, 0.76);
-  backdrop-filter: blur(22px) saturate(1.15);
-}
-
-.home-brand,
-.home-brand span,
-.home-hero-actions,
-.home-nav-actions,
-.home-primary,
-.home-secondary,
-.home-nav-action {
-  display: inline-flex;
-  align-items: center;
+  height: 56px;
+  padding: 0 clamp(16px, 4vw, 40px);
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(20px) saturate(1.1);
+  border-bottom: 1px solid var(--border);
 }
 
 .home-brand {
-  gap: 10px;
-  font-weight: 760;
-  white-space: nowrap;
-}
-
-.home-brand span {
-  justify-content: center;
-  width: 34px;
-  height: 34px;
-  border: 1px solid #b8ded2;
-  border-radius: 8px;
-  background: var(--green-soft);
-  color: var(--green);
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  justify-self: start;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
 }
 
 .home-brand img {
-  width: 29px;
-  height: 29px;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-thumb);
 }
 
-.home-hero-logo {
-  position: absolute;
-  right: clamp(28px, 9vw, 148px);
-  top: clamp(108px, 17vh, 168px);
-  z-index: 0;
-  width: clamp(128px, 18vw, 256px);
-  height: auto;
-  opacity: 0.94;
-  filter: drop-shadow(0 22px 42px rgba(10, 109, 92, 0.18));
-  pointer-events: none;
+.home-brand strong {
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
 }
 
-.home-nav-links {
+.home-topnav {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  gap: clamp(16px, 3vw, 34px);
-  flex: 1;
-  min-width: 0;
+  gap: 4px;
 }
 
-.home-nav-links button {
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: rgba(17, 17, 17, 0.7);
-  font-size: 13px;
-  font-weight: 720;
-  text-decoration: none;
-  transition:
-    color 150ms ease,
-    transform 150ms ease;
-}
-
-.home-nav-links button:hover {
-  color: #111;
-  transform: translateY(-1px);
-}
-
-.home-nav-actions {
-  gap: 10px;
-  justify-content: flex-end;
-}
-
-.home-nav-action,
-.home-primary,
-.home-secondary {
-  min-height: 42px;
-  border-radius: 999px;
+.home-topnav button {
+  height: 32px;
+  padding: 0 14px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: none;
+  color: var(--muted);
   font-size: 14px;
-  font-weight: 760;
-  text-decoration: none;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 
-.home-nav-action {
-  padding: 0 16px;
-  border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.88);
+.home-topnav button:hover {
+  background: var(--overlay-1);
   color: var(--text);
 }
 
-.home-admin-link {
+.home-topbar-end {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: end;
+}
+
+.home-account {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  min-height: 42px;
-  padding: 0 14px;
-  border: 1px solid rgba(17, 17, 17, 0.12);
-  border-radius: 999px;
-  background: rgba(17, 17, 17, 0.88);
-  color: #fff;
-  font-size: 14px;
-  font-weight: 760;
-}
-
-.home-nav-action:hover,
-.home-admin-link:hover,
-.home-primary:hover,
-.home-secondary:hover {
-  transform: translateY(-1px);
-}
-
-.home-hero-copy {
-  z-index: 1;
-  width: min(760px, 100%);
-}
-
-.home-kicker {
-  display: inline-flex;
-  margin-bottom: 14px;
-  color: var(--green);
+  height: 32px;
+  padding: 0 6px 0 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  color: var(--muted);
   font-size: 13px;
-  font-weight: 780;
 }
 
-.home-hero h1,
-.home-flow h2,
-.home-product-showcase h2,
-.home-analysis-showcase h2,
-.home-agent-section h2,
-.home-insight h2 {
-  margin: 0;
-  color: #0c0c0d;
-  font-weight: 820;
-  line-height: 1.02;
+.home-account > span {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-account button {
+  height: 22px;
+  padding: 0 9px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: var(--overlay-1);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.home-account button:hover {
+  background: var(--overlay-2);
+}
+
+.home-login {
+  height: 32px;
+  padding: 0 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.home-login:hover {
+  background: var(--overlay-1);
+}
+
+.home-admin-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.home-admin-icon:hover {
+  background: var(--overlay-1);
+  color: var(--text);
+}
+
+/* ── Hero：输入框是唯一焦点；62svh 刻意不占满，让下方内容露出一角 ── */
+.home-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 62svh;
+  padding: clamp(40px, 7vw, 88px) clamp(16px, 4vw, 40px) clamp(28px, 4vw, 48px);
+  text-align: center;
 }
 
 .home-hero h1 {
-  font-size: 112px;
-}
-
-.home-hero-copy p {
-  width: min(560px, 100%);
-  margin: 22px 0 0;
-  color: #383a36;
-  font-size: 24px;
-  line-height: 1.48;
-}
-
-.home-hero-actions {
-  flex-wrap: wrap;
-  gap: 12px;
-  margin-top: 30px;
-}
-
-.home-primary {
-  gap: 8px;
-  padding: 0 18px;
-  border: 1px solid #111;
-  background: #111;
-  color: #fff;
-  transition:
-    transform 150ms ease,
-    box-shadow 150ms ease,
-    background 150ms ease;
-}
-
-.home-primary.dark {
-  background: #111;
-  color: #fff;
-}
-
-.home-primary:hover {
-  box-shadow: 0 10px 24px rgba(17, 17, 17, 0.16);
-}
-
-.home-secondary {
-  padding: 0 16px;
-  border: 1px solid rgba(17, 17, 17, 0.14);
-  background: rgba(255, 255, 255, 0.72);
+  margin: 0;
+  font-size: clamp(30px, 4.2vw, 39px);
+  font-weight: 500;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
   color: var(--text);
 }
 
-.home-metric-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 34px;
-}
-
-.home-metric {
-  min-width: 126px;
-  padding: 12px 14px;
-  border: 1px solid rgba(17, 17, 17, 0.1);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.62);
-  backdrop-filter: blur(12px);
-}
-
-.home-metric strong,
-.home-metric span {
-  display: block;
-}
-
-.home-metric strong {
-  color: #111;
-  font-size: 18px;
-  line-height: 1.2;
-}
-
-.home-metric span {
-  margin-top: 4px;
+.home-hero-sub {
+  margin: 10px 0 0;
+  font-size: 16px;
+  line-height: 1.55;
   color: var(--muted);
-  font-size: 12px;
-  font-weight: 720;
 }
 
-.home-flow,
-.home-agent-section,
-.home-insight {
-  width: min(1180px, calc(100% - 40px));
-  margin: 0 auto;
-  padding: 78px 0;
-}
-
-.home-section-copy {
+/* ── 输入框：本次重构的主角 ── */
+.home-composer {
   width: min(720px, 100%);
-}
-
-.home-flow h2,
-.home-product-showcase h2,
-.home-analysis-showcase h2,
-.home-insight h2 {
-  font-size: 58px;
-}
-
-.home-section-copy p,
-.home-showcase-copy p {
-  margin: 18px 0 0;
-  color: var(--muted);
-  font-size: 17px;
-  line-height: 1.68;
-}
-
-.home-agent-section {
-  display: grid;
-  gap: 24px;
-}
-
-.home-agent-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
-}
-
-.home-agent-card {
-  display: grid;
-  align-content: start;
-  gap: 12px;
-  min-height: 210px;
-  padding: 16px;
+  margin-top: clamp(24px, 3.5vw, 36px);
+  padding: 14px 14px 10px;
   border: 1px solid var(--border);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.78);
-  box-shadow: 0 18px 50px rgba(17, 17, 17, 0.07);
+  border-radius: var(--r-panel);
+  background: var(--surface);
+  text-align: left;
+  transition: border-color var(--dur-base) var(--ease);
 }
 
-.home-agent-card div {
+.home-composer:focus-within {
+  border-color: var(--border-strong);
+}
+
+.home-composer textarea {
+  display: block;
+  width: 100%;
+  min-height: 66px;
+  max-height: 220px;
+  border: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1.55;
+  resize: none;
+  outline: none;
+}
+
+.home-composer textarea::placeholder {
+  color: var(--muted-soft);
+}
+
+.home-composer-bar {
   display: flex;
   align-items: center;
-  gap: 9px;
+  justify-content: space-between;
+  margin-top: 6px;
 }
 
-.home-agent-card strong {
-  color: var(--text);
-  font-size: 15px;
-  font-weight: 850;
-}
-
-.home-agent-card p {
-  margin: 0;
+.home-composer-attach {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: none;
   color: var(--muted);
-  font-size: 13px;
-  line-height: 1.55;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 
-.home-agent-card small {
-  display: -webkit-box;
-  overflow: hidden;
-  color: var(--muted-soft);
-  font-size: 12px;
-  line-height: 1.45;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+.home-composer-attach:hover {
+  background: var(--overlay-1);
+  color: var(--text);
 }
 
-.home-agent-card button {
+.home-composer-send {
+  display: inline-grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: var(--green);
+  color: #fff;
+  cursor: pointer;
+  transition: transform var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease);
+}
+
+.home-composer-send:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.home-composer-send:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* ── 能力 chips：模型（带近 7 日实测数据）+ 行业 Agent ── */
+.home-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: min(720px, 100%);
+  margin-top: 16px;
+}
+
+.home-chip {
   display: inline-flex;
   align-items: center;
-  justify-self: start;
   gap: 6px;
-  min-height: 32px;
-  margin-top: auto;
-  padding: 0 10px;
-  border: 1px solid #b8ded2;
-  border-radius: 999px;
-  background: #f8fffc;
-  color: var(--green);
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.home-feature-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
-  margin-top: 34px;
-}
-
-.home-feature {
-  display: grid;
-  gap: 12px;
-  min-height: 190px;
-  align-content: end;
-  padding: 18px;
+  flex: 0 0 auto;
+  height: 32px;
+  padding: 0 14px;
   border: 1px solid var(--border);
-  border-radius: 8px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(242, 243, 240, 0.94)),
-    var(--surface);
-  box-shadow: 0 14px 34px rgba(17, 17, 17, 0.055);
-  transition:
-    transform 180ms ease,
-    border-color 180ms ease,
-    box-shadow 180ms ease;
-}
-
-.home-feature:hover {
-  transform: translateY(-3px);
-  border-color: var(--border-strong);
-  box-shadow: 0 18px 44px rgba(17, 17, 17, 0.08);
-}
-
-.home-feature strong {
-  font-size: 19px;
-}
-
-.home-feature p,
-.home-insight p {
-  margin: 0;
+  border-radius: var(--r-pill);
+  background: var(--surface);
   color: var(--muted);
-  font-size: 15px;
-  line-height: 1.58;
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
 }
 
-.home-product-showcase {
-  display: grid;
-  gap: 34px;
-  padding: 86px clamp(20px, 5vw, 72px);
-  background: #111;
-  color: #fff;
+.home-chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
-.home-product-showcase .home-showcase-copy {
-  width: min(920px, 100%);
+.home-chip.is-active {
+  border-color: var(--green);
+  background: var(--green-soft);
+  color: var(--text);
 }
 
-.home-product-showcase .home-kicker {
-  color: #85d8c1;
+.home-chip em {
+  font-style: normal;
+  color: var(--muted-soft);
+  font-size: 12px;
 }
 
-.home-product-showcase h2 {
-  color: #fff;
+.home-chip-divider {
+  flex: 0 0 auto;
+  width: 1px;
+  height: 18px;
+  background: var(--border);
 }
 
-.home-product-showcase p {
-  width: min(760px, 100%);
-  color: rgba(255, 255, 255, 0.72);
+/* Square/Canvas 顶部小标签仍在复用这个类，首页改版后它不再出现在首页，但不能删 */
+.home-kicker {
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 14px;
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
-.home-preview-frame,
-.home-analysis-media {
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.06);
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.22);
+/* ── 区块标题 ── */
+.home-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
 }
 
-.home-preview-frame {
+.home-section-head h2 {
   margin: 0;
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--text);
 }
 
-.home-preview-frame img,
-.home-analysis-media img {
+.home-section-head button {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease);
+}
+
+.home-section-head button:hover {
+  color: var(--text);
+}
+
+/* ── 最近生成：仅在有本地历史时渲染 ── */
+.home-recent {
+  padding: clamp(20px, 3vw, 32px) clamp(16px, 4vw, 40px);
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+.home-recent-row {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 6px;
+  scrollbar-width: none;
+}
+
+.home-recent-row::-webkit-scrollbar {
+  display: none;
+}
+
+.home-recent-new,
+.home-recent-card {
+  flex: 0 0 auto;
+  width: 128px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease);
+}
+
+.home-recent-new:hover,
+.home-recent-card:hover {
+  border-color: var(--border-strong);
+}
+
+.home-recent-new {
+  display: grid;
+  place-items: center;
+  gap: 6px;
+  height: 152px;
+  border-style: dashed;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.home-recent-card {
+  display: block;
+  padding: 0;
+  overflow: hidden;
+  text-align: left;
+}
+
+.home-recent-card img {
+  display: block;
+  width: 100%;
+  height: 128px;
+  object-fit: cover;
+  background: var(--surface-soft);
+}
+
+.home-recent-card > span {
+  display: block;
+  padding: 6px 9px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 灵感发现：真瀑布流，保留原始比例，用 aspect-ratio 预留占位做到零 CLS ── */
+.home-inspire {
+  padding: clamp(20px, 3vw, 32px) clamp(16px, 4vw, 40px) clamp(40px, 5vw, 64px);
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+.home-inspire-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.home-inspire-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.home-inspire-empty {
+  padding: 56px 0;
+  text-align: center;
+  color: var(--muted-soft);
+  font-size: 14px;
+}
+
+.home-masonry {
+  columns: 5;
+  column-gap: 16px;
+}
+
+.home-masonry-item {
+  display: block;
+  position: relative;
+  width: 100%;
+  break-inside: avoid;
+  margin: 0 0 16px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease);
+}
+
+.home-masonry-item:hover {
+  border-color: var(--border-strong);
+}
+
+.home-masonry-item img {
   display: block;
   width: 100%;
   height: auto;
+  background: var(--surface-soft);
 }
 
-.home-preview-frame-wide {
-  max-height: 680px;
-  border-color: rgba(255, 255, 255, 0.2);
-}
-
-.home-preview-frame-wide img {
-  object-fit: cover;
-  object-position: left top;
-}
-
-.home-preview-frame,
-.home-analysis-media,
-.home-analysis-media img {
-  transition:
-    transform 220ms ease,
-    box-shadow 220ms ease;
-}
-
-.home-preview-frame:hover,
-.home-analysis-media:hover {
-  transform: translateY(-4px);
-  box-shadow: 0 30px 86px rgba(0, 0, 0, 0.28);
-}
-
-.home-analysis-showcase {
-  display: grid;
-  grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
-  gap: clamp(28px, 5vw, 72px);
-  align-items: center;
-  width: min(1180px, calc(100% - 40px));
-  margin: 0 auto;
-  padding: 90px 0;
-}
-
-.home-analysis-media {
-  border-color: var(--border);
-  background: #fff;
-  box-shadow: 0 20px 54px rgba(17, 17, 17, 0.1);
-}
-
-.home-analysis-media:hover {
-  box-shadow: 0 26px 70px rgba(17, 17, 17, 0.14);
-}
-
-.home-detail-list {
-  display: grid;
-  gap: 12px;
-  margin: 26px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.home-detail-list li {
+.home-masonry-meta {
   display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  color: #363833;
-  font-size: 15px;
-  line-height: 1.58;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
-.home-detail-list svg {
+.home-masonry-meta > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-masonry-like {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   flex: 0 0 auto;
-  margin-top: 3px;
-  color: var(--green);
+  color: var(--muted-soft);
 }
 
-.home-insight {
-  display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(260px, 0.8fr) auto;
-  gap: 24px;
-  align-items: end;
+/* ── Footer ── */
+.home-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 28px clamp(16px, 4vw, 40px);
   border-top: 1px solid var(--border);
+  color: var(--muted-soft);
+  font-size: 13px;
+}
+
+.home-footer-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.home-footer-meta a {
+  color: var(--muted);
+  text-decoration: none;
+  transition: color var(--dur-fast) var(--ease);
+}
+
+.home-footer-meta a:hover {
+  color: var(--text);
+}
+
+@media (max-width: 1180px) {
+  .home-masonry {
+    columns: 4;
+  }
+}
+
+@media (max-width: 900px) {
+  .home-masonry {
+    columns: 3;
+  }
+}
+
+@media (max-width: 780px) {
+  .home-topbar {
+    grid-template-columns: auto 1fr auto;
+    gap: 8px;
+    padding: 0 14px;
+  }
+
+  .home-topnav {
+    justify-self: center;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .home-topnav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .home-topnav button {
+    padding: 0 10px;
+    font-size: 13px;
+  }
+
+  .home-account > span {
+    display: none;
+  }
+
+  .home-hero {
+    min-height: auto;
+    padding-top: 40px;
+  }
+
+  .home-masonry {
+    columns: 2;
+    column-gap: 12px;
+  }
+
+  .home-masonry-item {
+    margin-bottom: 12px;
+  }
+}
+
+@media (max-width: 520px) {
+  .home-hero h1 {
+    font-size: 27px;
+  }
+
+  .home-hero-sub {
+    font-size: 14px;
+  }
 }
 
 .topbar-home-button {
@@ -748,21 +906,16 @@ textarea:focus-visible {
   background: var(--surface);
   color: var(--text);
   font-size: 12px;
-  font-weight: 740;
+  font-weight: 500;
   line-height: 1;
 }
 
 .admin-page {
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
   overflow: auto;
-  background:
-    linear-gradient(90deg, rgba(16, 163, 127, 0.06) 0 1px, transparent 1px 100%),
-    linear-gradient(180deg, rgba(17, 17, 17, 0.04) 0 1px, transparent 1px 100%),
-    linear-gradient(180deg, #fbfbf8, #f0f1ed);
-  background-size:
-    44px 44px,
-    44px 44px,
-    auto;
+  /* Lovart 式纯净暖纸画布：移除网格纸线 */
+  background: var(--bg);
   color: var(--text);
   padding: 28px clamp(18px, 4vw, 56px) 48px;
 }
@@ -778,7 +931,7 @@ textarea:focus-visible {
   background: rgba(255, 255, 255, 0.78);
   color: var(--muted);
   font-size: 14px;
-  font-weight: 740;
+  font-weight: 500;
 }
 
 .admin-auth-panel,
@@ -804,7 +957,7 @@ textarea:focus-visible {
 .admin-topbar h1 {
   margin: 12px 0 0;
   color: #0b0d0c;
-  font-weight: 820;
+  font-weight: 500;
   letter-spacing: 0;
 }
 
@@ -835,7 +988,7 @@ textarea:focus-visible {
   background: rgba(231, 248, 242, 0.86);
   color: var(--green);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 500;
 }
 
 .admin-badge img {
@@ -864,7 +1017,7 @@ textarea:focus-visible {
   border: 1px solid rgba(17, 17, 17, 0.1);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.82);
-  box-shadow: 0 26px 64px rgba(17, 17, 17, 0.12);
+  box-shadow: none;
   backdrop-filter: blur(18px);
 }
 
@@ -876,7 +1029,7 @@ textarea:focus-visible {
 .admin-login-card > span {
   color: var(--muted);
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 500;
 }
 
 .admin-login-divider {
@@ -885,7 +1038,7 @@ textarea:focus-visible {
   gap: 12px;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .admin-login-divider::before,
@@ -901,7 +1054,7 @@ textarea:focus-visible {
   gap: 7px;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .admin-login-card input,
@@ -924,7 +1077,7 @@ textarea:focus-visible {
   background: var(--red-soft);
   color: var(--red);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .admin-topbar {
@@ -972,7 +1125,7 @@ textarea:focus-visible {
   border: 1px solid rgba(17, 17, 17, 0.1);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.82);
-  box-shadow: 0 16px 42px rgba(17, 17, 17, 0.08);
+  box-shadow: none;
 }
 
 .admin-stat-card {
@@ -986,7 +1139,7 @@ textarea:focus-visible {
 .admin-stat-card span {
   color: var(--muted);
   font-size: 13px;
-  font-weight: 750;
+  font-weight: 500;
 }
 
 .admin-stat-card strong {
@@ -1090,7 +1243,7 @@ textarea:focus-visible {
   margin-bottom: 8px;
   color: var(--text);
   font-size: 13px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .admin-log-toolbar {
@@ -1148,7 +1301,7 @@ textarea:focus-visible {
   background: #f7f7f5;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 500;
 }
 
 .admin-table code {
@@ -1180,7 +1333,7 @@ textarea:focus-visible {
 
 .admin-status-cell svg {
   color: var(--muted);
-  transition: transform 150ms ease;
+  transition: transform var(--dur-fast) var(--ease);
 }
 
 .admin-log-row.expanded .admin-status-cell svg {
@@ -1197,7 +1350,7 @@ textarea:focus-visible {
   background: var(--surface-soft);
   color: var(--muted);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 500;
 }
 
 .admin-status.success {
@@ -1261,7 +1414,7 @@ textarea:focus-visible {
 .admin-log-detail-head strong {
   color: var(--text);
   font-size: 14px;
-  font-weight: 850;
+  font-weight: 500;
 }
 
 .admin-log-detail-head span {
@@ -1278,7 +1431,7 @@ textarea:focus-visible {
   border-radius: 999px;
   background: #fff;
   color: var(--green) !important;
-  font-weight: 800;
+  font-weight: 500;
 }
 
 .admin-log-detail-grid {
@@ -1304,7 +1457,7 @@ textarea:focus-visible {
   background: transparent;
   color: var(--muted);
   font-size: 14px;
-  font-weight: 700;
+  font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
 }
@@ -1322,7 +1475,7 @@ textarea:focus-visible {
   background: #f0faf6;
   color: #0f6e56;
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .admin-config {
@@ -1344,7 +1497,7 @@ textarea:focus-visible {
   background: #fff;
   color: var(--text);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 500;
   cursor: pointer;
 }
 
@@ -1371,7 +1524,7 @@ textarea:focus-visible {
   border-radius: 12px;
   padding: 16px;
   background: rgba(255, 255, 255, 0.82);
-  box-shadow: 0 16px 42px rgba(17, 17, 17, 0.08);
+  box-shadow: none;
 }
 
 .admin-config-block-head {
@@ -1549,7 +1702,7 @@ textarea:focus-visible {
   display: grid;
   gap: 4px;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--muted);
 }
 
@@ -1566,6 +1719,94 @@ textarea:focus-visible {
 
 .admin-stage-caption {
   margin-left: auto;
+}
+
+/* 低频参数折叠区（高级参数） */
+.settings-advanced {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.settings-advanced summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 4px;
+  border-radius: var(--r-thumb);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  list-style: none;
+}
+
+.settings-advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings-advanced summary:hover {
+  background: var(--overlay-1);
+  color: var(--text);
+}
+
+.settings-advanced summary svg {
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.settings-advanced[open] summary svg {
+  transform: rotate(90deg);
+}
+
+.settings-advanced summary small {
+  margin-left: auto;
+  color: var(--muted-soft);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+/* 签名元素：生成链路脉冲线（接收→上游生成→落盘→返回，段宽=真实耗时占比） */
+.pulse-line {
+  display: flex;
+  gap: 2px;
+  height: 2px;
+  margin-top: 8px;
+  border-radius: var(--r-pill);
+}
+
+.pulse-line span {
+  display: block;
+  height: 100%;
+  min-width: 6px;
+  border-radius: var(--r-pill);
+  background: var(--green);
+}
+
+.pulse-line.done span {
+  opacity: 0.55;
+}
+
+.pulse-line span.err {
+  background: var(--red);
+  opacity: 1;
+}
+
+.pulse-line.running {
+  position: relative;
+  overflow: hidden;
+  background: var(--border);
+}
+
+.pulse-line.running span {
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, var(--green), transparent);
+  animation: pulse-sweep 1.4s var(--ease) infinite;
+}
+
+@keyframes pulse-sweep {
+  from { transform: translateX(-120%); }
+  to { transform: translateX(320%); }
 }
 
 .feedback-button.feedback-up-active {
@@ -1635,7 +1876,7 @@ textarea:focus-visible {
 
 .admin-stage-step strong {
   font-size: 24px;
-  font-weight: 850;
+  font-weight: 650;
   line-height: 1.1;
   color: var(--text);
   font-variant-numeric: tabular-nums;
@@ -1649,7 +1890,7 @@ textarea:focus-visible {
 .admin-stage-step em {
   font-style: normal;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--green);
 }
 
@@ -1671,8 +1912,8 @@ textarea:focus-visible {
   text-align: left;
 }
 
-.admin-cell-success { color: var(--green); font-weight: 700; }
-.admin-cell-error { color: var(--red); font-weight: 700; }
+.admin-cell-success { color: var(--green); font-weight: 500; }
+.admin-cell-error { color: var(--red); font-weight: 500; }
 
 .admin-stage-timeline {
   margin: 0 12px 4px;
@@ -1685,7 +1926,7 @@ textarea:focus-visible {
 .admin-stage-timeline-title {
   display: block;
   font-size: 12px;
-  font-weight: 850;
+  font-weight: 500;
   color: var(--text);
   margin-bottom: 8px;
 }
@@ -1752,7 +1993,7 @@ textarea:focus-visible {
   background: #fff;
   color: var(--text);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
   cursor: pointer;
 }
 
@@ -1770,7 +2011,7 @@ textarea:focus-visible {
 .admin-json-block > strong {
   color: var(--text);
   font-size: 12px;
-  font-weight: 850;
+  font-weight: 500;
 }
 
 .admin-json-block pre {
@@ -1795,7 +2036,7 @@ textarea:focus-visible {
   justify-content: space-between;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .history-list {
@@ -1859,7 +2100,7 @@ textarea:focus-visible {
   overflow: hidden;
   color: var(--text);
   font-size: 13px;
-  font-weight: 640;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1882,7 +2123,7 @@ textarea:focus-visible {
   justify-content: center;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .load-more-sentinel {
@@ -1939,7 +2180,7 @@ textarea:focus-visible {
   min-width: 0;
   border-radius: 999px;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
   line-height: 1;
 }
 
@@ -1975,7 +2216,7 @@ textarea:focus-visible {
 .current-model span {
   color: var(--muted);
   font-size: 12px;
-  font-weight: 650;
+  font-weight: 500;
 }
 
 .current-model strong {
@@ -2009,7 +2250,7 @@ textarea:focus-visible {
   background: var(--surface);
   color: var(--text);
   font-size: 12px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .topbar-log-button.is-error {
@@ -2049,7 +2290,7 @@ textarea:focus-visible {
   border: 1px solid rgba(220, 220, 216, 0.92);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.94);
-  box-shadow: 0 24px 80px rgba(17, 17, 17, 0.18);
+  box-shadow: var(--shadow-popover);
   backdrop-filter: blur(18px) saturate(1.14);
   animation: prompt-presets-in 160ms ease-out both;
 }
@@ -2080,7 +2321,7 @@ textarea:focus-visible {
 .local-log-head strong {
   color: var(--text);
   font-size: 14px;
-  font-weight: 850;
+  font-weight: 500;
 }
 
 .local-log-head span {
@@ -2152,7 +2393,7 @@ textarea:focus-visible {
   overflow: hidden;
   color: var(--text);
   font-size: 12px;
-  font-weight: 840;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2172,7 +2413,7 @@ textarea:focus-visible {
   color: var(--muted);
   font-size: 10px;
   font-style: normal;
-  font-weight: 720;
+  font-weight: 500;
 }
 
 .ref-pill-none {
@@ -2246,9 +2487,9 @@ textarea:focus-visible {
   gap: 9px;
   padding: 9px 10px 9px 13px;
   border: 1px solid #b8ded2;
-  border-radius: 14px;
+  border-radius: 12px;
   background: rgba(255, 255, 255, 0.96);
-  box-shadow: 0 18px 48px rgba(17, 17, 17, 0.14);
+  box-shadow: var(--shadow-popover);
   color: var(--text);
   transform: translateX(-50%);
   backdrop-filter: blur(14px);
@@ -2263,7 +2504,7 @@ textarea:focus-visible {
 
 .version-update-notice strong {
   font-size: 13px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .version-update-notice span {
@@ -2340,7 +2581,7 @@ textarea:focus-visible {
   min-height: 34px;
   color: var(--muted);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .toolbar-actions {
@@ -2385,7 +2626,7 @@ textarea:focus-visible {
   overflow: hidden;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2581,7 +2822,7 @@ textarea:focus-visible {
   border: 1px solid currentColor;
   border-radius: 999px;
   font-size: 11px;
-  font-weight: 800;
+  font-weight: 500;
   opacity: 0.78;
 }
 
@@ -2615,7 +2856,7 @@ textarea:focus-visible {
   background: rgba(25, 27, 23, 0.56);
   color: #fff;
   font-size: 11px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .tile-reference-stack {
@@ -2632,13 +2873,13 @@ textarea:focus-visible {
   border-radius: 999px;
   background: rgba(25, 27, 23, 0.58);
   color: #fff;
-  box-shadow: 0 10px 26px rgba(17, 17, 17, 0.18);
+  box-shadow: none;
 }
 
 .tile-reference-stack > span {
   overflow: hidden;
   font-size: 10px;
-  font-weight: 820;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2698,7 +2939,7 @@ textarea:focus-visible {
   min-width: 0;
   color: var(--green);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 500;
 }
 
 .tile-agent-line span {
@@ -2747,7 +2988,7 @@ textarea:focus-visible {
   background: var(--surface-soft);
   color: var(--muted);
   font-size: 9.5px;
-  font-weight: 700;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2776,12 +3017,12 @@ textarea:focus-visible {
   width: 100%;
   padding: 6px 8px;
   border: 1px solid #efb4af;
-  border-radius: 7px;
+  border-radius: 8px;
   background: var(--red-soft);
   color: var(--red);
   cursor: pointer;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2819,7 +3060,7 @@ textarea:focus-visible {
   max-height: 150px;
   margin: 6px 0 0;
   padding: 8px;
-  border-radius: 7px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.72);
   white-space: pre-wrap;
 }
@@ -2836,7 +3077,7 @@ textarea:focus-visible {
   margin-bottom: 4px;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .status-badge {
@@ -2954,7 +3195,7 @@ textarea:focus-visible {
   background: rgba(25, 27, 23, 0.6);
   color: #fff;
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 500;
   backdrop-filter: blur(10px);
 }
 
@@ -2980,7 +3221,7 @@ textarea:focus-visible {
 .image-info dt {
   color: var(--muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .image-info dd {
@@ -3002,7 +3243,7 @@ textarea:focus-visible {
   background: #f6f9fd;
   color: var(--blue);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .loading-frame.queued {
@@ -3060,6 +3301,18 @@ textarea:focus-visible {
   margin-top: 0;
 }
 
+/* 内容前置：桌面端操作按钮 hover 才浮现，让图片说话；触屏保持常显 */
+@media (hover: hover) and (pointer: fine) {
+  .job-actions {
+    opacity: 0;
+    transition: opacity var(--dur-base) var(--ease);
+  }
+  .gallery-grid article:hover .job-actions,
+  .gallery-grid article:focus-within .job-actions {
+    opacity: 1;
+  }
+}
+
 .job-actions .icon-button {
   width: 27px;
   height: 27px;
@@ -3076,7 +3329,7 @@ textarea:focus-visible {
 .upload-button {
   width: 36px;
   height: 36px;
-  border-radius: 11px;
+  border-radius: 12px;
   background: var(--surface-soft);
 }
 
@@ -3087,11 +3340,11 @@ textarea:focus-visible {
   height: 36px;
   gap: 5px;
   padding: 0 9px;
-  border-radius: 11px;
+  border-radius: 12px;
   background: var(--green-soft);
   color: var(--green);
   font-size: 12px;
-  font-weight: 780;
+  font-weight: 500;
   overflow: visible;
 }
 
@@ -3100,7 +3353,7 @@ textarea:focus-visible {
   position: absolute;
   inset: -4px;
   border: 1px solid rgba(16, 163, 127, 0.32);
-  border-radius: 15px;
+  border-radius: 16px;
   opacity: 0;
   pointer-events: none;
 }
@@ -3123,10 +3376,11 @@ textarea:focus-visible {
   gap: 7px;
   padding: 0 11px;
   border-color: var(--border);
-  background: #fbfbfa;
+  /* 用令牌而非写死亮色：否则在深色作用域（画布页）里前景变浅、底色不变，对比度会塌到 1.06 */
+  background: var(--surface);
   color: var(--text);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .subtle-button.danger {
@@ -3163,7 +3417,7 @@ textarea:focus-visible {
   z-index: 0;
   inset: -12px -14px -10px;
   border: 1px solid rgba(255, 255, 255, 0.62);
-  border-radius: 24px;
+  border-radius: 16px;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(255, 255, 255, 0.66)),
     rgba(247, 249, 246, 0.64);
@@ -3218,7 +3472,7 @@ textarea:focus-visible {
   min-height: 52px;
   padding: 0 14px;
   border: 1px solid rgba(16, 163, 127, 0.35);
-  border-radius: 18px;
+  border-radius: 16px;
   background: rgba(255, 255, 255, 0.76);
   color: var(--muted);
   box-shadow:
@@ -3240,9 +3494,9 @@ textarea:focus-visible {
   margin-bottom: 8px;
   padding: 10px;
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: 12px;
   background: rgba(255, 255, 255, 0.86);
-  box-shadow: 0 14px 34px rgba(17, 17, 17, 0.08);
+  box-shadow: var(--shadow-popover);
   animation: prompt-presets-in 180ms ease-out both;
   backdrop-filter: blur(18px) saturate(1.16);
 }
@@ -3256,9 +3510,9 @@ textarea:focus-visible {
   margin-bottom: 6px;
   padding: 5px 6px;
   border: 1px solid rgba(220, 220, 216, 0.86);
-  border-radius: 14px;
+  border-radius: 12px;
   background: rgba(255, 255, 255, 0.7);
-  box-shadow: 0 12px 28px rgba(17, 17, 17, 0.07);
+  box-shadow: var(--shadow-popover);
   backdrop-filter: blur(16px) saturate(1.14);
 }
 
@@ -3310,7 +3564,7 @@ textarea:focus-visible {
 .agent-mode-switch-copy strong {
   color: var(--text);
   font-size: 13px;
-  font-weight: 840;
+  font-weight: 500;
 }
 
 .agent-mode-switch-copy span {
@@ -3379,9 +3633,9 @@ textarea:focus-visible {
   margin-bottom: 8px;
   padding: 12px;
   border: 1px solid #bfe6da;
-  border-radius: 14px;
+  border-radius: 12px;
   background: rgba(247, 255, 252, 0.96);
-  box-shadow: 0 16px 36px rgba(17, 17, 17, 0.07);
+  box-shadow: var(--shadow-popover);
 }
 
 .agent-mode-status-panel.idle {
@@ -3429,7 +3683,7 @@ textarea:focus-visible {
   display: block;
   color: var(--text);
   font-size: 14px;
-  font-weight: 840;
+  font-weight: 500;
 }
 
 .agent-mode-status-head span {
@@ -3489,7 +3743,7 @@ textarea:focus-visible {
   background: #fff;
   color: var(--text);
   font-size: 11px;
-  font-weight: 780;
+  font-weight: 500;
   line-height: 1;
   transition:
     border-color 150ms ease,
@@ -3514,7 +3768,7 @@ textarea:focus-visible {
   border-color: var(--green);
   background: var(--green);
   color: #fff;
-  box-shadow: 0 8px 18px rgba(16, 163, 127, 0.22);
+  box-shadow: none;
 }
 
 .agent-entry-button.is-active:hover {
@@ -3549,7 +3803,7 @@ textarea:focus-visible {
 .agent-chip:hover,
 .agent-expand-button:hover {
   border-color: #9fd9ca;
-  box-shadow: 0 8px 18px rgba(17, 17, 17, 0.09);
+  box-shadow: none;
   transform: translateY(-2px);
 }
 
@@ -3574,7 +3828,7 @@ textarea:focus-visible {
   background: #fff;
   color: var(--green);
   font-size: 9px;
-  font-weight: 850;
+  font-weight: 500;
   letter-spacing: 0;
 }
 
@@ -3612,7 +3866,7 @@ textarea:focus-visible {
 .agent-disable-button:hover {
   border-color: var(--red);
   background: var(--red-soft);
-  box-shadow: 0 6px 14px rgba(217, 45, 32, 0.12);
+  box-shadow: none;
   transform: translateY(-1px);
 }
 
@@ -3637,7 +3891,7 @@ textarea:focus-visible {
   background: linear-gradient(135deg, #f7fffc 0%, #eef7f3 100%);
   color: var(--green);
   font-size: 11px;
-  font-weight: 780;
+  font-weight: 500;
   line-height: 1;
 }
 
@@ -3689,10 +3943,10 @@ textarea:focus-visible {
   border: 1px solid #a8dccc;
   border-radius: 12px;
   background: rgba(247, 255, 252, 0.96);
-  box-shadow: 0 14px 34px rgba(17, 17, 17, 0.14);
+  box-shadow: none;
   color: var(--green);
   font-size: 12px;
-  font-weight: 820;
+  font-weight: 500;
   backdrop-filter: blur(14px);
   animation: agent-hint-in 180ms ease-out both;
 }
@@ -3721,19 +3975,6 @@ textarea:focus-visible {
 
 .agent-chip span,
 .agent-list-item > span,
-.home-agent-card div span {
-  display: grid;
-  width: 22px;
-  height: 22px;
-  flex: 0 0 auto;
-  place-items: center;
-  border-radius: 7px;
-  background: #111310;
-  color: #fff;
-  font-size: 12px;
-  font-weight: 850;
-}
-
 .agent-chip.active {
   border-color: #9fd9ca;
   background: #f2fffb;
@@ -3752,7 +3993,7 @@ textarea:focus-visible {
   background: rgba(16, 163, 127, 0.1);
   color: var(--green);
   font-size: 9px;
-  font-weight: 850;
+  font-weight: 500;
 }
 
 .agent-chip:not(.active) small {
@@ -3788,9 +4029,9 @@ textarea:focus-visible {
   min-height: 0;
   overflow: hidden;
   border: 1px solid rgba(220, 220, 216, 0.9);
-  border-radius: 18px;
+  border-radius: 16px;
   background: rgba(255, 255, 255, 0.96);
-  box-shadow: 0 28px 90px rgba(17, 17, 17, 0.22);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.25);
   backdrop-filter: blur(22px);
   animation: prompt-presets-in 180ms ease-out both;
 }
@@ -3824,7 +4065,7 @@ textarea:focus-visible {
   padding: 12px 16px;
   border-top: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.9);
-  box-shadow: 0 -14px 36px rgba(17, 17, 17, 0.06);
+  box-shadow: none;
 }
 
 .agent-panel-actions .subtle-button,
@@ -3838,7 +4079,7 @@ textarea:focus-visible {
   display: block;
   color: var(--text);
   font-size: 14px;
-  font-weight: 850;
+  font-weight: 500;
 }
 
 .agent-current span,
@@ -3853,7 +4094,7 @@ textarea:focus-visible {
 
 .agent-current small {
   color: var(--green);
-  font-weight: 760;
+  font-weight: 500;
 }
 
 .agent-layout {
@@ -3893,7 +4134,7 @@ textarea:focus-visible {
   color: var(--muted-soft);
   content: "›";
   font-size: 18px;
-  font-weight: 800;
+  font-weight: 500;
 }
 
 .agent-list-item.active {
@@ -3907,7 +4148,7 @@ textarea:focus-visible {
   overflow: hidden;
   color: var(--text);
   font-size: 12px;
-  font-weight: 820;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -3956,7 +4197,7 @@ textarea:focus-visible {
 .agent-empty-select strong {
   color: var(--text);
   font-size: 16px;
-  font-weight: 860;
+  font-weight: 500;
 }
 
 .agent-empty-select span {
@@ -3985,7 +4226,7 @@ textarea:focus-visible {
   background: #fbfbfa;
   color: var(--muted);
   font-size: 11px;
-  font-weight: 760;
+  font-weight: 500;
 }
 
 .agent-form-grid {
@@ -4006,7 +4247,7 @@ textarea:focus-visible {
 .agent-field span {
   color: var(--muted);
   font-size: 11px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .agent-field input,
@@ -4078,7 +4319,7 @@ textarea:focus-visible {
   flex: 0 0 auto;
   color: var(--green);
   font-size: 14px;
-  font-weight: 880;
+  font-weight: 500;
 }
 
 .agent-auto-countdown span {
@@ -4138,21 +4379,21 @@ textarea:focus-visible {
 
 .agent-variant-card:hover {
   border-color: #9fd9ca;
-  box-shadow: 0 12px 30px rgba(17, 17, 17, 0.1);
+  box-shadow: none;
   transform: translateY(-3px);
 }
 
 .agent-variant-card.recommended {
   border-color: #9fd9ca;
   background: linear-gradient(180deg, #f7fffc, #fff);
-  box-shadow: 0 12px 30px rgba(16, 163, 127, 0.12);
+  box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.35);
 }
 
 .agent-variant-card small {
   align-self: end;
   color: var(--green);
   font-size: 11px;
-  font-weight: 800;
+  font-weight: 500;
 }
 
 .agent-variant-card span {
@@ -4179,7 +4420,7 @@ textarea:focus-visible {
   display: block;
   color: var(--text);
   font-size: 13px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .prompt-presets-head span {
@@ -4230,13 +4471,13 @@ textarea:focus-visible {
   background: var(--green-soft);
   color: var(--green);
   font-size: 11px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .prompt-preset-card strong {
   color: var(--text);
   font-size: 13px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .prompt-preset-card small {
@@ -4258,7 +4499,7 @@ textarea:focus-visible {
   align-items: end;
   padding: 6px;
   border: 1px solid var(--border-strong);
-  border-radius: 13px;
+  border-radius: 12px;
   background: rgba(255, 255, 255, 0.82);
   box-shadow:
     0 14px 34px rgba(17, 17, 17, 0.12),
@@ -4319,9 +4560,9 @@ textarea:focus-visible {
   margin-bottom: 8px;
   padding: 12px;
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: 12px;
   background: rgba(255, 255, 255, 0.98);
-  box-shadow: 0 18px 44px rgba(17, 17, 17, 0.1);
+  box-shadow: var(--shadow-popover);
   animation: prompt-presets-in 180ms ease-out both;
 }
 
@@ -4336,7 +4577,7 @@ textarea:focus-visible {
   display: block;
   color: var(--text);
   font-size: 13px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .analysis-panel-head span {
@@ -4351,7 +4592,7 @@ textarea:focus-visible {
   margin-top: 6px;
   color: var(--green);
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .analysis-orb {
@@ -4438,7 +4679,7 @@ textarea:focus-visible {
   min-width: 40px;
   color: var(--green);
   font-size: 14px;
-  font-weight: 880;
+  font-weight: 500;
 }
 
 .analysis-countdown span {
@@ -4477,7 +4718,7 @@ textarea:focus-visible {
   padding: 3px 7px;
   border-radius: 999px;
   font-size: 11px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .risk-badge.low {
@@ -4503,7 +4744,7 @@ textarea:focus-visible {
 .analysis-section > strong {
   color: var(--text);
   font-size: 12px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .analysis-risk-list {
@@ -4523,7 +4764,7 @@ textarea:focus-visible {
 .analysis-risk span {
   color: var(--text);
   font-size: 12px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .analysis-risk small {
@@ -4552,7 +4793,7 @@ textarea:focus-visible {
   min-width: 0;
   padding: 7px 8px;
   border: 1px solid var(--border);
-  border-radius: 9px;
+  border-radius: 8px;
   background: var(--surface-soft);
   color: var(--muted);
   font-size: 11px;
@@ -4604,7 +4845,7 @@ textarea:focus-visible {
   background: #fbfbfa;
   color: var(--muted);
   font-size: 11px;
-  font-weight: 740;
+  font-weight: 500;
 }
 
 .style-enhancement-chip:hover,
@@ -4639,7 +4880,7 @@ textarea:focus-visible {
   background: var(--red-soft);
   color: var(--red);
   font-size: 12px;
-  font-weight: 720;
+  font-weight: 500;
 }
 
 .prompt-assist-bar {
@@ -4698,7 +4939,7 @@ textarea:focus-visible {
   background: #f8fffc;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
   line-height: 1.35;
   animation: prompt-hint-in 160ms ease-out both;
 }
@@ -4710,7 +4951,7 @@ textarea:focus-visible {
 
 .prompt-group-hint strong {
   color: var(--green);
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .api-key-hint {
@@ -4729,14 +4970,14 @@ textarea:focus-visible {
   max-width: 210px;
   padding: 0 7px;
   border: 1px solid rgba(220, 220, 216, 0.92);
-  border-radius: 11px;
+  border-radius: 12px;
   background: rgba(251, 251, 250, 0.92);
   color: var(--muted);
   font-size: 11px;
-  font-weight: 820;
+  font-weight: 500;
   line-height: 1;
   white-space: nowrap;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  box-shadow: none;
   transition:
     border-color 150ms ease,
     background 150ms ease,
@@ -4771,7 +5012,7 @@ textarea:focus-visible {
   overflow: visible;
   width: 36px;
   height: 36px;
-  border-radius: 11px;
+  border-radius: 12px;
   background: var(--text);
   color: #fff;
 }
@@ -5026,7 +5267,7 @@ textarea:focus-visible {
   background: var(--amber-soft);
   color: var(--amber);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .reference-chip {
@@ -5055,7 +5296,7 @@ textarea:focus-visible {
 .reference-thumb-fallback {
   width: 36px;
   height: 36px;
-  border-radius: 6px;
+  border-radius: 8px;
   object-fit: cover;
 }
 
@@ -5082,7 +5323,7 @@ textarea:focus-visible {
 .reference-chip-copy span {
   color: var(--text);
   font-size: 12px;
-  font-weight: 720;
+  font-weight: 500;
 }
 
 .reference-chip-copy small {
@@ -5111,7 +5352,7 @@ textarea:focus-visible {
   height: 24px;
   place-items: center;
   border: 0;
-  border-radius: 6px;
+  border-radius: 8px;
   background: var(--surface-soft);
   color: var(--muted);
 }
@@ -5125,7 +5366,7 @@ textarea:focus-visible {
   padding: 6px 6px 0;
   color: var(--muted);
   font-size: 11px;
-  font-weight: 760;
+  font-weight: 500;
   transition:
     opacity 180ms ease,
     transform 180ms ease;
@@ -5233,7 +5474,7 @@ textarea:focus-visible {
   gap: 6px;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 720;
+  font-weight: 500;
 }
 
 .section-label.with-note {
@@ -5295,7 +5536,7 @@ textarea:focus-visible {
   gap: 8px;
   background: var(--text);
   color: #fff;
-  font-weight: 720;
+  font-weight: 500;
 }
 
 .primary-action:disabled {
@@ -5354,7 +5595,7 @@ textarea:focus-visible {
 
 .protocol-note small,
 .ratio-preview small {
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .local-save-note {
@@ -5366,7 +5607,7 @@ textarea:focus-visible {
 
 .local-save-note span {
   color: var(--green);
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .ratio-preview {
@@ -5434,14 +5675,14 @@ textarea:focus-visible {
 .model-list button small {
   color: var(--muted);
   font-size: 11px;
-  font-weight: 560;
+  font-weight: 500;
 }
 
 .model-list button.selected {
   border-color: #9cc8af;
   background: var(--green-soft);
   color: var(--green);
-  font-weight: 760;
+  font-weight: 500;
 }
 
 .compact-grid {
@@ -5489,7 +5730,7 @@ textarea:focus-visible {
   grid-row: span 2;
   width: 48px;
   height: 48px;
-  border-radius: 7px;
+  border-radius: 8px;
   object-fit: cover;
 }
 
@@ -5502,7 +5743,7 @@ textarea:focus-visible {
 
 .reference-readonly span {
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .reference-readonly small {
@@ -5527,7 +5768,7 @@ textarea:focus-visible {
   position: absolute;
   z-index: 1;
   border: 2px solid rgba(255, 255, 255, 0.94);
-  border-radius: 14px;
+  border-radius: 12px;
   box-shadow:
     0 0 0 9999px rgba(10, 11, 12, 0.62),
     0 0 0 7px rgba(16, 163, 127, 0.2),
@@ -5554,7 +5795,7 @@ textarea:focus-visible {
   border: 1px solid rgba(17, 17, 17, 0.12);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.94);
-  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.28);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.25);
   backdrop-filter: blur(22px);
   pointer-events: auto;
 }
@@ -5585,7 +5826,7 @@ textarea:focus-visible {
 .onboarding-copy span {
   color: var(--green);
   font-size: 12px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .onboarding-copy strong {
@@ -5602,7 +5843,7 @@ textarea:focus-visible {
 }
 
 .onboarding-copy small {
-  font-weight: 760;
+  font-weight: 500;
 }
 
 .onboarding-actions {
@@ -5640,7 +5881,7 @@ textarea:focus-visible {
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 8px;
   background: #111310;
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.25);
 }
 
 .preview-stage {
@@ -5664,7 +5905,29 @@ textarea:focus-visible {
     20px 20px;
 }
 
+/* 原图加载中：显示明确的加载提示条，避免用户把过渡态误认成最终画质 */
+.preview-loading-hint {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: var(--r-pill);
+  background: rgba(22, 21, 15, 0.72);
+  color: #fff;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.preview-image-frame.is-loading-full img {
+  opacity: 0.55;
+}
+
 .preview-image-frame {
+  position: relative;
   display: flex;
   width: 100%;
   height: 100%;
@@ -5685,7 +5948,7 @@ textarea:focus-visible {
   width: auto;
   max-width: 100%;
   max-height: 100%;
-  border-radius: 6px;
+  border-radius: 8px;
   object-fit: contain;
 }
 
@@ -5811,7 +6074,7 @@ textarea:focus-visible {
   overflow: hidden;
   color: var(--text);
   font-size: 12px;
-  font-weight: 820;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -5834,7 +6097,7 @@ textarea:focus-visible {
 .preview-submitted-refs-head strong {
   color: var(--text);
   font-size: 12px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .preview-submitted-refs-head small {
@@ -5862,7 +6125,7 @@ textarea:focus-visible {
 
 .preview-submitted-ref:hover {
   border-color: #9fd9ca;
-  box-shadow: 0 8px 18px rgba(17, 17, 17, 0.1);
+  box-shadow: none;
   transform: translateY(-2px);
 }
 
@@ -5888,7 +6151,7 @@ textarea:focus-visible {
 
 .preview-submitted-ref strong {
   font-size: 10px;
-  font-weight: 820;
+  font-weight: 500;
   letter-spacing: 0.04em;
 }
 
@@ -5925,7 +6188,7 @@ textarea:focus-visible {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #fff;
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.26);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.25);
 }
 
 .confirm-card strong {
@@ -5989,7 +6252,7 @@ textarea:focus-visible {
 .agent-plan-job-head strong {
   color: var(--text);
   font-size: 13px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .agent-plan-job-head small,
@@ -5999,7 +6262,7 @@ textarea:focus-visible {
 }
 
 .agent-plan-job-objective {
-  font-weight: 760;
+  font-weight: 500;
 }
 
 .agent-plan-job-card p {
@@ -6020,7 +6283,7 @@ textarea:focus-visible {
   background: #edf9f4;
   color: var(--green);
   font-size: 12px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .brochure-plan-meta {
@@ -6040,7 +6303,7 @@ textarea:focus-visible {
   background: #fbfbfa;
   color: var(--muted);
   font-size: 11px;
-  font-weight: 760;
+  font-weight: 500;
 }
 
 .brochure-plan-section {
@@ -6051,7 +6314,7 @@ textarea:focus-visible {
 .brochure-plan-section > strong {
   color: var(--text);
   font-size: 13px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .brochure-outline-list {
@@ -6081,14 +6344,14 @@ textarea:focus-visible {
   background: #edf9f4;
   color: var(--green);
   font-size: 11px;
-  font-weight: 840;
+  font-weight: 500;
 }
 
 .brochure-outline-item strong {
   display: block;
   color: var(--text);
   font-size: 13px;
-  font-weight: 820;
+  font-weight: 500;
 }
 
 .brochure-outline-item small {
@@ -6153,7 +6416,7 @@ textarea:focus-visible {
   overflow: auto;
   margin: 0;
   padding: 10px;
-  border-radius: 7px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.76);
   color: #8e2b27;
   font-size: 11px;
@@ -6162,17 +6425,12 @@ textarea:focus-visible {
 }
 
 .square-page {
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
   overflow-x: hidden;
   overflow-y: auto;
-  background:
-    linear-gradient(90deg, rgba(16, 163, 127, 0.045) 0 1px, transparent 1px 100%),
-    linear-gradient(180deg, rgba(17, 17, 17, 0.035) 0 1px, transparent 1px 100%),
-    linear-gradient(180deg, #fbfbf8, #eeeeea);
-  background-size:
-    44px 44px,
-    44px 44px,
-    auto;
+  /* 内容前置：纯净画布让图片说话 */
+  background: var(--bg);
   color: var(--text);
   padding: 0 clamp(16px, 4vw, 56px) 44px;
 }
@@ -6228,7 +6486,7 @@ textarea:focus-visible {
   margin: 9px 0 0;
   color: #0b0d0c;
   font-size: clamp(56px, 8vw, 112px);
-  font-weight: 820;
+  font-weight: 500;
   line-height: 0.96;
   letter-spacing: -0.01em;
 }
@@ -6261,13 +6519,13 @@ textarea:focus-visible {
 .square-metric strong {
   color: var(--text);
   font-size: 20px;
-  font-weight: 840;
+  font-weight: 500;
 }
 
 .square-metric span {
   color: var(--muted);
   font-size: 11px;
-  font-weight: 720;
+  font-weight: 500;
 }
 
 .square-controls {
@@ -6303,7 +6561,7 @@ textarea:focus-visible {
   background: transparent;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .square-tabs button:hover,
@@ -6314,7 +6572,7 @@ textarea:focus-visible {
 }
 
 .square-tabs button.active {
-  box-shadow: 0 8px 18px rgba(17, 17, 17, 0.06);
+  box-shadow: none;
 }
 
 .square-alert {
@@ -6329,7 +6587,7 @@ textarea:focus-visible {
   background: var(--red-soft);
   color: var(--red);
   font-size: 13px;
-  font-weight: 720;
+  font-weight: 500;
 }
 
 .square-alert span {
@@ -6363,7 +6621,7 @@ textarea:focus-visible {
 .square-card:hover {
   transform: translateY(-3px);
   border-color: rgba(17, 17, 17, 0.14);
-  box-shadow: 0 12px 32px rgba(17, 17, 17, 0.1);
+  box-shadow: none;
 }
 
 .square-card-image {
@@ -6394,7 +6652,7 @@ textarea:focus-visible {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  transition: transform 180ms ease;
+  transition: transform var(--dur-base) var(--ease);
 }
 
 .square-card-image span {
@@ -6409,7 +6667,7 @@ textarea:focus-visible {
   background: rgba(25, 27, 23, 0.58);
   color: #fff;
   font-size: 10px;
-  font-weight: 820;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -6427,7 +6685,7 @@ textarea:focus-visible {
   background: rgba(255, 255, 255, 0.9);
   color: var(--text);
   font-size: 11px;
-  font-weight: 820;
+  font-weight: 500;
   opacity: 0;
   transform: translateY(4px);
   transition:
@@ -6463,7 +6721,7 @@ textarea:focus-visible {
   overflow: hidden;
   color: var(--text);
   font-size: 14px;
-  font-weight: 820;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -6472,7 +6730,7 @@ textarea:focus-visible {
   overflow: hidden;
   color: var(--muted);
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -6496,7 +6754,7 @@ textarea:focus-visible {
   background: var(--surface-soft);
   color: var(--muted);
   font-size: 10.5px;
-  font-weight: 740;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -6537,7 +6795,7 @@ textarea:focus-visible {
   background: #fbfbfa;
   color: var(--text);
   font-size: 12px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .square-like-button:hover,
@@ -6571,7 +6829,7 @@ textarea:focus-visible {
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 10px;
   background: #10120f;
-  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.32);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.25);
 }
 
 .square-preview-stage {
@@ -6589,9 +6847,9 @@ textarea:focus-visible {
   display: block;
   max-width: 100%;
   max-height: calc(min(88vh, 840px) - 52px);
-  border-radius: 6px;
+  border-radius: 8px;
   object-fit: contain;
-  box-shadow: 0 18px 58px rgba(0, 0, 0, 0.28);
+  box-shadow: none;
 }
 
 .square-preview-side {
@@ -6623,7 +6881,7 @@ textarea:focus-visible {
   background: var(--surface-soft);
   color: var(--muted);
   font-size: 11px;
-  font-weight: 740;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -6666,7 +6924,7 @@ textarea:focus-visible {
   margin: 0;
   color: #0c0c0d;
   font-size: clamp(22px, 3vw, 32px);
-  font-weight: 820;
+  font-weight: 500;
   line-height: 1.15;
 }
 
@@ -6702,7 +6960,7 @@ textarea:focus-visible {
   width: 52px;
   height: 52px;
   border: 1px solid #b8ded2;
-  border-radius: 14px;
+  border-radius: 12px;
   background: var(--green-soft);
   color: var(--green);
 }
@@ -6710,7 +6968,7 @@ textarea:focus-visible {
 .square-step strong {
   color: var(--text);
   font-size: 15px;
-  font-weight: 780;
+  font-weight: 500;
 }
 
 .square-step p {
@@ -6743,7 +7001,7 @@ textarea:focus-visible {
   background: #111;
   color: #fff;
   font-size: 15px;
-  font-weight: 760;
+  font-weight: 500;
   transition:
     transform 150ms ease,
     box-shadow 150ms ease;
@@ -6751,7 +7009,7 @@ textarea:focus-visible {
 
 .square-onboarding-cta:hover {
   transform: translateY(-1px);
-  box-shadow: 0 6px 18px rgba(17, 17, 17, 0.18);
+  box-shadow: none;
 }
 
 .square-ghost-grid {
@@ -6788,7 +7046,7 @@ textarea:focus-visible {
 
 .square-ghost-line {
   height: 10px;
-  border-radius: 5px;
+  border-radius: 4px;
   background: #eeeeea;
 }
 
@@ -6836,9 +7094,9 @@ textarea:focus-visible {
   background: rgba(25, 27, 23, 0.62);
   color: #fff;
   font-size: 11px;
-  font-weight: 820;
+  font-weight: 500;
   opacity: 0;
-  box-shadow: 0 10px 26px rgba(17, 17, 17, 0.18);
+  box-shadow: none;
   transition:
     opacity 150ms ease,
     background 150ms ease,
@@ -6912,7 +7170,7 @@ textarea:focus-visible {
   max-width: 320px;
   overflow: hidden;
   font-size: 12px;
-  font-weight: 720;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -6938,35 +7196,6 @@ textarea:focus-visible {
 }
 
 @media (max-width: 1180px) {
-  .home-hero h1 {
-    font-size: 88px;
-  }
-
-  .home-flow h2,
-  .home-product-showcase h2,
-  .home-analysis-showcase h2,
-  .home-agent-section h2,
-  .home-insight h2 {
-    font-size: 48px;
-  }
-
-  .home-feature-grid {
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .home-agent-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .home-analysis-showcase {
-    grid-template-columns: 1fr;
-  }
-
-  .home-insight {
-    grid-template-columns: 1fr;
-    align-items: start;
-  }
-
   .app-shell {
     --left-sidebar-width: 240px;
     --right-column: 0px;
@@ -6992,7 +7221,7 @@ textarea:focus-visible {
     width: min(360px, 92vw);
     box-shadow: -18px 0 36px rgba(21, 24, 20, 0.16);
     transform: translateX(100%);
-    transition: transform 180ms ease;
+    transition: transform var(--dur-base) var(--ease);
   }
 
   .settings-open .settings-panel {
@@ -7091,30 +7320,6 @@ textarea:focus-visible {
     max-width: 100%;
   }
 
-  .home-hero {
-    min-height: 86svh;
-    justify-content: flex-end;
-    background-position: 58% center;
-    padding: 92px 18px 48px;
-  }
-
-  .home-hero-logo {
-    display: none;
-  }
-
-  .home-nav {
-    min-height: 64px;
-    padding: 12px 16px;
-    gap: 8px;
-  }
-
-  .home-nav-links {
-    display: none;
-  }
-
-  .home-nav-actions {
-    gap: 8px;
-  }
 
   .home-brand strong {
     max-width: 150px;
@@ -7123,98 +7328,6 @@ textarea:focus-visible {
     white-space: nowrap;
   }
 
-  .home-nav-action {
-    min-height: 38px;
-    padding: 0 12px;
-    font-size: 13px;
-  }
-
-  .home-admin-link {
-    min-height: 38px;
-    padding: 0 10px;
-    font-size: 13px;
-  }
-
-  .home-hero-copy {
-    padding-top: 0;
-    width: calc(100vw - 36px);
-    max-width: calc(100vw - 36px);
-  }
-
-  .home-hero h1 {
-    max-width: 340px;
-    font-size: 64px;
-  }
-
-  .home-hero-copy p {
-    font-size: 17px;
-    overflow-wrap: anywhere;
-    word-break: break-all;
-  }
-
-  .home-metric-row {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 8px;
-    width: calc(100vw - 36px);
-    margin-top: 24px;
-    max-width: calc(100vw - 36px);
-  }
-
-  .home-metric {
-    min-width: 0;
-    overflow: hidden;
-    padding: 10px 11px;
-  }
-
-  .home-metric strong {
-    font-size: 17px;
-  }
-
-  .home-metric span {
-    font-size: 11px;
-  }
-
-  .home-flow,
-  .home-analysis-showcase,
-  .home-agent-section,
-  .home-insight {
-    width: min(100% - 28px, 1180px);
-    padding: 48px 0;
-  }
-
-  .home-product-showcase {
-    gap: 24px;
-    padding: 58px 14px;
-  }
-
-  .home-analysis-showcase {
-    gap: 28px;
-  }
-
-  .home-section-copy p,
-  .home-showcase-copy p {
-    font-size: 15px;
-  }
-
-  .home-flow h2,
-  .home-product-showcase h2,
-  .home-analysis-showcase h2,
-  .home-agent-section h2,
-  .home-insight h2 {
-    font-size: 40px;
-    overflow-wrap: anywhere;
-    word-break: break-all;
-  }
-
-  .home-preview-frame-wide {
-    max-height: 440px;
-  }
-
-  .home-preview-frame-wide img {
-    width: 154%;
-    max-width: none;
-  }
 
   .admin-page {
     padding: 18px 14px 32px;
@@ -7266,22 +7379,6 @@ textarea:focus-visible {
   .admin-log-detail-head {
     align-items: flex-start;
     flex-direction: column;
-  }
-
-  .home-feature-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .home-agent-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .home-feature {
-    min-height: 150px;
-  }
-
-  .home-detail-list li {
-    font-size: 14px;
   }
 
   .onboarding-panel {
@@ -7623,61 +7720,7 @@ textarea:focus-visible {
     width: 100%;
   }
 
-  .home-nav {
-    justify-content: flex-start;
-  }
 
-  .home-nav-actions {
-    flex: 0 0 auto;
-    margin-left: auto;
-  }
-
-  .home-nav-action {
-    display: none;
-  }
-
-  .home-admin-link {
-    display: inline-flex;
-    width: 38px;
-    padding: 0;
-    font-size: 0;
-  }
-
-  .home-hero h1 {
-    max-width: 300px;
-    font-size: 56px;
-  }
-
-  .home-hero-copy,
-  .home-hero-copy p,
-  .home-metric-row {
-    width: min(394px, 100%);
-    max-width: 394px;
-  }
-
-  .home-flow,
-  .home-analysis-showcase,
-  .home-agent-section,
-  .home-insight {
-    width: min(394px, calc(100% - 28px));
-  }
-
-  .home-flow h2,
-  .home-product-showcase h2,
-  .home-analysis-showcase h2,
-  .home-agent-section h2,
-  .home-insight h2 {
-    font-size: 30px;
-  }
-
-  .home-hero-actions {
-    align-items: stretch;
-  }
-
-  .home-primary,
-  .home-secondary {
-    justify-content: center;
-  }
 }
 
 /* ── OAuth login ── */
@@ -7696,7 +7739,7 @@ textarea:focus-visible {
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.88);
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 500;
   color: var(--text);
 }
 
@@ -7747,12 +7790,12 @@ textarea:focus-visible {
   background: var(--surface);
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition: border-color var(--dur-fast) var(--ease), box-shadow 0.15s;
 }
 
 .login-option:hover {
   border-color: var(--text-secondary);
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.06);
+  box-shadow: none;
 }
 
 .login-option div {
@@ -7763,7 +7806,7 @@ textarea:focus-visible {
 
 .login-option strong {
   font-size: 15px;
-  font-weight: 620;
+  font-weight: 500;
 }
 
 .login-option span {
@@ -7794,7 +7837,32 @@ textarea:focus-visible {
    Canvas Mode
    ====================================== */
 
+/* 画布页整体走深色（设计修订 §六.4：图片评估工作区用深色环境）。
+   做法是在本作用域内重定义令牌，子元素自动继承——避免出现「亮框架 + 黑画布」的撕裂。 */
 .canvas-page {
+  --bg: #1b1a18;
+  --surface: #232220;
+  --surface-soft: #2b2a27;
+  --surface-hover: rgba(245, 244, 239, 0.07);
+  --overlay-1: rgba(245, 244, 239, 0.05);
+  --overlay-2: rgba(245, 244, 239, 0.09);
+  --border: rgba(245, 244, 239, 0.12);
+  --border-strong: rgba(245, 244, 239, 0.22);
+  --text: #f5f4ef;
+  --muted: #b4b2aa;
+  /* 深色底上提亮一档，保证次要文字仍达 WCAG AA 4.5:1 */
+  --muted-soft: #93918a;
+  --paper: var(--surface);
+  --paper-muted: var(--surface-soft);
+  --green-soft: rgba(16, 163, 127, 0.18);
+  --blue-soft: rgba(37, 99, 235, 0.18);
+  --amber-soft: rgba(161, 98, 7, 0.2);
+  --red-soft: rgba(217, 45, 32, 0.18);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --focus-ring: rgba(16, 163, 127, 0.4);
+  color-scheme: dark;
+
   display: grid;
   grid-template-columns: minmax(0, 1fr) 360px;
   grid-template-rows: auto minmax(0, 1fr);
@@ -7802,7 +7870,8 @@ textarea:focus-visible {
   height: 100vh;
   overflow: hidden;
   background: var(--bg);
-  transition: grid-template-columns 200ms ease;
+  color: var(--text);
+  transition: grid-template-columns var(--dur-base) var(--ease);
 }
 .canvas-page.panel-collapsed {
   grid-template-columns: minmax(0, 1fr) 0px;
@@ -7835,7 +7904,7 @@ textarea:focus-visible {
 }
 .canvas-topbar-badge {
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--green);
   background: var(--green-soft);
   padding: 1px 6px;
@@ -7852,7 +7921,9 @@ textarea:focus-visible {
   position: relative;
   overflow: hidden;
   cursor: default;
-  background-color: #fafafa;
+  /* 画板比框架更深一档，形成「凹陷的工作台」层次，而不是一块突兀的黑 */
+  background-color: #141312;
+  box-shadow: inset 0 1px 0 rgba(0, 0, 0, 0.4);
   touch-action: none;
 }
 .canvas-viewport.is-space-held {
@@ -7891,9 +7962,9 @@ textarea:focus-visible {
 /* -- Canvas node -- */
 .canvas-node {
   position: absolute;
-  background: #fff;
+  background: var(--surface-soft);
   border-radius: 8px;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  box-shadow: none;
   overflow: hidden;
   user-select: none;
   cursor: pointer;
@@ -7901,17 +7972,17 @@ textarea:focus-visible {
   z-index: 1;
 }
 .canvas-node:hover {
-  box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+  box-shadow: none;
 }
 .canvas-node.selected {
   outline: 2px solid #10B981;
   outline-offset: 2px;
-  box-shadow: 0 4px 16px rgba(16,185,129,0.2);
+  box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.55);
   z-index: 2;
 }
 .canvas-node.dragging {
   z-index: 9999;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+  box-shadow: var(--shadow-popover);
   cursor: grabbing;
 }
 .canvas-node.generating {
@@ -7977,7 +8048,7 @@ textarea:focus-visible {
   background: rgba(0,0,0,0.55);
   color: #fff;
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 500;
   pointer-events: none;
   max-width: 60%;
   overflow: hidden;
@@ -7994,7 +8065,7 @@ textarea:focus-visible {
   background: rgba(0,0,0,0.55);
   color: #fff;
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 500;
   pointer-events: none;
 }
 
@@ -8005,7 +8076,7 @@ textarea:focus-visible {
   left: 50%;
   transform: translate(-50%, -50%);
   text-align: center;
-  color: var(--muted);
+  color: rgba(245, 244, 239, 0.6);
   pointer-events: auto;
   z-index: 5;
 }
@@ -8013,7 +8084,7 @@ textarea:focus-visible {
   display: block;
   margin-top: 12px;
   font-size: 20px;
-  color: var(--text);
+  color: rgba(245, 244, 239, 0.92);
 }
 .canvas-empty-state > p {
   margin: 6px 0;
@@ -8035,9 +8106,9 @@ textarea:focus-visible {
   background: var(--green);
   color: #fff;
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
-  transition: background 0.15s;
+  transition: background var(--dur-fast) var(--ease);
 }
 .canvas-empty-action:hover {
   background: #0e9370;
@@ -8051,7 +8122,7 @@ textarea:focus-visible {
   border-radius: 10px;
   background: var(--surface);
   border: 1px solid var(--border);
-  box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+  box-shadow: var(--shadow-popover);
   z-index: 100;
   pointer-events: auto;
 }
@@ -8061,10 +8132,10 @@ textarea:focus-visible {
   gap: 4px;
   padding: 6px 10px;
   border: none;
-  border-radius: 6px;
+  border-radius: 8px;
   background: transparent;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
   color: var(--text);
   cursor: pointer;
   white-space: nowrap;
@@ -8087,7 +8158,7 @@ textarea:focus-visible {
   border-radius: 10px;
   background: var(--surface);
   border: 1px solid var(--border);
-  box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+  box-shadow: var(--shadow-popover);
   z-index: 10;
   pointer-events: auto;
 }
@@ -8098,10 +8169,10 @@ textarea:focus-visible {
   width: 28px;
   height: 28px;
   border: none;
-  border-radius: 6px;
+  border-radius: 8px;
   background: transparent;
   font-size: 16px;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--text);
   cursor: pointer;
 }
@@ -8114,7 +8185,7 @@ textarea:focus-visible {
 }
 .canvas-zoom-label {
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500;
   color: var(--muted);
   min-width: 36px;
   text-align: center;
@@ -8195,7 +8266,7 @@ textarea:focus-visible {
 
 .canvas-panel-label {
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
   color: var(--muted);
 }
 
@@ -8203,12 +8274,12 @@ textarea:focus-visible {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 8px;
   font-size: 13px;
   background: var(--surface);
   color: var(--text);
   outline: none;
-  transition: border-color 0.15s;
+  transition: border-color var(--dur-fast) var(--ease);
 }
 .canvas-select:focus {
   border-color: var(--green);
@@ -8231,7 +8302,7 @@ textarea:focus-visible {
   background: var(--surface);
   color: var(--text);
   outline: none;
-  transition: border-color 0.15s;
+  transition: border-color var(--dur-fast) var(--ease);
 }
 .canvas-prompt-input:focus {
   border-color: var(--green);
@@ -8253,7 +8324,7 @@ textarea:focus-visible {
 .canvas-panel-details summary {
   padding: 8px 12px;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
   background: var(--surface-soft);
   user-select: none;
@@ -8278,7 +8349,7 @@ textarea:focus-visible {
 }
 .canvas-param label {
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500;
   color: var(--muted);
 }
 
@@ -8301,9 +8372,9 @@ textarea:focus-visible {
   background: var(--green);
   color: #fff;
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
-  transition: background 0.15s, opacity 0.15s;
+  transition: background var(--dur-fast) var(--ease), opacity 0.15s;
 }
 .canvas-generate-btn:hover:not(:disabled) {
   background: #0e9370;
@@ -8319,7 +8390,7 @@ textarea:focus-visible {
   text-align: center;
   padding: 8px;
   background: var(--surface-soft);
-  border-radius: 6px;
+  border-radius: 8px;
   line-height: 1.5;
 }
 .canvas-api-hint .link-button {
@@ -8327,7 +8398,7 @@ textarea:focus-visible {
   border: none;
   background: none;
   cursor: pointer;
-  font-weight: 600;
+  font-weight: 500;
   text-decoration: underline;
   font-size: 12px;
   margin-left: 4px;
@@ -8340,7 +8411,7 @@ textarea:focus-visible {
 }
 .canvas-selected-hint span {
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
   color: var(--muted);
 }
 .canvas-optimize-entry {
@@ -8350,13 +8421,13 @@ textarea:focus-visible {
   margin-top: 6px;
   padding: 6px 12px;
   border: 1px solid var(--green);
-  border-radius: 6px;
+  border-radius: 8px;
   background: transparent;
   color: var(--green);
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
-  transition: background 0.15s;
+  transition: background var(--dur-fast) var(--ease);
 }
 .canvas-optimize-entry:hover {
   background: var(--green);
@@ -8369,7 +8440,7 @@ textarea:focus-visible {
   color: var(--green);
   cursor: pointer;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 500;
   padding: 4px 0;
 }
 
@@ -8406,7 +8477,7 @@ textarea:focus-visible {
   color: var(--muted);
   padding: 8px;
   background: var(--surface-soft);
-  border-radius: 6px;
+  border-radius: 8px;
   max-height: 60px;
   overflow: hidden;
   line-height: 1.5;
@@ -8487,11 +8558,11 @@ textarea:focus-visible {
 .canvas-dialog-danger {
   padding: 8px 16px;
   border: none;
-  border-radius: 6px;
+  border-radius: 8px;
   background: var(--red);
   color: #fff;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
 }
 .canvas-dialog-danger:hover {
