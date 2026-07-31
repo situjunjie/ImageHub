@@ -109,6 +109,8 @@
 | `/api/admin/config/presets` | PUT | admin | Phase 2 |
 | `/api/admin/config/system-prompts` | PUT | admin | Phase 3 |
 | `/api/admin/config/quotas` | PUT | admin | Phase 3 |
+| `/api/admin/config/token-guide` | PUT | admin | 上线后追加，见 §10.1 |
+| `/api/admin/config/timeouts` | PUT | admin | 上线后追加，见 §10.2 |
 | `/api/admin/config/reset` | POST | admin | 按分组恢复默认：`{ "section": "upstreams" \| "models" \| "presets" \| … }`，默认值来自代码内 seed 常量 |
 
 约定：
@@ -185,3 +187,31 @@
 - **模型精确名单的运营成本**：上游发布新模型变体后，用户端不会自动放行，需管理员登记。这是评审时的主动选择（可控性优先）。
 - **本地优先不变量不受影响**：config-store 只存配置文本，不含 API key、图片数据或 URL，符合 README 隐私策略。
 - 前后端尺寸表仍是两份代码（deliberate），`sizing` 只做分支选择，不搬表。
+
+## 10. 上线后追加的配置分组
+
+原始设计稿只规划到 Phase 3。下列分组在上线后按需追加，沿用同一套模式（`ConfigStore` 字段 + `/api/admin/config/<section>` PUT + `reset` 分支 + 审计日志），此处只记差异。
+
+### 10.1 `tokenGuide`（取 Key 引导，2026-07）
+
+首页给还没有 API Key 的新用户看的指引：`enabled` + `siteName` + `tokenUrl` + `groupName` + `note`。这是唯一**进** `/api/config` 公开快照的追加分组（前台要渲染它），因此 `tokenUrl` 在服务端强校验只允许 http/https。
+
+### 10.2 `timeouts`（上游请求超时，2026-07-26）
+
+生图慢是常态（4K、多图、上游排队），但把"慢"写死在代码里意味着换个上游就要改代码重新部署，所以改成管理员可配。
+
+```jsonc
+"timeouts": {
+  "apiTimeoutMs": 300000,        // 交互式请求：模型列表 / OAuth / 提示词与 Agent 分析
+  "generationTimeoutMs": 1200000 // 只作用于六个 generate* 打上游生图的那一次请求
+}
+```
+
+- **两档而非一档**：一个卡死的 OAuth 跳转不该跟着生成超时一起拖 20 分钟。
+- **服务端 clamp**：`apiTimeoutMs` 10–600 秒，`generationTimeoutMs` 30–3600 秒；非数字或 ≤0 回落出厂默认。前端 `<input type="number">` 的 min/max 与之一致，但校验以服务端为准。
+- **拒绝倒挂**：`generationTimeoutMs < apiTimeoutMs` 返回 400「生成超时不能小于常规接口超时」——查模型列表永远快于生图，倒挂只可能是填错。
+- **改完立即生效，不需重启**：`apiTimeoutMs()` / `generationTimeoutMs()` 每次调用都读一遍 `configStoreCache`（无 IO）。`fetchWithTimeout` 的第三参默认值必须保持 `0`（JS 默认参数在调用时求值），写成常量就会退回启动时快照。
+- **排队 TTL 是派生值而非第二个旋钮**：`generationQueueTtlMs() = max(30min, generation + 10min)`。若 TTL 可以低于生成超时，并发槽位被长任务占满时后面排队的任务会在系统正常运转的情况下被判「排队超时未执行」。
+- **不进公开快照**：`/api/config` 是显式白名单，`timeouts` 属服务端运行参数，前台不需要知道。
+- **与 undici 底层超时的关系**：见 CLAUDE.md「Upstream timeouts」——`longTimeoutDispatcher()` 的阈值是 undici 自己的 300 秒默认（`UNDICI_DEFAULT_TIMEOUT_MS`），不是这里配的 API 超时；管理员把交互式那档调到 300 秒以上时同样需要放宽的 dispatcher。
+- 后台位置：接口配置 → 系统设置 → 请求超时；表单单位是**秒**（填 1200 比填 1200000 不容易错一个零），保存时换算成毫秒。审计动作名 `config_update_timeouts`。

@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>无限画布 V2 · 产品规划</title>
+<style>
+  :root {
+    --ground: #f7f6f2;
+    --raise: #fffefb;
+    --ink: #16150f;
+    --ink-2: #55534a;
+    --ink-3: #8b8880;
+    --line: rgba(22, 21, 15, 0.11);
+    --line-2: rgba(22, 21, 15, 0.2);
+    --brand: #0f8f70;
+    --done: #0f8f70;
+    --next: #2c5fd8;
+    --later: #a8710d;
+    --never: #8b8880;
+    --danger: #c8352a;
+    --tint-done: rgba(15, 143, 112, 0.1);
+    --tint-next: rgba(44, 95, 216, 0.1);
+    --tint-later: rgba(168, 113, 13, 0.11);
+    --r-pill: 999px;
+    --r-lg: 14px;
+    --r-md: 10px;
+    --r-sm: 6px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #14130f;
+      --raise: #1c1b17;
+      --ink: #f2f0e9;
+      --ink-2: #a9a69c;
+      --ink-3: #726f66;
+      --line: rgba(242, 240, 233, 0.13);
+      --line-2: rgba(242, 240, 233, 0.24);
+      --brand: #3fbf9b;
+      --done: #3fbf9b;
+      --next: #6f9bff;
+      --later: #d9a441;
+      --never: #726f66;
+      --danger: #e8695c;
+      --tint-done: rgba(63, 191, 155, 0.13);
+      --tint-next: rgba(111, 155, 255, 0.13);
+      --tint-later: rgba(217, 164, 65, 0.14);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #14130f; --raise: #1c1b17; --ink: #f2f0e9; --ink-2: #a9a69c; --ink-3: #726f66;
+    --line: rgba(242,240,233,0.13); --line-2: rgba(242,240,233,0.24);
+    --brand: #3fbf9b; --done: #3fbf9b; --next: #6f9bff; --later: #d9a441; --never: #726f66; --danger: #e8695c;
+    --tint-done: rgba(63,191,155,0.13); --tint-next: rgba(111,155,255,0.13); --tint-later: rgba(217,164,65,0.14);
+  }
+  :root[data-theme="light"] {
+    --ground: #f7f6f2; --raise: #fffefb; --ink: #16150f; --ink-2: #55534a; --ink-3: #8b8880;
+    --line: rgba(22,21,15,0.11); --line-2: rgba(22,21,15,0.2);
+    --brand: #0f8f70; --done: #0f8f70; --next: #2c5fd8; --later: #a8710d; --never: #8b8880; --danger: #c8352a;
+    --tint-done: rgba(15,143,112,0.1); --tint-next: rgba(44,95,216,0.1); --tint-later: rgba(168,113,13,0.11);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 16px;
+    line-height: 1.62;
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 0 24px 96px; }
+  section { padding-top: 56px; }
+  h1, h2, h3 { font-weight: 500; text-wrap: balance; margin: 0; }
+  h1 { font-size: clamp(30px, 4.6vw, 42px); line-height: 1.14; letter-spacing: -0.02em; }
+  h2 { font-size: 22px; letter-spacing: -0.01em; }
+  h3 { font-size: 16px; }
+  p { margin: 0; }
+  .stack { display: grid; gap: 14px; }
+  .stack-lg { display: grid; gap: 26px; }
+
+  .eyebrow {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .lede { font-size: 18px; color: var(--ink-2); max-width: 62ch; }
+  .muted { color: var(--ink-2); }
+  .small { font-size: 14px; }
+
+  header.hero { padding: 72px 0 8px; border-bottom: 1px solid var(--line); }
+  .hero-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 26px; }
+
+  .tag {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 26px; padding: 0 11px;
+    border-radius: var(--r-pill);
+    font-size: 12px;
+    border: 1px solid var(--line);
+    color: var(--ink-2);
+  }
+  .tag.done { background: var(--tint-done); border-color: transparent; color: var(--done); }
+  .tag.next { background: var(--tint-next); border-color: transparent; color: var(--next); }
+  .tag.later { background: var(--tint-later); border-color: transparent; color: var(--later); }
+
+  .sec-head { display: grid; gap: 8px; margin-bottom: 22px; }
+
+  .card {
+    background: var(--raise);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    padding: 20px 22px;
+  }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .scroll-x { overflow-x: auto; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 500; color: var(--ink-3); font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; white-space: nowrap; }
+
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+  .dot.y { background: var(--done); }
+  .dot.n { background: var(--line-2); }
+  .dot.p { background: var(--later); }
+
+  .rail { display: grid; gap: 0; }
+  .rail-row {
+    display: grid; grid-template-columns: 74px 1fr; gap: 18px;
+    padding: 16px 0; border-bottom: 1px solid var(--line);
+  }
+  .rail-row:last-child { border-bottom: none; }
+  .rail-key {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px; color: var(--ink-3); padding-top: 2px;
+  }
+  .rail-key b { display: block; font-size: 15px; font-weight: 500; color: var(--ink); letter-spacing: -0.01em; }
+
+  .why {
+    border-left: 2px solid var(--brand);
+    padding: 2px 0 2px 14px;
+    color: var(--ink-2);
+    font-size: 15px;
+  }
+  .why b { color: var(--ink); font-weight: 500; }
+
+  .pros { display: grid; gap: 7px; margin-top: 12px; font-size: 14px; }
+  .pros div { display: grid; grid-template-columns: 16px 1fr; gap: 9px; align-items: start; color: var(--ink-2); }
+  .pros .s { font-family: ui-monospace, Menlo, monospace; font-size: 13px; line-height: 1.5; }
+  .pros .up .s { color: var(--done); }
+  .pros .dn .s { color: var(--danger); }
+
+  figure { margin: 0; }
+  figcaption { font-size: 13px; color: var(--ink-3); margin-top: 10px; }
+  svg { display: block; max-width: 100%; height: auto; }
+  .chart-frame {
+    background: var(--raise); border: 1px solid var(--line);
+    border-radius: var(--r-lg); padding: 18px;
+  }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 14px; font-size: 13px; color: var(--ink-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+
+  .callout {
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--later);
+    border-radius: var(--r-md);
+    padding: 14px 16px;
+    background: var(--tint-later);
+    font-size: 15px;
+  }
+  .callout.brand { border-left-color: var(--brand); background: var(--tint-done); }
+
+
+  /* SVG 里 fill="var(--x)" 这种 presentation attribute 不解析 CSS 变量，必须用类 */
+  .chart-grid { stroke: var(--line); fill: none; }
+  .chart-quad { fill: var(--tint-done); }
+  .chart-axis { stroke: var(--line-2); }
+  .chart-tick { fill: var(--ink-3); font-size: 12px; }
+  .chart-note { fill: var(--done); font-size: 11px; font-family: ui-monospace, Menlo, monospace; }
+  .chart-name { fill: var(--ink); font-size: 13px; }
+  .chart-name.em { font-weight: 500; }
+  .chart-name.dim { fill: var(--ink-2); }
+  .pt-done { fill: var(--done); }
+  .pt-next { fill: var(--next); }
+  .pt-later { fill: var(--later); }
+  .pt-never { fill: var(--never); }
+
+  a { color: var(--brand); }
+  :focus-visible { outline: 2px solid var(--brand); outline-offset: 3px; border-radius: 3px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+  @media (max-width: 640px) {
+    .rail-row { grid-template-columns: 1fr; gap: 8px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">ImageHub · Canvas V2</div>
+  <h1 style="margin-top:14px">把无限画布从「图片陈列」<br>做成「探索路径」</h1>
+  <p class="lede" style="margin-top:18px">
+    工作台解决「我知道要什么，给我 20 个候选」。画布解决另一件事——<b style="font-weight:500;color:var(--ink)">我不知道要什么，我在找方向</b>。
+    这条路径的可视化，是工作台永远给不了的。
+  </p>
+  <div class="hero-meta">
+    <span class="tag done">已落地 5 项</span>
+    <span class="tag next">建议下一步 3 项</span>
+    <span class="tag">调研 27 个产品</span>
+    <span class="tag">代码盘查 1479 行</span>
+  </div>
+</header>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">现状诊断</div>
+    <h2>缺的不是节点编排，是画布基线</h2>
+    <p class="muted">tldraw 官方把撤销、复制粘贴、拖放列为 table-stakes（入场门槛）。对照检查后的结果并不好看。</p>
+  </div>
+
+  <div class="scroll-x card">
+    <table>
+      <thead><tr><th>基线能力</th><th>ImageHub</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>撤销 / 重做</td><td><span class="dot n"></span> 无</td><td class="muted">误删节点无法挽回</td></tr>
+        <tr><td>框选多选</td><td><span class="dot n"></span> 无</td><td class="muted"><code>selectedNodeId</code> 是单值</td></tr>
+        <tr><td>复制粘贴</td><td><span class="dot n"></span> 无</td><td class="muted">剪贴板图片进不来</td></tr>
+        <tr><td>拖拽落图</td><td><span class="dot n"></span> 无</td><td class="muted">本地图片拖不进画布</td></tr>
+        <tr><td>视口裁剪</td><td><span class="dot n"></span> 无</td><td class="muted">所有节点无条件渲染，节点一多就卡</td></tr>
+        <tr><td>右键菜单</td><td><span class="dot y"></span> 已加</td><td class="muted">查看原图 / 优化 / 下载 / 删除</td></tr>
+        <tr><td>LOD 分级</td><td><span class="dot y"></span> 已加</td><td class="muted">修掉了画布图片模糊</td></tr>
+        <tr><td>并发生成</td><td><span class="dot y"></span> 已加</td><td class="muted">上限 6，替代原来的全局单标志</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout" style="margin-top:16px">
+    用户会先因为「误删了一个节点无法撤销」而流失，<b>而不是因为「没有局部重绘」</b>。在补齐基线之前谈 inpainting 和节点流，是本末倒置。
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">优先级</div>
+    <h2>价值与成本的分布</h2>
+    <p class="muted">横轴是实现成本，纵轴是用户价值。右上角不是「最该做」，而是「要排期做」；左上角才是应该立刻做的。</p>
+  </div>
+
+  <figure class="chart-frame">
+    <svg viewBox="0 0 720 440" role="img" aria-label="功能优先级矩阵：横轴实现成本，纵轴用户价值">
+      <defs>
+        <pattern id="g" width="36" height="36" patternUnits="userSpaceOnUse">
+          <path class="chart-grid" d="M36 0H0V36" stroke-width="1"/>
+        </pattern>
+      </defs>
+      <rect x="56" y="16" width="620" height="360" fill="url(#g)" opacity="0.5"/>
+      <rect class="chart-quad" x="56" y="16" width="310" height="180"/>
+      <text class="chart-note" x="66" y="34">立刻做 · 高价值低成本</text>
+
+      <line class="chart-axis" x1="56" y1="376" x2="676" y2="376" stroke-width="1"/>
+      <line class="chart-axis" x1="56" y1="16" x2="56" y2="376" stroke-width="1"/>
+      <text class="chart-tick" x="56" y="400">低成本 →</text>
+      <text class="chart-tick" x="676" y="400" text-anchor="end">高成本</text>
+      <text class="chart-tick" x="70" y="30">↑ 高价值</text>
+
+      <g class="pt-done">
+        <circle cx="130" cy="86" r="7"/><circle cx="150" cy="132" r="7"/><circle cx="255" cy="170" r="7"/>
+      </g>
+      <text class="chart-name" x="144" y="90">LOD 修模糊</text>
+      <text class="chart-name" x="164" y="136">右键菜单</text>
+      <text class="chart-name" x="269" y="174">并发 6</text>
+
+      <g class="pt-next">
+        <circle cx="300" cy="62" r="9"/><circle cx="360" cy="104" r="9"/><circle cx="404" cy="148" r="9"/>
+      </g>
+      <text class="chart-name em" x="316" y="66">视口裁剪</text>
+      <text class="chart-name em" x="376" y="108">派生把手</text>
+      <text class="chart-name em" x="420" y="152">扇形变体</text>
+
+      <g class="pt-later">
+        <circle cx="560" cy="72" r="7"/><circle cx="330" cy="228" r="7"/>
+        <circle cx="200" cy="262" r="7"/><circle cx="470" cy="206" r="7"/>
+      </g>
+      <text class="chart-name" x="574" y="76">撤销 / 重做</text>
+      <text class="chart-name" x="344" y="232">框选多选</text>
+      <text class="chart-name" x="214" y="266">拖拽落图</text>
+      <text class="chart-name" x="484" y="210">便签分组</text>
+
+      <g class="pt-never">
+        <circle cx="600" cy="286" r="7"/><circle cx="628" cy="322" r="7"/><circle cx="560" cy="348" r="7"/>
+      </g>
+      <text class="chart-name dim" x="614" y="290">局部重绘</text>
+      <text class="chart-name dim" x="642" y="326">扩图</text>
+      <text class="chart-name dim" x="574" y="352">流式预览</text>
+    </svg>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--done)"></i> 已落地</span>
+      <span><i class="dot" style="background:var(--next)"></i> 建议下一步</span>
+      <span><i class="dot" style="background:var(--later)"></i> 排期</span>
+      <span><i class="dot" style="background:var(--never)"></i> 受限于上游 API</span>
+    </div>
+    <figcaption>右下角三项（局部重绘 / 扩图 / 流式预览）不只是成本高——它们<b>依赖上游 API 支持 mask 参数</b>，当前后端只做无状态转发，落地前必须先确认协议。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">建议</div>
+    <h2>如果只做三件事</h2>
+  </div>
+
+  <div class="rail">
+    <div class="rail-row">
+      <div class="rail-key">01<b>视口裁剪<br>+ LOD</b></div>
+      <div class="stack">
+        <p class="why"><b>为什么第一</b>：这是你现在真实感受到的痛点——图糊、节点一多就卡。而且改动<b>局限在渲染层</b>，不碰数据模型，风险最低。</p>
+        <div class="pros">
+          <div class="up"><span class="s">+</span><span>100 个节点不卡；缩略图基础设施已就绪，只差按 zoom 切换</span></div>
+          <div class="up"><span class="s">+</span><span>可随时回滚，不影响任何已有数据</span></div>
+          <div class="dn"><span class="s">−</span><span>裁剪必须用 <code>display:none</code> 保留 DOM，卸载会导致图片重解码、滚回来闪白</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="rail-row">
+      <div class="rail-key">02<b>派生把手<br>+ 扇形变体</b></div>
+      <div class="stack">
+        <p class="why"><b>为什么第二</b>：这是把「迭代树」这个核心卖点<b>真正做出来</b>的一步。现在的边只是优化操作的副产品，用户感知不到它是一棵可探索的树。</p>
+        <div class="pros">
+          <div class="up"><span class="s">+</span><span>从节点拖出一条线松手即建子节点——把「优化」从两步降为一个手势</span></div>
+          <div class="up"><span class="s">+</span><span>一次产出 2–4 个分支并自动扇形排布，分支比较才是画布相对工作台的差异化</span></div>
+          <div class="dn"><span class="s">−</span><span>要克制：只做「父图→优化子图」这一种连接，不能滑向 ComfyUI 式的自由连线</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="rail-row">
+      <div class="rail-key">03<b>撤销<br>/ 重做</b></div>
+      <div class="stack">
+        <p class="why"><b>为什么第三而不是第一</b>：它成本最高，且会<b>改变所有状态变更的写法</b>（要引入 history 栈）。应该等数据模型稳定后再做，否则每加一个功能都要补一次历史记录。</p>
+        <div class="pros">
+          <div class="up"><span class="s">+</span><span>用户信心的底线，误操作可挽回</span></div>
+          <div class="dn"><span class="s">−</span><span>必须用 mark-based 批处理：一次拖拽合并成一条记录，否则拖一下产生几十条 undo</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">竞品</div>
+    <h2>别人是怎么做的</h2>
+    <p class="muted">调研 27 个产品，分三类。对你最有参考价值的是第一类——tldraw 与本项目<b>同为 DOM + CSS transform 架构</b>，方案可直接移植。</p>
+  </div>
+
+  <div class="scroll-x card">
+    <table>
+      <thead>
+        <tr><th>产品</th><th>类型</th><th>值得抄的一件事</th><th>要不要抄</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b style="font-weight:500">tldraw</b></td><td class="muted">开源画布</td>
+          <td>裁剪用 <code>display:none</code> 保留 DOM 而非卸载；选中节点永不裁剪</td>
+          <td><span class="tag done">抄</span></td>
+        </tr>
+        <tr>
+          <td><b style="font-weight:500">Excalidraw</b></td><td class="muted">开源画布</td>
+          <td>三套右键菜单（空白 / 单选 / 多选），菜单项右对齐显示快捷键</td>
+          <td><span class="tag done">已抄</span></td>
+        </tr>
+        <tr>
+          <td><b style="font-weight:500">React Flow</b></td><td class="muted">节点图</td>
+          <td>NodeToolbar <b>不随视口缩放</b>——缩到 20% 时按钮仍可点</td>
+          <td><span class="tag done">抄</span></td>
+        </tr>
+        <tr>
+          <td><b style="font-weight:500">Krea Nodes</b></td><td class="muted">AI 画布</td>
+          <td>拖出把手 → 自动列出可连接候选，比先建节点再连线少一步</td>
+          <td><span class="tag next">抄手势</span></td>
+        </tr>
+        <tr>
+          <td><b style="font-weight:500">Firefly Boards</b></td><td class="muted">AI 画布</td>
+          <td>框选多图 → 浮出 Remix → 出一组融合变体</td>
+          <td><span class="tag next">抄</span></td>
+        </tr>
+        <tr>
+          <td><b style="font-weight:500">n8n</b></td><td class="muted">工作流</td>
+          <td>便签垫在节点后面即得分组，<b>不需要 group 数据结构</b></td>
+          <td><span class="tag later">排期</span></td>
+        </tr>
+        <tr>
+          <td><b style="font-weight:500">ComfyUI</b></td><td class="muted">节点流</td>
+          <td>类型化端口 + 自由连线 + 子图嵌套</td>
+          <td><span class="tag">不抄</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout brand" style="margin-top:16px">
+    <b>最重要的一条判断：不要做成 ComfyUI。</b>
+    它的端口配色是为了在十几种数据类型间做校验，而你的画布<b>只有图片一种数据</b>，颜色承载零信息量。
+    更关键的是——一旦允许用户手动画任意边，边的含义就从「血缘」漂移成「数据流」，<b>而后端并没有 DAG 执行引擎去兑现这个承诺</b>。
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">商业化</div>
+    <h2>四条路径，按「地基完成度」排序</h2>
+    <p class="muted">判断依据不是市场想象，而是<b>代码里已经存在什么</b>。有些路径的基础设施你已经建好了，只是还没接上收费。</p>
+  </div>
+
+  <div class="stack-lg">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap">
+        <h3>路径 A · 算力分销</h3><span class="tag done">地基已完成 ~80%</span>
+      </div>
+      <p class="muted small" style="margin-top:8px">用户不带 Key，平台代充上游额度，赚差价。</p>
+      <p class="why" style="margin-top:12px">
+        <b>关键事实</b>：OAuth 登录成功后，服务端<b>已经在自动下发 apiKey</b> 给前端。也就是说「平台发 Key」这套架构你已经建好了。
+        再加上已有的每日生成配额、每用户磁盘配额、按用户分目录存图——<b>计费所需的计量基础设施全都在</b>。
+      </p>
+      <div class="pros">
+        <div class="up"><span class="s">+</span><span>差价模式现金流直接，用户零配置上手（不用自己找 Key）</span></div>
+        <div class="up"><span class="s">+</span><span>只差三件事：额度账本、充值入口、超额拦截（配额拦截已有）</span></div>
+        <div class="dn"><span class="s">−</span><span>要垫付上游成本，需要防刷（当前 clientId 可伪造，得先接 OAuth 强鉴权）</span></div>
+        <div class="dn"><span class="s">−</span><span>与 local-first 定位有张力：用户会问「我的图是不是在你服务器上」</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap">
+        <h3>路径 B · 企业私有部署</h3><span class="tag next">地基已完成 ~60%</span>
+      </div>
+      <p class="muted small" style="margin-top:8px">一次性授权 + 年维护费，部署在客户内网。</p>
+      <p class="why" style="margin-top:12px">
+        <b>关键事实</b>：<code>deploy.sh</code> 已支持一键部署（含 systemd、Nginx 反代示例），数据全部落本地 <code>.data/</code>。
+        <b>local-first 在这里从「技术选择」变成「销售卖点」</b>——设计素材不出内网，是广告、游戏、影视公司的硬需求。
+      </p>
+      <div class="pros">
+        <div class="up"><span class="s">+</span><span>客单价高，不垫付算力成本，客户自带上游账号</span></div>
+        <div class="up"><span class="s">+</span><span>管理后台、配置中心、审计日志、配额——企业要的治理能力已经有了</span></div>
+        <div class="dn"><span class="s">−</span><span>缺多用户体系（当前只有单管理员 + clientId），要做角色与团队空间</span></div>
+        <div class="dn"><span class="s">−</span><span>销售周期长，需要交付与支持能力</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap">
+        <h3>路径 C · 模板与配方市场</h3><span class="tag later">地基已完成 ~35%</span>
+      </div>
+      <p class="muted small" style="margin-top:8px">行业工作流、画册模板、参数配方，创作者上架分成。</p>
+      <p class="why" style="margin-top:12px">
+        <b>关键事实</b>：已有 8 个行业 Agent、画册多页编排流程、配置中心的预设管理。
+        广场提供了内容与流量入口。缺的是<b>「配方」这个可交易的最小单元</b>——把 prompt + 参数存成命名快照。
+      </p>
+      <div class="pros">
+        <div class="up"><span class="s">+</span><span>边际成本近零，且强化社区粘性</span></div>
+        <div class="up"><span class="s">+</span><span>与画布的「配方快照」功能天然同源，做一次两用</span></div>
+        <div class="dn"><span class="s">−</span><span>需要足够的创作者密度才能转起来，早期是冷启动难题</span></div>
+        <div class="dn"><span class="s">−</span><span>提示词易被复制，需要设计「用得到但拿不走」的分发方式</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap">
+        <h3>路径 D · 协作 SaaS</h3><span class="tag">地基已完成 ~15%</span>
+      </div>
+      <p class="muted small" style="margin-top:8px">团队共享画布、实时协作、版本与评论。</p>
+      <p class="why" style="margin-top:12px">
+        <b>关键事实</b>：这是 Freepik Spaces、Figma Weave 的路线，也是最拥挤的赛道。
+        而你当前的画布状态存在<b>浏览器 IndexedDB</b>，协作需要把状态搬到服务端——这与 local-first 定位<b>正面冲突</b>，是一次架构方向的改变而非增量。
+      </p>
+      <div class="pros">
+        <div class="up"><span class="s">+</span><span>订阅制天花板最高</span></div>
+        <div class="dn"><span class="s">−</span><span>要重写状态层（IndexedDB → 服务端 + 冲突合并），是重构不是加功能</span></div>
+        <div class="dn"><span class="s">−</span><span>正面对上 Figma/Adobe，差异化难立</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout" style="margin-top:22px">
+    <b>建议</b>：短期走 <b>A（算力分销）</b>——地基最全，只差账本和充值；中期做 <b>B（私有部署）</b>，把 local-first 从技术特性变成销售话术。
+    C 作为 B 的附加值捆绑。<b>D 暂时不碰</b>，它要求你放弃 local-first，而那恰恰是你现在唯一的结构性差异点。
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">前置</div>
+    <h2>动功能之前，先拆代码</h2>
+  </div>
+  <div class="card">
+    <p>
+      画布代码在 <code>src/App.tsx</code> 里是连续的 <b>1479 行</b>，加 CSS 754 行。上面任何一个功能都会让它继续膨胀。
+      好消息是 <code>CanvasPage</code> 是顶层函数、<b>不捕获 App 的任何闭包变量</b>，天然可抽离。
+    </p>
+    <p style="margin-top:12px">
+      但<b>不能只抽画布</b>：它依赖 20 个与工作台共用的函数，只抽会形成循环 import。必须<b>先抽共享层</b>做成叶子模块。
+    </p>
+    <div class="pros" style="margin-top:14px">
+      <div class="dn"><span class="s">!</span><span><code>.canvas</code> 不是画布——它是<b>工作台主滚动区</b>。按 grep 搬 CSS 会直接搞坏工作台布局</span></div>
+      <div class="dn"><span class="s">!</span><span><code>openDb</code> 建三个 store，复制一份会导致两套 upgrade 逻辑漂移 → 用户端 VersionError</span></div>
+      <div class="dn"><span class="s">!</span><span><code>runtime*</code> 是可变单例，各持一份会出现「后台改了站点，画布还打旧地址」</span></div>
+    </div>
+  </div>
+</section>
+
+<footer style="margin-top:64px;padding-top:22px;border-top:1px solid var(--line)" class="small muted">
+  完整规格见 <code>docs/canvas-v2-prd.md</code> · 异步生成方案见 <code>docs/async-generation-prd.md</code> · 缩略图方案见 <code>docs/thumbnail-prd.md</code>
+</footer>
+
+</div>
+</body>
+</html>

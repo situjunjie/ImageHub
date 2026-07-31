@@ -13,21 +13,25 @@ import {
   DownloadCloud,
   ExternalLink,
   Flame,
+  Frame,
   Heart,
   ImagePlus,
   Loader2,
   LogOut,
   Maximize2,
+  MessageSquare,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
   Plus,
   RefreshCw,
+  Ban,
   Save,
   Search,
   Send,
   Settings2,
+  ShieldAlert,
   ShieldCheck,
   Star,
   Square,
@@ -55,73 +59,21 @@ import {
   useState,
 } from "react";
 import imageStudioLogo from "./assets/image-studio-logo.svg";
+import { AppNav, type AppNavTarget } from "./shared/AppNav";
+import { CanvasPage } from "./canvas/CanvasPage";
+import { API_KEY_MIN_LENGTH, COMMON_AGENT_NEGATIVE_PROMPT, INDUSTRY_AGENTS, PROMPT_STARTERS, STYLE_ENHANCEMENT_PRESETS, fetchAppConfig, normalizeApiBaseUrl, runtimeEndpoints, runtimeIndustryAgents, runtimeModelConfig, runtimeModelDisplayName, runtimeModelIds, runtimePromptStarters, runtimeStylePresets, runtimeTokenGuide } from "./shared/appConfig";
+import { RECIPES_LIMIT, RECIPES_STORE, REFERENCE_LIBRARY_LIMIT, REFERENCE_LIBRARY_STORE, STORE_NAME, idbDelete, listRecipes, listReferenceLibrary, openDb, saveRecipe, saveReferenceLibraryItem } from "./shared/db";
+import { FullImageError, blobToDataUrl, createListThumbnail, createSquareThumbnail, generatedImageToBlob, getImageSize } from "./shared/imageUtils";
+import { ASPECT_RATIOS, DEFAULT_IMAGE_RESOLUTION, GEMINI_3_PRO_IMAGE_MODEL, GPT_IMAGE_2_MODEL, GPT_IMAGE_2_PRO_MODEL, GPT_IMAGE_2_FAMILY_MODEL, IMAGE_RESOLUTIONS, PROTOCOLS, SIZE_BY_RATIO, aspectRatioNumber, explicitSizeOptionsForModel, getProtocolDefinition, getSupportedAspectRatios, gptImage2SizeOptionForSize, imageModelLaneLabel, isGemini3ProImageModel, isGptImage2Model, isGptImage2ProModel, isImageResolution, normalizedImageModelId, resolveRequestSize, safeImageResolution, scaleSize, supportsGptImage2ExplicitSizes, usesOfficialGptImageSizing } from "./shared/modelSizing";
+import { GenerationSubmissionError, fetchGenerationTasks, reportGenerationClientEvent, submitGenerationTask } from "./shared/generationTasks";
+import type { ApiConfig, CanvasImportPayload, GenerationLifecycleEvent, GenerationSubmissionBody, ImageParams, ImageProtocol, ImageResolution, IndustryAgent, JobStages, ModelLoadState, PromptVariant, Recipe, ReferenceLibraryItem, ServerGenerationTask, SquareFeedItem, SquareRecommendResponse, StyleEnhancement, SubmittedReference, UploadedReference } from "./shared/types";
+import { clampNumber, formatBytes, formatDuration, getClientId, readApiJson, truncateForLog, uid } from "./shared/utils";
 
-type ImageProtocol =
-  | "custom-openai"
-  | "openai-images"
-  | "openai-responses"
-  | "gemini-native"
-  | "gemini-openai"
-  | "google-imagen"
-  | "stability-core";
 
-type ApiConfig = {
-  protocol: ImageProtocol;
-  baseUrl: string;
-  apiKey: string;
-  rememberKey: boolean;
-};
-
-type ImageResolution = "1K" | "2K" | "4K";
-
-type ImageParams = {
-  aspectRatio: string;
-  size: string;
-  resolution: ImageResolution;
-  quality: string;
-  outputFormat: "png" | "jpeg" | "webp";
-  batchCount: number;
-  concurrency: number;
-  retryLimit: number;
-  seed: string;
-  negativePrompt: string;
-};
-
-type SubmittedReference = {
-  name: string;
-  type: string;
-  dataUrl: string;
-  originalBytes: number;
-  requestBytes: number;
-  compressed: boolean;
-};
-
-type ReferenceStatus = "ready" | "warning" | "error";
-
-type UploadedReference = {
-  id: string;
-  name: string;
-  type: string;
-  size: number;
-  dataUrl: string;
-  thumbnailDataUrl?: string;
-  width?: number;
-  height?: number;
-  status?: ReferenceStatus;
-  message?: string;
-};
-
-type JobStatus = "queued" | "running" | "success" | "error";
+type JobStatus = "submitting" | "queued" | "running" | "success" | "error";
 
 type ErrorDetail = unknown;
 
-type JobStages = {
-  receivedAt?: number;
-  upstreamRequestedAt?: number;
-  upstreamRespondedAt?: number;
-  imageSavedAt?: number;
-  returnedAt?: number;
-};
 
 type Job = {
   id: string;
@@ -155,7 +107,10 @@ type Job = {
   attempt?: number;
   maxAttempts?: number;
   submittedReferenceImages?: SubmittedReference[];
+  // 首个任务可能在用户点击时已提前记录 intent，真正入前端队列时不要重复写“用户点击”日志。
+  submissionIntentLogged?: boolean;
 };
+
 
 type StoredHistoryRecord = {
   id: string;
@@ -169,11 +124,13 @@ type StoredHistoryRecord = {
   params: ImageParams;
   referenceImages?: UploadedReference[];
   submittedReferenceImages?: SubmittedReference[];
-  status: "success" | "error";
+  // 异步生成：submitting/queued/running 也要落库，否则关掉页面就失去了找回任务的凭据
+  status: JobStatus;
   createdAt: number;
   startedAt?: number;
   finishedAt?: number;
   durationMs?: number;
+  stages?: JobStages;
   imageBlob?: Blob;
   // 列表用缩略图（512px WebP）。用存储换时间：省的是位图解码内存，不是磁盘。
   thumbBlob?: Blob;
@@ -195,10 +152,6 @@ type HistoryRecord = Omit<StoredHistoryRecord, "referenceImages"> & {
   thumbUrl?: string;
 };
 
-type ModelLoadState = {
-  status: "idle" | "loading" | "ready" | "error";
-  message: string;
-};
 
 type LocalLogLevel = "info" | "success" | "warning" | "error";
 type LocalLogType = "model_load" | "api_health" | "prompt_analysis" | "image_generation" | "agent_analysis";
@@ -241,15 +194,6 @@ type LocalLogEntry = {
   error?: unknown;
 };
 
-type GenerateProxyResponse = {
-  ok: boolean;
-  requestId?: string;
-  status?: number;
-  images?: Array<{ dataUrl?: string; url?: string; revisedPrompt?: string }>;
-  detail?: unknown;
-  raw?: unknown;
-  stages?: JobStages;
-};
 
 type AnalysisMode = "send" | "optimize" | "params" | "risk" | "style";
 type RiskLevel = "low" | "medium" | "high";
@@ -271,11 +215,6 @@ type PromptRisk = {
   fix?: string;
 };
 
-type StyleEnhancement = {
-  name: string;
-  description: string;
-  promptFragment: string;
-};
 
 type PromptAnalysisResult = {
   safe: boolean;
@@ -302,43 +241,9 @@ type PromptAnalysisState = {
   streamChunks?: number;
 };
 
-type PromptVariant = "stable" | "creative" | "commercial";
 type AgentRunPhase = "collecting" | "planning" | "prompting" | "prechecking" | "countdown" | "generating" | "reviewing" | "done";
 
-type AgentField = {
-  id: string;
-  label: string;
-  type: "text" | "textarea" | "select";
-  placeholder?: string;
-  options?: string[];
-  defaultValue?: string;
-  required?: boolean;
-};
 
-type IndustryAgent = {
-  id: string;
-  name: string;
-  tag: string;
-  icon: string;
-  scenario: string;
-  description: string;
-  recommendedRatio: string;
-  defaultCount: number;
-  defaultQuality: string;
-  defaultSubject: string;
-  defaultGoal: string;
-  defaultScene: string;
-  defaultAudience: string;
-  clickHint: string;
-  emptyStateHint: string;
-  defaultValues: Record<string, string>;
-  promptBlueprint: string;
-  negativePrompt: string;
-  fields: AgentField[];
-  supplements: string[];
-  promptStructures: Record<PromptVariant, string>;
-  qualityChecklist: string[];
-};
 
 type AgentPlan = {
   agentId: string;
@@ -355,6 +260,11 @@ type AgentPlan = {
 type AgentContext = {
   plan: AgentPlan;
   variant: PromptVariant;
+};
+
+type GenerationIntent = {
+  requestId: string;
+  submittedAt: number;
 };
 
 type AnalysisCountdown = {
@@ -457,28 +367,6 @@ type AppPage = "home" | "studio" | "square" | "admin" | "canvas";
 
 type SquareFeedTab = "latest" | "hot" | "top_day" | "top_week" | "top_month";
 
-type SquareFeedItem = {
-  id: string;
-  imageId: string;
-  requestId?: string;
-  thumbnailUrl: string;
-  prompt: string;
-  caption: string;
-  model: string;
-  params: Partial<ImageParams> & Record<string, unknown>;
-  width?: number;
-  height?: number;
-  aspectRatio?: string;
-  sourceType: string;
-  reasonPlan?: unknown;
-  recommenderLabel: string;
-  pageLabel?: string;
-  likeCount: number;
-  createdAt: number;
-  updatedAt: number;
-  rankScore: number;
-  likedByRequester?: boolean;
-};
 
 type SquareFeedResponse = {
   ok: boolean;
@@ -501,17 +389,6 @@ type SquareQuotaResponse = {
   error?: string;
 };
 
-type SquareRecommendResponse = {
-  ok: boolean;
-  status?: string;
-  action?: "added" | "replaced" | "rejected";
-  item?: SquareFeedItem;
-  remainingDailyQuota?: number;
-  remainingShelfSlots?: number;
-  replacedItemId?: string;
-  reasonCode?: string;
-  error?: string;
-};
 
 type SquareLikeResponse = {
   ok: boolean;
@@ -591,7 +468,6 @@ type AdminRequestLog = {
   apiKeyPresent?: boolean;
   apiKeyLength?: number;
   apiKeyPrefix?: string;
-  apiKeySuffix?: string;
   endpoint: string;
   model: string;
   prompt: string;
@@ -614,7 +490,7 @@ type AdminRequestLog = {
   requestParams?: unknown;
   upstreamRequest?: unknown;
   responseBody?: unknown;
-  status: "running" | "success" | "error";
+  status: "submitting" | "queued" | "running" | "success" | "error";
   httpStatus?: number;
   errorMessage?: string;
   errorType?: string;
@@ -628,12 +504,33 @@ type AdminRequestLog = {
   imageSaved?: boolean;
   savedImages?: Array<{ id: string; mime: string; bytes: number; thumbId?: string; thumbBytes?: number }>;
   stages?: {
+    clientSubmittedAt?: number;
+    clientPersistedAt?: number;
+    clientRequestStartedAt?: number;
     receivedAt?: number;
+    requestParsedAt?: number;
+    validatedAt?: number;
+    validationFailedAt?: number;
+    idempotencyClaimedAt?: number;
+    enqueuedAt?: number;
+    acceptedResponseAt?: number;
+    clientAcceptedAt?: number;
+    dispatchedAt?: number;
     upstreamRequestedAt?: number;
     upstreamRespondedAt?: number;
     imageSavedAt?: number;
     returnedAt?: number;
+    taskCompletedAt?: number;
+    lastReconcileAt?: number;
+    lastIdempotentRetryAt?: number;
+    clientResultReceivedAt?: number;
+    clientErrorReceivedAt?: number;
   };
+  lifecycleEvents?: GenerationLifecycleEvent[];
+  sourceSurface?: "studio" | "canvas";
+  localRecordId?: string;
+  idempotentReplayCount?: number;
+  lastIdempotentReplayAt?: number;
 };
 
 type AdminDailyStat = {
@@ -682,50 +579,7 @@ type ModelStat = {
   down: number;
 };
 
-// ── Canvas Mode Types ──
 
-type CanvasNodeStatus = "generating" | "success" | "error";
-
-type CanvasNode = {
-  id: string;
-  type: "image";
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  prompt: string;
-  model: string;
-  protocol: ImageProtocol;
-  params: ImageParams;
-  status: CanvasNodeStatus;
-  error?: string;
-  parentId?: string;
-  referenceNodeId?: string;
-  createdAt: number;
-  duration?: number;
-  imageWidth?: number;
-  imageHeight?: number;
-  // objectUrl 是原图（下载/优化取参考图用）；thumbUrl 是画布上渲染用的缩略图
-  objectUrl?: string;
-  thumbUrl?: string;
-};
-
-type CanvasEdge = {
-  id: string;
-  fromNodeId: string;
-  toNodeId: string;
-};
-
-type CanvasViewport = {
-  x: number;
-  y: number;
-  zoom: number;
-};
-
-type CanvasPanelMode = "generate" | "optimize";
-
-const DB_NAME = "codex-image-batch-studio";
-const STORE_NAME = "history";
 const HISTORY_PAGE_SIZE = 20;
 const SQUARE_PAGE_SIZE = 20;
 const REFERENCE_LIMIT = 6;
@@ -736,14 +590,13 @@ const MIN_REFERENCE_EDGE = 128;
 const LARGE_REFERENCE_EDGE = 4096;
 const PROMPT_TEXTAREA_MAX_HEIGHT = 220;
 const FRONTEND_VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
-const API_KEY_MIN_LENGTH = 8;
+// 短于这个长度的 Key 在任何日志/诊断文件里都不回显字符：
+// 4 位前缀对一把 12 位的 Key 就是三分之一，对短 Key 而言前缀本身即泄漏。
+const API_KEY_MASK_MIN_LENGTH = 20;
 const AGENT_MODE_STORAGE_KEY = "imageStudioAgentModeEnabled";
 const AGENT_MODE_NAME = "Agent 模式 A";
-const CANVAS_STATE_STORE = "canvas-state";
-const CANVAS_IMAGES_STORE = "canvas-images";
-const CANVAS_STATE_KEY = "current";
-const CANVAS_SAVE_DEBOUNCE_MS = 500;
-const CANVAS_DEFAULT_NODE_WIDTH = 280;
+
+
 const SQUARE_FEED_TABS: Array<{ value: SquareFeedTab; label: string; icon: typeof Clock3 }> = [
   { value: "latest", label: "最新", icon: Clock3 },
   { value: "hot", label: "热门", icon: Flame },
@@ -754,272 +607,11 @@ const SQUARE_FEED_TABS: Array<{ value: SquareFeedTab; label: string; icon: typeo
 const CURRENT_FRONTEND_VERSION = typeof __FRONTEND_BUILD_VERSION__ === "string"
   ? __FRONTEND_BUILD_VERSION__
   : "dev";
-const ALLOWED_API_ENDPOINTS: { value: string; label: string; description: string }[] = [
-  {
-    value: "https://www.taijiai.online/",
-    label: "太极 AI",
-    description: "主服务地址",
-  },
-  {
-    value: "https://bobdong.cn/",
-    label: "BobDong",
-    description: "备用服务地址",
-  },
-];
-const DEFAULT_API_URL = ALLOWED_API_ENDPOINTS[0].value;
 const DEFAULT_PROTOCOL: ImageProtocol = "custom-openai";
-const DEFAULT_IMAGE_RESOLUTION: ImageResolution = "1K";
-const GPT_IMAGE_2_MODEL = "gpt-image-2";
-const GPT_IMAGE_2_PRO_MODEL = "gpt-image-2-pro";
-const GPT_IMAGE_2_FAMILY_MODEL = "gpt-5.4-image-2";
-const GEMINI_3_PRO_IMAGE_MODEL = "gemini-3-pro-image-preview";
 const PRIMARY_IMAGE_MODELS = [GPT_IMAGE_2_MODEL, GEMINI_3_PRO_IMAGE_MODEL] as const;
 const SUPPORTED_REFERENCE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
-const ASPECT_RATIOS = [
-  { value: "1:1", label: "1:1 方图 · 1024x1024", hint: "GPT Image 官方方图尺寸" },
-  { value: "4:5", label: "4:5 竖版社媒", hint: "小红书、信息流、电商卡片" },
-  { value: "5:4", label: "5:4 横版产品", hint: "商品展示、横版构图" },
-  { value: "3:4", label: "3:4 竖版照片", hint: "人像、封面、海报草图" },
-  { value: "4:3", label: "4:3 经典横图", hint: "摄影、PPT、内容插图" },
-  { value: "2:3", label: "2:3 竖图 · 1024x1536", hint: "GPT Image 官方竖图尺寸" },
-  { value: "3:2", label: "3:2 横图 · 1536x1024", hint: "GPT Image 官方横图尺寸" },
-  { value: "9:16", label: "9:16 手机竖屏", hint: "短视频封面、Story、壁纸" },
-  { value: "16:9", label: "16:9 宽屏", hint: "视频封面、网页头图、桌面壁纸" },
-  { value: "21:9", label: "21:9 超宽屏", hint: "横幅、电影感场景" },
-  { value: "9:21", label: "9:21 长竖屏", hint: "长屏海报、移动端素材" },
-  { value: "12:5", label: "12:5 4K 超宽", hint: "GPT Image 2 4K 超宽输出尺寸 3840x1600" },
-  { value: "5:12", label: "5:12 4K 超高", hint: "GPT Image 2 4K 超高输出尺寸 1600x3840" },
-  { value: "4:1", label: "4:1 横幅", hint: "Banner、页面横幅" },
-  { value: "1:4", label: "1:4 长图", hint: "竖向长图、信息流素材" },
-  { value: "8:1", label: "8:1 超横幅", hint: "超宽展示屏、高级模式" },
-  { value: "1:8", label: "1:8 超长图", hint: "特殊竖向长图、高级模式" },
-] as const;
 
-const ALL_ASPECT_RATIOS = ASPECT_RATIOS.map((ratio) => ratio.value);
-const GPT_IMAGE_SUPPORTED_ASPECT_RATIOS = ["1:1", "2:3", "3:2"] as const;
-const GPT_IMAGE_2_PRO_1K_SUPPORTED_ASPECT_RATIOS = ["1:1", "4:5", "5:4", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9"] as const;
-const GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"] as const;
-
-const IMAGEN_ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"];
-const STABILITY_ASPECT_RATIOS = ["16:9", "1:1", "21:9", "2:3", "3:2", "4:5", "5:4", "9:16", "9:21"];
-const OPENAI_ASPECT_RATIOS = [...GPT_IMAGE_SUPPORTED_ASPECT_RATIOS];
-
-const SIZE_BY_RATIO: Record<string, string> = {
-  "1:1": "1024x1024",
-  "4:5": "1024x1280",
-  "5:4": "1280x1024",
-  "3:4": "1152x1536",
-  "4:3": "1536x1152",
-  "2:3": "1024x1536",
-  "3:2": "1536x1024",
-  "9:16": "1024x1792",
-  "16:9": "1792x1024",
-  "21:9": "2016x864",
-  "9:21": "864x2016",
-  "12:5": "2016x840",
-  "5:12": "840x2016",
-  "4:1": "2048x512",
-  "1:4": "512x2048",
-  "8:1": "2048x256",
-  "1:8": "256x2048",
-};
-
-const GPT_IMAGE_2_SIZE_OPTIONS: Array<{
-  size: string;
-  aspectRatio: string;
-  resolution: Exclude<ImageResolution, "1K">;
-  label: string;
-}> = [
-  { size: "2560x1440", aspectRatio: "16:9", resolution: "2K", label: "2K QHD 横屏" },
-  { size: "1440x2560", aspectRatio: "9:16", resolution: "2K", label: "2K QHD 竖屏" },
-  { size: "2048x1152", aspectRatio: "16:9", resolution: "2K", label: "2K 16:9 横屏" },
-  { size: "1152x2048", aspectRatio: "9:16", resolution: "2K", label: "2K 9:16 竖屏" },
-  { size: "2048x2048", aspectRatio: "1:1", resolution: "2K", label: "2K 方图" },
-  { size: "2048x1536", aspectRatio: "4:3", resolution: "2K", label: "2K 4:3 横图" },
-  { size: "1536x2048", aspectRatio: "3:4", resolution: "2K", label: "2K 3:4 竖图" },
-  { size: "2048x3072", aspectRatio: "2:3", resolution: "2K", label: "2K 2:3 竖图" },
-  { size: "3072x2048", aspectRatio: "3:2", resolution: "2K", label: "2K 3:2 横图" },
-  { size: "3840x2160", aspectRatio: "16:9", resolution: "4K", label: "4K UHD 横屏" },
-  { size: "2160x3840", aspectRatio: "9:16", resolution: "4K", label: "4K UHD 竖屏" },
-  { size: "3840x1600", aspectRatio: "12:5", resolution: "4K", label: "4K 超宽" },
-  { size: "1600x3840", aspectRatio: "5:12", resolution: "4K", label: "4K 超高" },
-];
-
-const GPT_IMAGE_2_2K_SUPPORTED_ASPECT_RATIOS = [...new Set(
-  GPT_IMAGE_2_SIZE_OPTIONS.filter((option) => option.resolution === "2K").map((option) => option.aspectRatio),
-)];
-const GPT_IMAGE_2_4K_SUPPORTED_ASPECT_RATIOS = [...new Set(
-  GPT_IMAGE_2_SIZE_OPTIONS.filter((option) => option.resolution === "4K").map((option) => option.aspectRatio),
-)];
-
-const GEMINI_3_PRO_SIZE_BY_RATIO: Record<string, string> = {
-  "1:1": "1024x1024",
-  "2:3": "832x1248",
-  "3:2": "1248x832",
-  "3:4": "896x1200",
-  "4:3": "1200x896",
-  "4:5": "864x1088",
-  "5:4": "1088x864",
-  "9:16": "768x1344",
-  "16:9": "1344x768",
-  "21:9": "1536x672",
-};
-
-const IMAGE_RESOLUTIONS: Array<{ value: ImageResolution; label: string; hint: string; multiplier: number }> = [
-  { value: "1K", label: "1K 标准", hint: "速度优先，适合批量预览", multiplier: 1 },
-  { value: "2K", label: "2K 高清", hint: "更清晰，适合交付候选", multiplier: 2 },
-  { value: "4K", label: "4K 超清", hint: "高成本，取决于模型支持", multiplier: 4 },
-];
-
-const PROTOCOLS: Array<{
-  value: ImageProtocol;
-  label: string;
-  shortLabel: string;
-  description: string;
-  defaultBaseUrl: string;
-  defaultModels: string[];
-  supportedAspectRatios: string[];
-  supportsReferenceImages: boolean;
-  supportsNegativePrompt: boolean;
-  supportsQuality: boolean;
-  supportsOutputFormat: boolean;
-}> = [
-  {
-    value: "custom-openai",
-    label: "OpenAI 兼容",
-    shortLabel: "兼容协议",
-    description: "适合第三方中转或自建 OpenAI 风格图片接口",
-    defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_PRO_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
-    supportedAspectRatios: ALL_ASPECT_RATIOS,
-    supportsReferenceImages: true,
-    supportsNegativePrompt: true,
-    supportsQuality: true,
-    supportsOutputFormat: true,
-  },
-  {
-    value: "openai-images",
-    label: "OpenAI Images",
-    shortLabel: "OpenAI",
-    description: "OpenAI 风格 Images API，宽高比会转换为 size 参数",
-    defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_PRO_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
-    supportedAspectRatios: OPENAI_ASPECT_RATIOS,
-    supportsReferenceImages: true,
-    supportsNegativePrompt: true,
-    supportsQuality: true,
-    supportsOutputFormat: true,
-  },
-  {
-    value: "openai-responses",
-    label: "OpenAI Responses",
-    shortLabel: "Responses",
-    description: "适合对话式生成和后续多轮改图",
-    defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: ["gpt-4.1", "gpt-4.1-mini"],
-    supportedAspectRatios: OPENAI_ASPECT_RATIOS,
-    supportsReferenceImages: false,
-    supportsNegativePrompt: true,
-    supportsQuality: true,
-    supportsOutputFormat: true,
-  },
-  {
-    value: "gemini-native",
-    label: "Gemini Native",
-    shortLabel: "Gemini",
-    description: "Google Gemini 原生 generateContent 生图/改图",
-    defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: [GEMINI_3_PRO_IMAGE_MODEL, "gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"],
-    supportedAspectRatios: [...GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS],
-    supportsReferenceImages: true,
-    supportsNegativePrompt: true,
-    supportsQuality: false,
-    supportsOutputFormat: true,
-  },
-  {
-    value: "gemini-openai",
-    label: "Gemini OpenAI 兼容",
-    shortLabel: "Gemini 兼容",
-    description: "Gemini 的 OpenAI 兼容接口，适合快速迁移",
-    defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: ["gemini-2.5-flash-image"],
-    supportedAspectRatios: OPENAI_ASPECT_RATIOS,
-    supportsReferenceImages: false,
-    supportsNegativePrompt: true,
-    supportsQuality: false,
-    supportsOutputFormat: true,
-  },
-  {
-    value: "google-imagen",
-    label: "Google Imagen",
-    shortLabel: "Imagen",
-    description: "Imagen 系列文生图，比例范围较明确",
-    defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: ["imagen-4.0-generate-001", "imagen-4.0-ultra-generate-001", "imagen-3.0-generate-002"],
-    supportedAspectRatios: IMAGEN_ASPECT_RATIOS,
-    supportsReferenceImages: false,
-    supportsNegativePrompt: true,
-    supportsQuality: false,
-    supportsOutputFormat: true,
-  },
-  {
-    value: "stability-core",
-    label: "Stability Core",
-    shortLabel: "Stability",
-    description: "Stability AI Stable Image Core/Ultra 风格接口",
-    defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: ["stable-image-core"],
-    supportedAspectRatios: STABILITY_ASPECT_RATIOS,
-    supportsReferenceImages: false,
-    supportsNegativePrompt: true,
-    supportsQuality: false,
-    supportsOutputFormat: true,
-  },
-];
-
-const PROMPT_STARTERS = [
-  {
-    label: "超写实人像",
-    tag: "头像写真",
-    prompt: "8K 超写实近景人像肖像，女性，白皙皮肤，五官与参考照片 100% 一致，柔和侧逆光打在脸上，背景虚化，皮肤纹理与毛发细节清晰可见，电影级光影和肤色过渡，高质感摄影棚风格，4K 细节，适合头像与人像写真展示。",
-  },
-  {
-    label: "水墨双龙",
-    tag: "东方概念",
-    prompt: "阴阳概念，两条中国龙龙对战，一条白龙一条黑龙，极简水墨画风格，黑色墨迹绘制在白色背景上，带有和纸纹理，大号红色印章签名，禅意风格，居中构图",
-  },
-  {
-    label: "建筑文字剖面",
-    tag: "信息图",
-    prompt: "2x2 网格布局，每一格是一栋著名建筑的垂直剖面示意图，不画真实造型，而是用建筑结构与材料术语堆叠成楼层文字方块：地基、柱网、楼板、幕墙、机电系统等，从下到上依次排列。整体采用极简信息图风格，白底黑字，少量线条勾勒楼层分隔，排版干净、对比清晰，可读性强，适合作为建筑结构可视化概念插画。",
-  },
-  {
-    label: "蓝图到现实",
-    tag: "建筑渲染",
-    prompt: "创建一张纵向分屏建筑可视化图，上半部分是深色主题的精细建筑平立面蓝图，包含清晰线稿、标注和结构细节，下半部分是与蓝图完全对应的写实现代住宅外观 3D 渲染，真实光影和材质，干净背景，整体呈现“蓝图到现实”的一体化对比效果。",
-  },
-  {
-    label: "人物侧脸海报",
-    tag: "IP 视觉",
-    prompt: "核心结构：人物侧脸外轮廓 + 内部世界观填充，适合文学/IP/人物传记海报。\n风格方向：电影海报 + 东方现实主义，强调光影、空间纵深和宿命感。\n质感控制：侧逆光、体积光、轻雾、胶片颗粒，让画面更像正式视觉物料。\n可复用点：把主题换成任意小说、历史人物、城市故事或品牌叙事，都能做系列封面。",
-  },
-  {
-    label: "历史学家玩具",
-    tag: "3D 手办",
-    prompt: "2×2 网格布局，每格展示一个基于“历史学家”职业的可爱玩具人物立牌。输入为一个著名历史学家，分析其典型特征并转化为 Q 版或 chibi 风格：大头小身、夸张表情和代表性服饰或道具（如书卷、古地图、羽毛笔）。整体为 3D 扭蛋场景风格，塑料质感的小公仔站在透明底座上，画面为分层拆解的 split-view，展示人物、底座和扭蛋背景机台，柔和打光，高细节，卡通但带一点收藏手办质感。",
-  },
-  {
-    label: "文本封面主视觉",
-    tag: "社媒封面",
-    prompt: "核心任务：把一句话或大段文本转成“封面主视觉”，适合小红书、X、公众号、Telegram 封面。\n设计思路：苹果设计师思维 + 海报大师思维 + 高桥流，强调大字、留白、冲击力和信息压缩。\n关键能力：让模型“智能梳理文本”，避免把长文逐字堆到图里。\n可复用点：适合金句、信息差、课程标题、文章封面、播客标题、社群公告。",
-  },
-  {
-    label: "社交媒体成瘾",
-    tag: "社论漫画",
-    prompt: "为「社交媒体上瘾」这个主题创作一幅正方形、单格的社论漫画。先推理出最有力、最讽刺的视觉隐喻（例如赌场、仓鼠轮、正在下沉的船、飙车赛道等），再据此构图。画面应一眼就能看出是在批判社交媒体成瘾：人物被界面和通知牵制，氛围略带黑色幽默，细节简洁但寓意清晰，适合社论版头图使用。",
-  },
-];
 
 const ANALYSIS_STEPS = [
   "正在理解画面主体",
@@ -1029,463 +621,12 @@ const ANALYSIS_STEPS = [
   "正在增强风格表达",
 ];
 
-const STYLE_ENHANCEMENT_PRESETS: StyleEnhancement[] = [
-  {
-    name: "电影感",
-    description: "更强的镜头、光影和空间纵深",
-    promptFragment: "电影级构图，柔和侧逆光，体积光，浅景深，细腻胶片颗粒，画面具有空间纵深和叙事感。",
-  },
-  {
-    name: "商业摄影",
-    description: "适合产品、人像与高质感展示",
-    promptFragment: "高质感商业摄影棚风格，干净背景，精准布光，真实材质，高细节，主体边缘清晰。",
-  },
-  {
-    name: "社媒封面",
-    description: "更适合小红书、公众号和信息流",
-    promptFragment: "社交媒体封面主视觉，强标题感构图，留白明确，高对比，信息层级清晰，移动端可读性强。",
-  },
-  {
-    name: "极简信息图",
-    description: "适合结构解释、知识卡片与图解",
-    promptFragment: "极简信息图风格，白底黑字，少量辅助线条，模块化排版，层级分明，可读性强。",
-  },
-  {
-    name: "东方水墨",
-    description: "更适合国风、禅意和概念插画",
-    promptFragment: "东方水墨画风格，宣纸纹理，留白构图，墨色层次丰富，克制的红色印章点缀，禅意氛围。",
-  },
-  {
-    name: "3D 手办",
-    description: "适合玩具、公仔、IP 角色",
-    promptFragment: "3D 收藏手办质感，Q 版比例，塑料材质，透明底座，柔和棚拍打光，高细节，干净背景。",
-  },
-];
-
 const PROMPT_VARIANT_LABELS: Record<PromptVariant, string> = {
   stable: "稳定版",
   creative: "创意版",
   commercial: "商业版",
 };
 
-const COMMON_AGENT_NEGATIVE_PROMPT = "低清晰度，主体变形，错误文字，杂乱背景，比例失真，廉价模板感，过度锐化，AI伪影";
-
-const INDUSTRY_AGENTS: IndustryAgent[] = [
-  {
-    id: "ecommerce-product",
-    name: "电商商品图",
-    tag: "商业高频",
-    icon: "商",
-    scenario: "商品主图 / 场景图 / 详情页配图",
-    description: "把商品卖点、材质和平台构图转成商业摄影方案。",
-    recommendedRatio: "1:1",
-    defaultCount: 4,
-    defaultQuality: "high",
-    defaultSubject: "现代消费电子产品",
-    defaultGoal: "生成可直接用于商品主图、场景图和详情页首屏的高质感商业摄影图。",
-    defaultScene: "纯净棚拍电商主图，干净浅灰背景，商品完整居中。",
-    defaultAudience: "电商运营、品牌营销和正在浏览商品详情页的潜在买家。",
-    clickHint: "打开电商商品图工作流",
-    emptyStateHint: "不填写也会默认生成现代消费电子产品的电商主图方案。",
-    defaultValues: {
-      productName: "现代消费电子产品",
-      material: "磨砂金属与细腻织物纹理",
-      sellingPoint: "高质感、主体清晰、材质真实、平台可直接使用",
-      scene: "纯净棚拍",
-      platform: "电商主图",
-      blank: "不需要",
-    },
-    promptBlueprint: "商品主体 + 材质细节 + 平台用途 + 商业棚拍布光 + 干净背景 + 商品占比 + 可交付电商视觉",
-    negativePrompt: `${COMMON_AGENT_NEGATIVE_PROMPT}，商品变形，过度反光，低质感，道具喧宾夺主`,
-    fields: [
-      { id: "productName", label: "商品名称", type: "text", required: true, placeholder: "例如：黑色智能音箱" },
-      { id: "material", label: "材质 / 颜色", type: "text", placeholder: "磨砂黑金属、织物网面" },
-      { id: "sellingPoint", label: "核心卖点", type: "textarea", placeholder: "音质、质感、便携、礼品感等" },
-      { id: "scene", label: "使用场景", type: "select", options: ["纯净棚拍", "居家桌面", "礼盒场景", "户外生活方式", "高级灰背景"], defaultValue: "纯净棚拍" },
-      { id: "platform", label: "目标平台", type: "select", options: ["电商主图", "电商详情页", "品牌官网", "广告投放", "私域海报"], defaultValue: "电商主图" },
-      { id: "blank", label: "留白位置", type: "select", options: ["不需要", "上方留白", "左侧留白", "右侧留白", "底部留白"], defaultValue: "不需要" },
-    ],
-    supplements: ["商业摄影布光", "商品占比明确", "材质细节清晰", "背景干净", "适合电商合规构图"],
-    promptStructures: {
-      stable: "主体为现代消费电子产品，产品完整清晰，占据画面中心，干净浅灰背景，柔和双侧棚拍布光，真实材质纹理，边缘清晰，轻微自然投影。",
-      creative: "保持商品结构真实，加入高级生活方式陈列、氛围光和轻叙事背景，让商品更有记忆点但不喧宾夺主。",
-      commercial: "强调广告可交付质感，卖点可视化，背景克制，构图适合电商主图、详情页首屏和品牌页面。",
-    },
-    qualityChecklist: ["商品完整清晰", "主体占比明确", "材质真实", "背景干净", "适合电商平台"],
-  },
-  {
-    id: "xiaohongshu-cover",
-    name: "小红书封面",
-    tag: "社媒增长",
-    icon: "封",
-    scenario: "笔记封面 / 种草图 / 干货图",
-    description: "自动补全移动端识别、标题留白和种草氛围。",
-    recommendedRatio: "4:5",
-    defaultCount: 4,
-    defaultQuality: "high",
-    defaultSubject: "精致生活方式场景与种草产品",
-    defaultGoal: "生成手机端高识别、可叠加标题的小红书封面。",
-    defaultScene: "干净生活方式画面，主体居中，上方保留标题区域。",
-    defaultAudience: "小红书内容创作者、品牌种草运营和移动端浏览用户。",
-    clickHint: "打开小红书封面工作流",
-    emptyStateHint: "不填写也会默认生成精致生活方式种草封面。",
-    defaultValues: {
-      topic: "春日通勤包里有什么",
-      audience: "年轻职场女性",
-      subject: "精致桌面、通勤包和生活方式产品",
-      emotion: "精致种草",
-      titleSpace: "上方留白",
-      style: "生活方式摄影",
-    },
-    promptBlueprint: "内容主题 + 移动端强识别 + 视觉中心 + 标题留白 + 情绪关键词 + 种草氛围 + 干净层级",
-    negativePrompt: `${COMMON_AGENT_NEGATIVE_PROMPT}，杂乱排版，畸形人物，过度磨皮，主体不清晰，标题区域拥挤`,
-    fields: [
-      { id: "topic", label: "笔记主题", type: "text", required: true, placeholder: "例如：早八通勤包里有什么" },
-      { id: "audience", label: "目标人群", type: "text", placeholder: "大学生、职场新人、精致妈妈" },
-      { id: "subject", label: "画面主体", type: "text", placeholder: "人物、产品、桌面、场景" },
-      { id: "emotion", label: "情绪关键词", type: "select", options: ["高级松弛", "强烈反差", "治愈温暖", "干货清晰", "精致种草"], defaultValue: "精致种草" },
-      { id: "titleSpace", label: "标题留白", type: "select", options: ["上方留白", "左上留白", "右上留白", "中间标题区", "不需要文字区"], defaultValue: "上方留白" },
-      { id: "style", label: "风格方向", type: "select", options: ["生活方式摄影", "强标题封面", "产品种草", "极简干货", "胶片氛围"], defaultValue: "生活方式摄影" },
-    ],
-    supplements: ["手机屏幕强识别", "视觉中心明确", "标题留白", "高点击率构图", "信息层级清晰"],
-    promptStructures: {
-      stable: "主体明确居中，上方保留标题留白，柔和自然光，高级干净配色，画面有种草感和真实生活氛围，移动端一眼可读。",
-      creative: "增强颜色反差、情绪表达和封面记忆点，保留标题安全区，适合探索高点击率封面方向。",
-      commercial: "保持高级生活方式质感和品牌可信度，构图可叠加标题，色彩统一，适合品牌种草和内容投放。",
-    },
-    qualityChecklist: ["手机端可读", "视觉中心明确", "标题留白清楚", "种草感强", "背景不杂乱"],
-  },
-  {
-    id: "short-video-cover",
-    name: "短视频封面",
-    tag: "高点击",
-    icon: "视",
-    scenario: "抖音 / TikTok / Reels / Shorts 封面",
-    description: "把视频主题提炼成一秒能看懂的竖屏首帧。",
-    recommendedRatio: "9:16",
-    defaultCount: 4,
-    defaultQuality: "high",
-    defaultSubject: "大主体人物或核心物品",
-    defaultGoal: "生成 1 秒内可读的竖屏短视频首帧封面。",
-    defaultScene: "强视觉中心、顶部标题区、竖屏安全构图。",
-    defaultAudience: "抖音、TikTok、Reels、Shorts 的快速滑动用户。",
-    clickHint: "打开短视频封面工作流",
-    emptyStateHint: "不填写也会默认生成强对比竖屏短视频封面。",
-    defaultValues: {
-      videoTopic: "3 个让房间显贵的软装技巧",
-      platform: "抖音",
-      subject: "博主与室内空间对比",
-      conflict: "普通房间到高级感空间的前后对比",
-      titleArea: "上方标题区",
-      emotion: "强冲击",
-    },
-    promptBlueprint: "视频主题 + 大主体 + 冲突点 + 强对比 + 字幕安全区 + 快速识别 + 竖屏构图",
-    negativePrompt: `${COMMON_AGENT_NEGATIVE_PROMPT}，主体太小，低对比，背景干扰，表情僵硬，画面拖沓`,
-    fields: [
-      { id: "videoTopic", label: "视频主题", type: "text", required: true, placeholder: "例如：3 个让房间显贵的软装技巧" },
-      { id: "platform", label: "平台", type: "select", options: ["抖音", "TikTok", "Reels", "Shorts", "视频号"], defaultValue: "抖音" },
-      { id: "subject", label: "主体人物 / 产品", type: "text", placeholder: "博主、产品、场景或道具" },
-      { id: "conflict", label: "冲突点", type: "textarea", placeholder: "前后对比、常见误区、意外结果" },
-      { id: "titleArea", label: "字幕安全区", type: "select", options: ["上方标题区", "中间大标题", "下方字幕区", "左右留白"], defaultValue: "上方标题区" },
-      { id: "emotion", label: "情绪强度", type: "select", options: ["强冲击", "惊讶表情", "专业可信", "轻松幽默", "克制高级"], defaultValue: "强冲击" },
-    ],
-    supplements: ["9:16 竖屏构图", "大主体", "强对比", "字幕安全区", "快速识别"],
-    promptStructures: {
-      stable: "9:16 竖屏首帧图，主体足够大，表情或核心物品醒目，强对比背景，顶部保留标题安全区，画面在 1 秒内能看懂主题。",
-      creative: "加强冲突、表情张力和视觉对比，让封面更有停留感和点击欲望，同时保持字幕区域清晰。",
-      commercial: "保持专业质感和品牌可信度，适合课程、知识、产品视频封面，画面醒目但不过度夸张。",
-    },
-    qualityChecklist: ["1 秒内看懂主题", "主体足够大", "标题安全区清楚", "情绪明确", "背景不干扰"],
-  },
-  {
-    id: "brand-poster",
-    name: "品牌海报",
-    tag: "主视觉",
-    icon: "品",
-    scenario: "活动海报 / 发布会图 / 官网头图",
-    description: "建立主视觉、调性、色彩秩序和文案区域。",
-    recommendedRatio: "4:5",
-    defaultCount: 4,
-    defaultQuality: "high",
-    defaultSubject: "现代生活方式品牌主视觉",
-    defaultGoal: "生成活动、发布会或官网可用的高级商业主视觉。",
-    defaultScene: "品牌发布海报，主视觉居中，文案区域干净留白。",
-    defaultAudience: "品牌市场团队、活动运营和官网访客。",
-    clickHint: "打开品牌海报工作流",
-    emptyStateHint: "不填写也会默认生成极简高级品牌发布主视觉。",
-    defaultValues: {
-      brand: "现代生活方式品牌",
-      campaign: "新品发布主视觉",
-      tone: "极简高级",
-      visual: "产品与抽象光影装置",
-      color: "黑白银与淡绿色点缀",
-      copyArea: "上方留白",
-    },
-    promptBlueprint: "品牌调性 + 活动主题 + 主视觉元素 + 留白区域 + 色彩秩序 + 商业海报质感",
-    negativePrompt: `${COMMON_AGENT_NEGATIVE_PROMPT}，廉价模板感，视觉中心混乱，色彩脏，过度装饰`,
-    fields: [
-      { id: "brand", label: "品牌名称", type: "text", placeholder: "可选，不需要生成文字时也可只填调性" },
-      { id: "campaign", label: "活动主题", type: "text", required: true, placeholder: "新品发布、节日营销、品牌升级" },
-      { id: "tone", label: "品牌调性", type: "select", options: ["极简高级", "科技未来", "年轻潮流", "温暖生活", "东方美学"], defaultValue: "极简高级" },
-      { id: "visual", label: "主视觉元素", type: "text", placeholder: "产品、符号、装置、自然元素" },
-      { id: "color", label: "色彩方向", type: "text", placeholder: "黑白银、薄荷绿、暖金色" },
-      { id: "copyArea", label: "文案区域", type: "select", options: ["上方留白", "左侧留白", "右侧留白", "底部留白", "中心主标题"], defaultValue: "上方留白" },
-    ],
-    supplements: ["品牌调性统一", "主视觉中心", "留白区域", "商业海报质感", "色彩秩序"],
-    promptStructures: {
-      stable: "高级商业主视觉，画面有明确主视觉中心，统一色彩秩序，干净留白区域可放文案，适合活动页、发布会、官网头图。",
-      creative: "加入更有记忆点的视觉隐喻、装置感和空间层次，形成可作为发布会主 KV 的强视觉。",
-      commercial: "强调可交付商业海报，色彩统一，视觉秩序清楚，画面高级、克制、适合官网和广告投放。",
-    },
-    qualityChecklist: ["主视觉明确", "留白可放文案", "品牌调性统一", "色彩干净", "商业交付感强"],
-  },
-  {
-    id: "interior-space",
-    name: "室内空间",
-    tag: "设计灵感",
-    icon: "室",
-    scenario: "室内效果图 / 软装方案 / 空间灵感",
-    description: "补全空间层次、材质、镜头焦段和真实自然光。",
-    recommendedRatio: "4:3",
-    defaultCount: 4,
-    defaultQuality: "high",
-    defaultSubject: "现代极简客厅空间",
-    defaultGoal: "生成真实可信的室内设计参考图和软装方案图。",
-    defaultScene: "80 平现代公寓客厅，清晨自然光，材质真实，空间层次清楚。",
-    defaultAudience: "室内设计师、装修业主、家居品牌和方案汇报用户。",
-    clickHint: "打开室内空间工作流",
-    emptyStateHint: "不填写也会默认生成现代极简客厅设计参考图。",
-    defaultValues: {
-      spaceType: "客厅",
-      scale: "80 平现代公寓",
-      style: "现代极简",
-      materials: "木饰面、亚麻、浅色石材",
-      light: "清晨自然光",
-      camera: "人眼平视",
-    },
-    promptBlueprint: "空间类型 + 面积尺度 + 设计风格 + 主材 + 自然光 + 镜头角度 + 合理透视 + 真实摄影感",
-    negativePrompt: `${COMMON_AGENT_NEGATIVE_PROMPT}，空间透视错误，家具变形，材质虚假，过曝，布局杂乱`,
-    fields: [
-      { id: "spaceType", label: "空间类型", type: "select", options: ["客厅", "卧室", "餐厅", "书房", "办公室", "商业空间"], defaultValue: "客厅" },
-      { id: "scale", label: "面积 / 尺度", type: "text", placeholder: "例如：80 平现代公寓" },
-      { id: "style", label: "风格", type: "select", options: ["现代极简", "奶油风", "侘寂", "中古风", "自然原木", "科技办公"], defaultValue: "现代极简" },
-      { id: "materials", label: "主材", type: "text", placeholder: "木饰面、微水泥、石材、亚麻" },
-      { id: "light", label: "光线", type: "select", options: ["清晨自然光", "午后侧光", "柔和夜景灯光", "大面积落地窗", "商业摄影灯光"], defaultValue: "清晨自然光" },
-      { id: "camera", label: "镜头角度", type: "select", options: ["广角空间", "人眼平视", "角落斜拍", "细节特写", "中景生活感"], defaultValue: "人眼平视" },
-    ],
-    supplements: ["空间层次", "真实材质", "自然光", "透视合理", "家具布局"],
-    promptStructures: {
-      stable: "现代客厅真实室内摄影，自然光进入空间，合理透视，家具布局舒适，木饰面、亚麻与浅色石材材质真实，空间层次清楚。",
-      creative: "强化风格叙事、材质对比和生活痕迹，提供更有灵感感的空间方案。",
-      commercial: "强调设计方案图可交付感，干净高级，适合提案、官网和案例展示。",
-    },
-    qualityChecklist: ["透视自然", "家具比例合理", "材质真实", "光线舒适", "空间有层次"],
-  },
-  {
-    id: "portrait-photo",
-    name: "人像写真",
-    tag: "人物形象",
-    icon: "人",
-    scenario: "头像 / 半身写真 / 商务形象照",
-    description: "自动补全妆造、姿态、光线、背景和镜头语言。",
-    recommendedRatio: "3:4",
-    defaultCount: 4,
-    defaultQuality: "high",
-    defaultSubject: "自然半身人像",
-    defaultGoal: "生成自然专业的人像写真、头像和商务形象候选图。",
-    defaultScene: "窗边浅色室内，柔和侧逆光，背景干净，浅景深。",
-    defaultAudience: "个人形象用户、品牌创始人、内容创作者和摄影工作室。",
-    clickHint: "打开人像写真工作流",
-    emptyStateHint: "不填写也会默认生成自然半身人像写真。",
-    defaultValues: {
-      portraitType: "自然写真",
-      temperament: "年轻、温柔、专业、松弛",
-      styling: "淡妆、白色针织衫、干净发型",
-      scene: "窗边浅色室内",
-      light: "柔和侧逆光",
-      pose: "自然微笑，看向镜头，放松坐姿",
-    },
-    promptBlueprint: "人像类型 + 气质 + 妆造服装 + 场景 + 光线 + 表情姿态 + 镜头语言 + 真实肤色",
-    negativePrompt: `${COMMON_AGENT_NEGATIVE_PROMPT}，畸形五官，畸形手部，过度磨皮，表情僵硬，背景杂乱`,
-    fields: [
-      { id: "portraitType", label: "人像类型", type: "select", options: ["自然写真", "商务形象", "头像", "杂志大片", "生活方式"], defaultValue: "自然写真" },
-      { id: "temperament", label: "年龄气质", type: "text", placeholder: "年轻、成熟、温柔、专业、松弛" },
-      { id: "styling", label: "妆造 / 服装", type: "textarea", placeholder: "淡妆、白衬衫、针织衫、干净发型" },
-      { id: "scene", label: "场景", type: "text", placeholder: "窗边、街角、棚拍灰背景、咖啡馆" },
-      { id: "light", label: "光线", type: "select", options: ["柔和侧逆光", "自然窗光", "棚拍柔光", "日落暖光", "电影感暗调"], defaultValue: "柔和侧逆光" },
-      { id: "pose", label: "表情姿态", type: "text", placeholder: "自然微笑、看向镜头、侧脸、放松坐姿" },
-    ],
-    supplements: ["肤色真实", "柔和光线", "浅景深", "自然表情", "背景干净"],
-    promptStructures: {
-      stable: "自然半身人像写真，柔和侧逆光，真实肤色，浅景深，表情放松，背景干净，适合头像和写真交付。",
-      creative: "加入更强杂志感镜头、胶片质感和叙事氛围，适合探索视觉风格。",
-      commercial: "强调专业可信的形象照质感，光线高级，构图稳重，适合商务和品牌展示。",
-    },
-    qualityChecklist: ["五官自然", "肤色真实", "手部不异常", "表情放松", "光线高级"],
-  },
-  {
-    id: "food-photo",
-    name: "餐饮美食",
-    tag: "菜单转化",
-    icon: "食",
-    scenario: "菜品图 / 外卖主图 / 餐厅宣传图",
-    description: "补全食物质感、摆盘、蒸汽和商业美食摄影语言。",
-    recommendedRatio: "1:1",
-    defaultCount: 4,
-    defaultQuality: "high",
-    defaultSubject: "番茄牛腩饭",
-    defaultGoal: "生成菜单、外卖主图和餐厅宣传可用的商业美食图。",
-    defaultScene: "干净浅色桌面，菜品清晰，热气蒸腾，食欲感强。",
-    defaultAudience: "餐饮商家、外卖运营、菜单设计和餐厅推广用户。",
-    clickHint: "打开餐饮美食工作流",
-    emptyStateHint: "不填写也会默认生成番茄牛腩饭商业菜单图。",
-    defaultValues: {
-      dish: "番茄牛腩饭",
-      cuisine: "中式轻食",
-      ingredients: "牛肉块、番茄浓汁、新鲜香草",
-      plating: "外卖主图",
-      background: "干净浅色桌面",
-      freshness: "热气蒸腾",
-    },
-    promptBlueprint: "菜品名称 + 菜系 + 食材亮点 + 摆盘 + 背景 + 新鲜感 + 商业美食摄影 + 食欲质感",
-    negativePrompt: `${COMMON_AGENT_NEGATIVE_PROMPT}，食物不新鲜，颜色失真，油腻脏乱，餐具变形，塑料质感，过度假`,
-    fields: [
-      { id: "dish", label: "菜品名称", type: "text", required: true, placeholder: "例如：番茄牛腩饭" },
-      { id: "cuisine", label: "菜系", type: "text", placeholder: "中式、日式、意式、轻食" },
-      { id: "ingredients", label: "食材亮点", type: "textarea", placeholder: "牛肉块、番茄浓汁、新鲜香草" },
-      { id: "plating", label: "摆盘风格", type: "select", options: ["外卖主图", "高级餐厅摆盘", "家庭餐桌", "微距特写", "节日套餐"], defaultValue: "外卖主图" },
-      { id: "background", label: "背景", type: "select", options: ["干净浅色桌面", "木质餐桌", "深色高级背景", "厨房现场", "节日氛围"], defaultValue: "干净浅色桌面" },
-      { id: "freshness", label: "新鲜感", type: "select", options: ["热气蒸腾", "清爽新鲜", "酱汁光泽", "酥脆质感", "克制自然"], defaultValue: "热气蒸腾" },
-    ],
-    supplements: ["食物质感", "微距细节", "新鲜色泽", "餐桌氛围", "商业美食摄影"],
-    promptStructures: {
-      stable: "商业菜单图，菜品清晰有食欲，色泽自然，柔和侧光，热气蒸腾，干净摆盘，适合菜单或外卖主图。",
-      creative: "加入更强氛围光、蒸汽和食材特写，让画面更有香气和记忆点。",
-      commercial: "强调餐饮品牌交付质感，摆盘高级，背景克制，适合广告和宣传图。",
-    },
-    qualityChecklist: ["食物有食欲", "色泽自然", "构图干净", "摆盘清楚", "适合菜单或外卖"],
-  },
-  {
-    id: "saas-promo",
-    name: "App / SaaS 宣传图",
-    tag: "科技营销",
-    icon: "软",
-    scenario: "官网头图 / App 展示 / 功能介绍图",
-    description: "把功能卖点变成设备 mockup、数据感和官网视觉。",
-    recommendedRatio: "16:9",
-    defaultCount: 4,
-    defaultQuality: "high",
-    defaultSubject: "AI 图像工作台产品展示",
-    defaultGoal: "生成官网头图、产品展示图和功能介绍主视觉。",
-    defaultScene: "桌面网页设备 mockup，干净白色背景，科技光影和产品界面层级。",
-    defaultAudience: "SaaS 团队、设计团队、运营团队和企业采购用户。",
-    clickHint: "打开 App / SaaS 宣传图工作流",
-    emptyStateHint: "不填写也会默认生成 AI 图像工作台官网宣传图。",
-    defaultValues: {
-      productType: "AI 图像工作台",
-      coreFeature: "批量生图、行业 Agent、提示词优化、本地图库",
-      audience: "设计团队、运营与企业客户",
-      device: "桌面网页",
-      style: "Apple 官网感",
-      background: "干净白色",
-    },
-    promptBlueprint: "产品类型 + 核心功能 + 目标用户 + 设备 mockup + UI 层级 + 科技光影 + 官网留白",
-    negativePrompt: `${COMMON_AGENT_NEGATIVE_PROMPT}，伪界面混乱，文字错误，层级不清，廉价科技感，过度复杂`,
-    fields: [
-      { id: "productType", label: "产品类型", type: "text", required: true, placeholder: "AI 图库、CRM、数据看板、效率工具" },
-      { id: "coreFeature", label: "核心功能", type: "textarea", placeholder: "批量生图、智能分析、团队管理、自动化报表" },
-      { id: "audience", label: "目标用户", type: "text", placeholder: "设计团队、运营、企业客户、开发者" },
-      { id: "device", label: "展示设备", type: "select", options: ["桌面网页", "手机 App", "平板设备", "多设备组合", "抽象界面层"], defaultValue: "桌面网页" },
-      { id: "style", label: "UI 风格", type: "select", options: ["Apple 官网感", "ChatGPT 极简", "企业级 SaaS", "深色科技", "明亮数据感"], defaultValue: "Apple 官网感" },
-      { id: "background", label: "背景风格", type: "select", options: ["干净白色", "柔和渐变光", "深色发布会", "真实办公场景", "抽象数据空间"], defaultValue: "干净白色" },
-    ],
-    supplements: ["产品界面展示", "设备 mockup", "清晰层级", "科技光影", "官网留白"],
-    promptStructures: {
-      stable: "官网头图风格，真实设备 mockup，产品界面层级清晰，数据感和科技光影适度，干净白色背景，留白充足。",
-      creative: "加入抽象数据流、光影空间和发布会感，让科技产品更有视觉冲击。",
-      commercial: "强调 B2B 可交付营销图，真实可信，留白充足，适合官网和销售资料。",
-    },
-    qualityChecklist: ["产品功能清晰", "设备 mockup 真实", "UI 层级明确", "留白充足", "适合官网营销"],
-  },
-];
-
-type EndpointOption = { value: string; label: string; description: string };
-type RuntimeModelConfig = { id: string; displayName: string; sizing: "explicit-2k4k" | "official-1k"; tags: string[] };
-
-let runtimeEndpoints: EndpointOption[] = [...ALLOWED_API_ENDPOINTS];
-let runtimeModelConfig: RuntimeModelConfig[] = [];
-let runtimePromptStarters = PROMPT_STARTERS;
-let runtimeStylePresets = STYLE_ENHANCEMENT_PRESETS;
-let runtimeIndustryAgents = INDUSTRY_AGENTS;
-let runtimeCommonNegativePrompt = COMMON_AGENT_NEGATIVE_PROMPT;
-
-function normalizeEndpointValue(url: string) {
-  const trimmed = String(url || "").trim();
-  return trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
-}
-
-function runtimeModelIds(): Set<string> {
-  return new Set(runtimeModelConfig.map((m) => m.id.replace(/^models\//, "").trim().toLowerCase()));
-}
-
-function runtimeModelDisplayName(model: string): string {
-  const norm = model.replace(/^models\//, "").trim().toLowerCase();
-  return runtimeModelConfig.find((m) => m.id.replace(/^models\//, "").trim().toLowerCase() === norm)?.displayName || model;
-}
-
-type AppConfigPayload = {
-  upstreams?: Array<{ id: string; name: string; baseUrl: string; note?: string }>;
-  models?: RuntimeModelConfig[];
-  presets?: {
-    promptStarters?: unknown[] | null;
-    stylePresets?: unknown[] | null;
-    industryAgents?: unknown[] | null;
-    negativePrompt?: string | null;
-  };
-};
-
-function applyAppConfig(config: AppConfigPayload | null | undefined) {
-  if (!config) return;
-  if (Array.isArray(config.upstreams) && config.upstreams.length > 0) {
-    const mapped = config.upstreams.map((u) => ({
-      value: normalizeEndpointValue(u.baseUrl),
-      label: u.name,
-      description: u.note || "",
-    }));
-    const oauthExtras = runtimeEndpoints.filter(
-      (ep) => ep.label.includes("OAuth") && !mapped.some((m) => m.value === ep.value),
-    );
-    runtimeEndpoints = [...mapped, ...oauthExtras];
-  }
-  runtimeModelConfig = Array.isArray(config.models) ? config.models : [];
-  const presets = config.presets || {};
-  runtimePromptStarters = Array.isArray(presets.promptStarters) && presets.promptStarters.length > 0
-    ? presets.promptStarters as typeof PROMPT_STARTERS
-    : PROMPT_STARTERS;
-  runtimeStylePresets = Array.isArray(presets.stylePresets) && presets.stylePresets.length > 0
-    ? presets.stylePresets as StyleEnhancement[]
-    : STYLE_ENHANCEMENT_PRESETS;
-  runtimeIndustryAgents = Array.isArray(presets.industryAgents) && presets.industryAgents.length > 0
-    ? presets.industryAgents as IndustryAgent[]
-    : INDUSTRY_AGENTS;
-  runtimeCommonNegativePrompt = typeof presets.negativePrompt === "string" && presets.negativePrompt.trim()
-    ? presets.negativePrompt
-    : COMMON_AGENT_NEGATIVE_PROMPT;
-}
-
-let appConfigPromise: Promise<void> | null = null;
-function fetchAppConfig(force = false): Promise<void> {
-  if (appConfigPromise && !force) return appConfigPromise;
-  appConfigPromise = fetch("/api/config")
-    .then((res) => (res.ok ? res.json() : null))
-    .then((payload) => {
-      if (payload && payload.ok) applyAppConfig(payload);
-    })
-    .catch(() => {
-      // 拉取失败时保留内置默认值
-    });
-  return appConfigPromise;
-}
 
 function createAgentDefaults(agent: IndustryAgent) {
   return agent.fields.reduce<Record<string, string>>((values, field) => {
@@ -1597,20 +738,8 @@ const fullDateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
 
 const LOCAL_LOG_STORAGE_KEY = "imageStudioLocalRequestLogs";
 const LOCAL_LOG_LIMIT = 200;
-const LOG_TEXT_LIMIT = 800;
 
-function uid() {
-  return crypto.randomUUID();
-}
 
-function getClientId() {
-  const storageKey = "imageStudioClientId";
-  const existing = localStorage.getItem(storageKey);
-  if (existing) return existing;
-  const next = uid();
-  localStorage.setItem(storageKey, next);
-  return next;
-}
 
 // 本项目是 hash 路由，但 /admin、/studio 这类 path 直链是所有人都会先试的写法
 // （服务端 SPA fallback 会返回 index.html，hash 为空就落回首页，看起来像"打不开"）。
@@ -1618,7 +747,7 @@ function getClientId() {
 (function normalizePathToHash() {
   if (typeof window === "undefined" || window.location.hash) return;
   const path = window.location.pathname.replace(/^\/+|\/+$/g, "").toLowerCase();
-  if (path === "studio" || path === "canvas" || path === "square" || path === "admin") {
+  if (path === "studio" || path === "canvas" || path === "square" || path === "admin" || path === "login") {
     window.history.replaceState(null, "", `/#${path}`);
   }
 })();
@@ -1631,16 +760,7 @@ function pageFromHash(): AppPage {
   return "home";
 }
 
-function clampNumber(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value));
-}
 
-function formatDuration(ms = 0) {
-  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-}
 
 function formatDate(value?: number) {
   if (!value) return "-";
@@ -1658,10 +778,6 @@ function formatFileDate(value = Date.now()) {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}`;
 }
 
-function formatBytes(value: number) {
-  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
-  return `${(value / 1024 / 1024).toFixed(1)} MB`;
-}
 
 // 错误分类可能是上游直接吐回来的 HTML（如 nginx 404 页），做成可读短标签再展示
 function formatErrorKeyLabel(value: string) {
@@ -1679,6 +795,99 @@ function formatErrorKeyLabel(value: string) {
 function formatCompactDuration(ms = 0) {
   if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
   return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+}
+
+const ADMIN_LIFECYCLE_LABELS: Record<string, string> = {
+  client_submitted: "用户点击提交",
+  client_persisted: "前端任务快照落盘",
+  client_request_started: "前端发送生成请求",
+  server_received: "服务端收到请求",
+  request_parsed: "请求体解析完成",
+  request_validated: "参数与配额校验通过",
+  request_rejected: "服务端拒绝请求",
+  idempotency_claimed: "requestId 幂等占位",
+  idempotent_replay: "幂等重投命中已有任务",
+  queued: "任务进入服务端队列",
+  accepted_response_sent: "服务端返回 202 接单",
+  client_accepted: "前端收到接单结果",
+  dispatched: "任务出队开始执行",
+  upstream_requested: "请求上游图片模型",
+  upstream_responded: "收到上游响应",
+  image_saved: "生成图片已落盘",
+  task_completed: "服务端任务完成",
+  task_failed: "服务端任务失败",
+  queue_timeout: "服务端排队超时",
+  server_restart_abort: "服务重启中断任务",
+  client_transport_ambiguous: "前端网络响应不确定",
+  client_reconcile_started: "前端开始按 requestId 对账",
+  client_reconcile_found: "前端对账找到任务",
+  client_reconcile_miss: "前端本轮对账未找到任务",
+  client_idempotent_retry: "前端使用同一 ID 幂等重投",
+  client_submission_rejected: "前端收到提交拒绝",
+  client_submission_unconfirmed: "前端暂无法确认接单",
+  client_result_received: "前端已取回并保存图片",
+  client_error_received: "前端已收到失败结果",
+};
+
+const ADMIN_STATUS_LABELS: Record<AdminRequestLog["status"], string> = {
+  submitting: "提交中",
+  queued: "排队中",
+  running: "生成中",
+  success: "成功",
+  error: "失败",
+};
+
+function adminLifecycleEvents(log: AdminRequestLog): GenerationLifecycleEvent[] {
+  const actual = Array.isArray(log.lifecycleEvents) ? [...log.lifecycleEvents] : [];
+  const stages = log.stages;
+  const derived: Array<{ phase: string; at?: number; source: GenerationLifecycleEvent["source"] }> = [
+    { phase: "client_submitted", at: stages?.clientSubmittedAt, source: "client" },
+    { phase: "client_persisted", at: stages?.clientPersistedAt, source: "client" },
+    { phase: "client_request_started", at: stages?.clientRequestStartedAt, source: "client" },
+    { phase: "server_received", at: stages?.receivedAt || log.startedAt || log.createdAt, source: "server" },
+    { phase: "request_parsed", at: stages?.requestParsedAt, source: "server" },
+    { phase: "request_validated", at: stages?.validatedAt, source: "server" },
+    { phase: "request_rejected", at: stages?.validationFailedAt, source: "server" },
+    { phase: "idempotency_claimed", at: stages?.idempotencyClaimedAt, source: "server" },
+    { phase: "queued", at: stages?.enqueuedAt, source: "server" },
+    { phase: "accepted_response_sent", at: stages?.acceptedResponseAt, source: "server" },
+    { phase: "client_accepted", at: stages?.clientAcceptedAt, source: "client" },
+    { phase: "dispatched", at: stages?.dispatchedAt, source: "server" },
+    { phase: "upstream_requested", at: stages?.upstreamRequestedAt, source: "upstream" },
+    { phase: "upstream_responded", at: stages?.upstreamRespondedAt, source: "upstream" },
+    { phase: "image_saved", at: stages?.imageSavedAt, source: "server" },
+    { phase: "task_completed", at: stages?.taskCompletedAt || (log.status === "success" ? log.finishedAt : undefined), source: "server" },
+    { phase: "task_failed", at: log.status === "error" ? log.finishedAt : undefined, source: "server" },
+    { phase: "client_idempotent_retry", at: stages?.lastIdempotentRetryAt, source: "client" },
+    { phase: "client_result_received", at: stages?.clientResultReceivedAt, source: "client" },
+    { phase: "client_error_received", at: stages?.clientErrorReceivedAt, source: "client" },
+  ];
+  for (const item of derived) {
+    if (typeof item.at !== "number" || actual.some((event) => event.phase === item.phase)) continue;
+    actual.push({
+      id: `derived-${item.phase}-${item.at}`,
+      phase: item.phase,
+      source: item.source,
+      at: item.at,
+    });
+  }
+  return actual
+    .filter((event) => event && typeof event.at === "number" && Number.isFinite(event.at))
+    .sort((a, b) => a.at - b.at || (a.recordedAt || a.at) - (b.recordedAt || b.at));
+}
+
+function adminLifecycleLatestLabel(log: AdminRequestLog) {
+  const events = adminLifecycleEvents(log);
+  const latest = events[events.length - 1];
+  return latest ? (ADMIN_LIFECYCLE_LABELS[latest.phase] || latest.phase) : "等待链路事件";
+}
+
+function adminLifecycleDuration(log: AdminRequestLog) {
+  if (typeof log.durationMs === "number" && (log.status === "success" || log.status === "error")) {
+    return log.durationMs;
+  }
+  const startedAt = log.stages?.clientSubmittedAt || log.startedAt || log.createdAt;
+  return Math.max(0, Date.now() - startedAt);
 }
 
 function normalizeImageType(file: File) {
@@ -1861,45 +1070,16 @@ function recordFilename(record: Job) {
   return `${formatFileDate(record.createdAt)}-${String(record.index).padStart(2, "0")}-${sanitizeFilename(record.model)}-${size}.${record.params.outputFormat}`;
 }
 
-function getProtocolDefinition(protocol: ImageProtocol) {
-  return PROTOCOLS.find((item) => item.value === protocol) || PROTOCOLS[0];
-}
 
 function isImageProtocol(value: string | null): value is ImageProtocol {
   return PROTOCOLS.some((protocol) => protocol.value === value);
 }
 
-function normalizeApiBaseUrl(value: string | null | undefined) {
-  const normalized = String(value || "").trim().replace(/\/+$/, "");
-  const matched = runtimeEndpoints.find((endpoint) => endpoint.value.replace(/\/+$/, "") === normalized);
-  return matched?.value || runtimeEndpoints[0]?.value || DEFAULT_API_URL;
-}
 
 function getAspectDefinition(value: string) {
   return ASPECT_RATIOS.find((ratio) => ratio.value === value) || ASPECT_RATIOS[0];
 }
 
-function normalizedImageModelId(model = "") {
-  return model.replace(/^models\//, "").trim().toLowerCase();
-}
-
-function isGptImage2Model(model = "") {
-  const normalized = normalizedImageModelId(model);
-  return normalized === GPT_IMAGE_2_MODEL || normalized === GPT_IMAGE_2_FAMILY_MODEL || normalized.includes("image-2");
-}
-
-function isGptImage2ProModel(model = "") {
-  return normalizedImageModelId(model) === GPT_IMAGE_2_PRO_MODEL;
-}
-
-function supportsGptImage2ExplicitSizes(model = "") {
-  const normalized = normalizedImageModelId(model);
-  return normalized === GPT_IMAGE_2_MODEL || normalized === GPT_IMAGE_2_PRO_MODEL;
-}
-
-function isGemini3ProImageModel(model = "") {
-  return normalizedImageModelId(model) === GEMINI_3_PRO_IMAGE_MODEL;
-}
 
 function protocolForImageModel(model: string, fallback: ImageProtocol = DEFAULT_PROTOCOL): ImageProtocol {
   if (isGemini3ProImageModel(model)) return "gemini-native";
@@ -1916,57 +1096,6 @@ function protocolMatchesImageModel(protocol: ImageProtocol, model = "") {
   return true;
 }
 
-function imageModelLaneLabel(model: string) {
-  if (isGemini3ProImageModel(model)) return "Gemini 原生接口";
-  if (isGptImage2ProModel(model)) return "GPT Image 2 Pro 接口";
-  if (isGptImage2Model(model)) return "GPT Image 2 接口";
-  return "图片模型";
-}
-
-function usesOfficialGptImageSizing(protocol: ImageProtocol, model = "") {
-  return isGptImage2Model(model) && !supportsGptImage2ExplicitSizes(model) && (
-    protocol === "custom-openai"
-    || protocol === "openai-images"
-    || protocol === "openai-responses"
-  );
-}
-
-function gptImage2SizeOptionsForResolution(resolution: ImageResolution) {
-  return GPT_IMAGE_2_SIZE_OPTIONS.filter((option) => option.resolution === resolution);
-}
-
-function gptImage2SizeOptionForSize(size = "") {
-  return GPT_IMAGE_2_SIZE_OPTIONS.find((option) => option.size === size);
-}
-
-function gptImage2DefaultSizeOption(aspectRatio: string, resolution: ImageResolution) {
-  const options = gptImage2SizeOptionsForResolution(resolution);
-  return options.find((option) => option.aspectRatio === aspectRatio) || options[0];
-}
-
-function explicitSizeOptionsForModel(model: string, resolution: ImageResolution) {
-  return supportsGptImage2ExplicitSizes(model) ? gptImage2SizeOptionsForResolution(resolution) : [];
-}
-
-function getSupportedAspectRatios(
-  protocol: ImageProtocol,
-  model = "",
-  resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION,
-) {
-  if (isGemini3ProImageModel(model) && protocol === "gemini-native") {
-    return [...GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS];
-  }
-  if (supportsGptImage2ExplicitSizes(model)) {
-    const res = safeImageResolution(resolution);
-    if (res === "4K") return [...GPT_IMAGE_2_4K_SUPPORTED_ASPECT_RATIOS];
-    if (res === "2K") return [...GPT_IMAGE_2_2K_SUPPORTED_ASPECT_RATIOS];
-    return [...GPT_IMAGE_2_PRO_1K_SUPPORTED_ASPECT_RATIOS];
-  }
-  if (usesOfficialGptImageSizing(protocol, model)) {
-    return [...GPT_IMAGE_SUPPORTED_ASPECT_RATIOS];
-  }
-  return getProtocolDefinition(protocol).supportedAspectRatios;
-}
 
 function isAspectRatioSupported(
   protocol: ImageProtocol,
@@ -1977,63 +1106,12 @@ function isAspectRatioSupported(
   return getSupportedAspectRatios(protocol, model, resolution).includes(aspectRatio);
 }
 
-function isImageResolution(value: unknown): value is ImageResolution {
-  return value === "1K" || value === "2K" || value === "4K";
-}
-
-function safeImageResolution(value: unknown): ImageResolution {
-  return isImageResolution(value) ? value : DEFAULT_IMAGE_RESOLUTION;
-}
-
-function scaleSize(size: string, resolution: ImageResolution) {
-  const [width, height] = size.split("x").map((item) => Number(item));
-  const multiplier = IMAGE_RESOLUTIONS.find((item) => item.value === resolution)?.multiplier || 1;
-  if (!Number.isFinite(width) || !Number.isFinite(height) || multiplier === 1) return size;
-  const MAX_EDGE = 3840;
-  let w = Math.round(width * multiplier);
-  let h = Math.round(height * multiplier);
-  const longest = Math.max(w, h);
-  if (longest > MAX_EDGE) {
-    const factor = MAX_EDGE / longest;
-    w = Math.round(width * multiplier * factor);
-    h = Math.round(height * multiplier * factor);
-  }
-  return `${w}x${h}`;
-}
-
-function baseSizeForModel(aspectRatio: string, protocol: ImageProtocol, model = "") {
-  if (isGemini3ProImageModel(model) && protocol === "gemini-native") {
-    return GEMINI_3_PRO_SIZE_BY_RATIO[aspectRatio] || GEMINI_3_PRO_SIZE_BY_RATIO["1:1"];
-  }
-  return SIZE_BY_RATIO[aspectRatio] || SIZE_BY_RATIO["1:1"];
-}
 
 function resolveSize(aspectRatio: string, resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION) {
   const baseSize = SIZE_BY_RATIO[aspectRatio] || SIZE_BY_RATIO["1:1"];
   return scaleSize(baseSize, safeImageResolution(resolution));
 }
 
-function resolveRequestSize(
-  aspectRatio: string,
-  resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION,
-  protocol: ImageProtocol,
-  model = "",
-  preferredSize = "",
-) {
-  const baseSize = baseSizeForModel(aspectRatio, protocol, model);
-  if (usesOfficialGptImageSizing(protocol, model)) return baseSize;
-  if (supportsGptImage2ExplicitSizes(model)) {
-    const res = safeImageResolution(resolution);
-    const preferredOption = gptImage2SizeOptionForSize(preferredSize);
-    if (preferredOption && preferredOption.resolution === res && preferredOption.aspectRatio === aspectRatio) {
-      return preferredOption.size;
-    }
-    const defaultOption = gptImage2DefaultSizeOption(aspectRatio, res);
-    if (defaultOption) return defaultOption.size;
-    return baseSize;
-  }
-  return scaleSize(baseSize, safeImageResolution(resolution));
-}
 
 function normalizeResolutionForRequest(
   resolution: ImageResolution,
@@ -2062,12 +1140,6 @@ function normalizeImageParams(params: Partial<ImageParams> = {}): ImageParams {
   };
 }
 
-function aspectRatioNumber(aspectRatio?: string) {
-  if (!aspectRatio) return 1;
-  const [width, height] = aspectRatio.split(":").map(Number);
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return 1;
-  return width / height;
-}
 
 function aspectRatioCss(width?: number, height?: number, fallbackAspectRatio = "1:1") {
   if (width && height && width > 0 && height > 0) return `${width} / ${height}`;
@@ -2192,6 +1264,7 @@ function historyRecordToJob(record: HistoryRecord): Job {
     startedAt: record.startedAt,
     finishedAt: record.finishedAt,
     durationMs: record.durationMs,
+    stages: record.stages,
     imageBlob: record.imageBlob,
     imageUrl: record.objectUrl,
     // 漏了这行会让主画廊对所有从 IndexedDB 读回的记录退回原图（缩略图只对本次会话生成的图生效）
@@ -2222,68 +1295,77 @@ function sortHistoryRecords(records: HistoryRecord[]) {
   });
 }
 
+function generationStatusRank(status: JobStatus) {
+  if (status === "submitting") return 0;
+  if (status === "queued") return 1;
+  if (status === "running") return 2;
+  return 3;
+}
+
 function mergeHistoryRecords(current: HistoryRecord[], incoming: HistoryRecord[]) {
-  const seen = new Set(current.map((record) => record.id));
   const next = [...current];
+  const positions = new Map(next.map((record, index) => [record.id, index]));
   incoming.forEach((record) => {
-    if (seen.has(record.id)) {
-      const existing = current.find((item) => item.id === record.id);
-      if (record.objectUrl && record.objectUrl !== existing?.objectUrl) URL.revokeObjectURL(record.objectUrl);
-      if (record.thumbUrl && record.thumbUrl !== existing?.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
+    const position = positions.get(record.id);
+    if (position !== undefined) {
+      const existing = next[position];
+      if (generationStatusRank(record.status) < generationStatusRank(existing.status)) {
+        if (record.objectUrl && record.objectUrl !== existing.objectUrl) URL.revokeObjectURL(record.objectUrl);
+        if (record.thumbUrl && record.thumbUrl !== existing.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
+        return;
+      }
+      if (existing.objectUrl && record.objectUrl && record.objectUrl !== existing.objectUrl) {
+        URL.revokeObjectURL(existing.objectUrl);
+      }
+      if (existing.thumbUrl && record.thumbUrl && record.thumbUrl !== existing.thumbUrl) {
+        URL.revokeObjectURL(existing.thumbUrl);
+      }
+      next[position] = {
+        ...existing,
+        ...record,
+        objectUrl: record.objectUrl ?? existing.objectUrl,
+        thumbUrl: record.thumbUrl ?? existing.thumbUrl,
+      };
       return;
     }
-    seen.add(record.id);
+    positions.set(record.id, next.length);
     next.push(record);
   });
   return sortHistoryRecords(next);
 }
 
 function mergeHistoricalJobs(current: Job[], incoming: Job[]) {
-  const seen = new Set(current.map((record) => record.id));
   const next = [...current];
+  const positions = new Map(next.map((record, index) => [record.id, index]));
   incoming.forEach((record) => {
-    if (seen.has(record.id)) {
-      const existing = current.find((item) => item.id === record.id);
-      if (record.imageUrl && record.imageUrl !== existing?.imageUrl) URL.revokeObjectURL(record.imageUrl);
-      if (record.thumbUrl && record.thumbUrl !== existing?.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
+    const position = positions.get(record.id);
+    if (position !== undefined) {
+      const existing = next[position];
+      if (generationStatusRank(record.status) < generationStatusRank(existing.status)) {
+        if (record.imageUrl && record.imageUrl !== existing.imageUrl) URL.revokeObjectURL(record.imageUrl);
+        if (record.thumbUrl && record.thumbUrl !== existing.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
+        return;
+      }
+      if (existing.imageUrl && record.imageUrl && record.imageUrl !== existing.imageUrl) {
+        URL.revokeObjectURL(existing.imageUrl);
+      }
+      if (existing.thumbUrl && record.thumbUrl && record.thumbUrl !== existing.thumbUrl) {
+        URL.revokeObjectURL(existing.thumbUrl);
+      }
+      next[position] = {
+        ...existing,
+        ...record,
+        imageUrl: record.imageUrl ?? existing.imageUrl,
+        thumbUrl: record.thumbUrl ?? existing.thumbUrl,
+      };
       return;
     }
-    seen.add(record.id);
+    positions.set(record.id, next.length);
     next.push(record);
   });
   return sortGenerationRecords(next);
 }
 
-function openDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 3);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      const store = db.objectStoreNames.contains(STORE_NAME)
-        ? request.transaction!.objectStore(STORE_NAME)
-        : db.createObjectStore(STORE_NAME, { keyPath: "id" });
-      if (!store.indexNames.contains("createdAt")) {
-        store.createIndex("createdAt", "createdAt");
-      }
-      if (!db.objectStoreNames.contains(CANVAS_STATE_STORE)) {
-        db.createObjectStore(CANVAS_STATE_STORE);
-      }
-      if (!db.objectStoreNames.contains(CANVAS_IMAGES_STORE)) {
-        db.createObjectStore(CANVAS_IMAGES_STORE);
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => {
-      if (request.error?.name === "VersionError") {
-        const retry = indexedDB.open(DB_NAME);
-        retry.onsuccess = () => resolve(retry.result);
-        retry.onerror = () => reject(retry.error);
-      } else {
-        reject(request.error);
-      }
-    };
-  });
-}
 
 async function getHistoryRecordsPage({
   limit = HISTORY_PAGE_SIZE,
@@ -2351,6 +1433,122 @@ async function saveHistoryRecord(record: StoredHistoryRecord) {
   });
 }
 
+async function getRecentHistoryRecovery(since: number) {
+  const db = await openDb();
+  return new Promise<{
+    requestIds: Set<string>;
+    pendingRecords: StoredHistoryRecord[];
+  }>((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const store = tx.objectStore(STORE_NAME);
+    const requestIds = new Set<string>();
+    const pendingRecords: StoredHistoryRecord[] = [];
+    const collect = (record: StoredHistoryRecord) => {
+      if (record.createdAt < since) return;
+      if (record.requestId) requestIds.add(record.requestId);
+      if (record.status === "submitting" || record.status === "queued" || record.status === "running") {
+        pendingRecords.push(record);
+      }
+    };
+    if (!store.indexNames.contains("createdAt")) {
+      const request = store.getAll();
+      request.onsuccess = () => {
+        (request.result as StoredHistoryRecord[]).forEach(collect);
+        resolve({ requestIds, pendingRecords });
+      };
+      request.onerror = () => reject(request.error);
+      return;
+    }
+    const request = store.index("createdAt").openCursor(IDBKeyRange.lowerBound(since));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        resolve({ requestIds, pendingRecords });
+        return;
+      }
+      collect(cursor.value as StoredHistoryRecord);
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function recoveredTaskRecord(task: ServerGenerationTask): StoredHistoryRecord {
+  const outputFormat = task.params?.outputFormat;
+  const promptVariant = task.promptVariant === "creative" || task.promptVariant === "commercial"
+    ? task.promptVariant
+    : task.promptVariant === "stable"
+      ? "stable"
+      : undefined;
+  return {
+    id: `server-${task.requestId}`,
+    requestId: task.requestId,
+    batchId: task.batchId || task.requestId,
+    index: task.batchIndex || 1,
+    total: task.batchTotal || 1,
+    protocol: task.protocol || DEFAULT_PROTOCOL,
+    prompt: task.prompt,
+    model: task.model,
+    params: normalizeImageParams({
+      aspectRatio: task.params?.aspectRatio,
+      size: task.params?.size,
+      resolution: isImageResolution(task.params?.resolution) ? task.params.resolution : DEFAULT_IMAGE_RESOLUTION,
+      quality: task.params?.quality,
+      outputFormat: outputFormat === "jpeg" || outputFormat === "webp" ? outputFormat : "png",
+      batchCount: task.batchTotal || 1,
+      concurrency: 1,
+      retryLimit: 0,
+      seed: task.params?.seed || "",
+      negativePrompt: task.negativePrompt || "",
+    }),
+    referenceImages: [],
+    status: task.status === "queued" || task.status === "running" ? task.status : "submitting",
+    createdAt: task.createdAt,
+    startedAt: task.stages?.receivedAt || task.createdAt,
+    durationMs: task.durationMs,
+    stages: task.stages,
+    agentId: task.agentId,
+    agentName: task.agentName,
+    agentScenario: task.agentScenario,
+    promptVariant,
+  };
+}
+
+function storedRecordForJob(
+  job: Job,
+  overrides: Partial<StoredHistoryRecord> = {},
+): StoredHistoryRecord {
+  return {
+    id: job.id,
+    requestId: job.requestId,
+    batchId: job.batchId,
+    index: job.index,
+    total: job.total,
+    protocol: job.protocol,
+    prompt: job.prompt,
+    model: job.model,
+    params: job.params,
+    referenceImages: referenceImagesForHistory(job.referenceImages),
+    submittedReferenceImages: job.submittedReferenceImages,
+    status: job.status,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    durationMs: job.durationMs,
+    stages: job.stages,
+    imageBlob: job.imageBlob,
+    width: job.width,
+    height: job.height,
+    revisedPrompt: job.revisedPrompt,
+    errorDetail: job.errorDetail,
+    agentId: job.agentId,
+    agentName: job.agentName,
+    agentScenario: job.agentScenario,
+    promptVariant: job.promptVariant,
+    ...overrides,
+  };
+}
+
 async function deleteHistoryRecord(id: string) {
   const db = await openDb();
   return new Promise<void>((resolve, reject) => {
@@ -2388,75 +1586,26 @@ async function clearHistoryRecords() {
   const db = await openDb();
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readwrite");
-    tx.objectStore(STORE_NAME).clear();
+    const request = tx.objectStore(STORE_NAME).openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      const record = cursor.value as StoredHistoryRecord;
+      // 未终态任务的 requestId 是断线恢复凭据，“清空历史”不能把它一并删掉。
+      if (record.status === "success" || record.status === "error") cursor.delete();
+      cursor.continue();
+    };
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
-  });
-}
-
-// ── Canvas IndexedDB Persistence ──
-
-type CanvasPersistedState = {
-  nodes: Array<Omit<CanvasNode, "objectUrl">>;
-  edges: CanvasEdge[];
-  viewport: CanvasViewport;
-  lastSavedAt: number;
-};
-
-async function saveCanvasStateToDB(state: CanvasPersistedState): Promise<void> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(CANVAS_STATE_STORE, "readwrite");
-    tx.objectStore(CANVAS_STATE_STORE).put(state, CANVAS_STATE_KEY);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function loadCanvasStateFromDB(): Promise<CanvasPersistedState | null> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(CANVAS_STATE_STORE, "readonly");
-    const request = tx.objectStore(CANVAS_STATE_STORE).get(CANVAS_STATE_KEY);
-    request.onsuccess = () => resolve(request.result ?? null);
     request.onerror = () => reject(request.error);
   });
 }
 
-// 画布缩略图复用同一个 store，key 加 :thumb 后缀——避免升 IndexedDB 版本，且对老数据天然兼容
-function canvasThumbKey(nodeId: string) {
-  return `${nodeId}:thumb`;
-}
 
-async function saveCanvasImageToDB(nodeId: string, blob: Blob): Promise<void> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(CANVAS_IMAGES_STORE, "readwrite");
-    tx.objectStore(CANVAS_IMAGES_STORE).put(blob, nodeId);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
 
-async function loadCanvasImageFromDB(nodeId: string): Promise<Blob | null> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(CANVAS_IMAGES_STORE, "readonly");
-    const request = tx.objectStore(CANVAS_IMAGES_STORE).get(nodeId);
-    request.onsuccess = () => resolve(request.result ?? null);
-    request.onerror = () => reject(request.error);
-  });
-}
 
-async function deleteCanvasImageFromDB(nodeId: string): Promise<void> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(CANVAS_IMAGES_STORE, "readwrite");
-    tx.objectStore(CANVAS_IMAGES_STORE).delete(nodeId);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
+
+
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -2467,14 +1616,6 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
-function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
-  });
-}
 
 function createReferenceThumbnail(dataUrl: string, maxEdge = 160): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -2506,101 +1647,8 @@ function createReferenceThumbnail(dataUrl: string, maxEdge = 160): Promise<strin
   });
 }
 
-const LIST_THUMB_MAX_EDGE = 512;
-const LIST_THUMB_QUALITY = 0.78;
 
-// 列表缩略图：等比缩放不裁剪。收益在位图解码内存（2048² 原图解码后 16.8MB，512² 只要 1MB）。
-// 与 createSquareThumbnail 的区别：入参出参都是 Blob，且小图也会重编码——因为目标是压像素数，
-// 原图哪怕体积小，解码后的位图内存仍由像素数决定。
-function createListThumbnail(blob: Blob): Promise<{ blob: Blob; width: number; height: number } | null> {
-  return new Promise((resolve) => {
-    const sourceUrl = URL.createObjectURL(blob);
-    const image = new Image();
-    const cleanup = () => URL.revokeObjectURL(sourceUrl);
-    image.onload = () => {
-      const naturalWidth = image.naturalWidth;
-      const naturalHeight = image.naturalHeight;
-      const longestEdge = Math.max(naturalWidth, naturalHeight);
-      if (!longestEdge) {
-        cleanup();
-        resolve(null);
-        return;
-      }
-      const scale = Math.min(1, LIST_THUMB_MAX_EDGE / longestEdge);
-      const width = Math.max(1, Math.round(naturalWidth * scale));
-      const height = Math.max(1, Math.round(naturalHeight * scale));
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const context = canvas.getContext("2d", { alpha: true });
-      if (!context) {
-        cleanup();
-        resolve(null);
-        return;
-      }
-      context.imageSmoothingEnabled = true;
-      context.imageSmoothingQuality = "high";
-      context.drawImage(image, 0, 0, width, height);
-      cleanup();
-      canvas.toBlob(
-        (result) => {
-          if (result) {
-            resolve({ blob: result, width, height });
-            return;
-          }
-          // WebP 编码失败降级 PNG；再失败就放弃缩略图，渲染点会回退原图
-          canvas.toBlob(
-            (png) => resolve(png ? { blob: png, width, height } : null),
-            "image/png",
-          );
-        },
-        "image/webp",
-        LIST_THUMB_QUALITY,
-      );
-    };
-    image.onerror = () => {
-      cleanup();
-      resolve(null);
-    };
-    image.src = sourceUrl;
-  });
-}
 
-function createSquareThumbnail(dataUrl: string, maxEdge = 1024): Promise<{ dataUrl: string; width: number; height: number }> {
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    image.onload = () => {
-      const naturalWidth = image.naturalWidth;
-      const naturalHeight = image.naturalHeight;
-      const longestEdge = Math.max(naturalWidth, naturalHeight);
-      if (longestEdge > 0 && longestEdge <= maxEdge) {
-        resolve({ dataUrl, width: naturalWidth, height: naturalHeight });
-        return;
-      }
-      const scale = longestEdge > 0 ? Math.min(1, maxEdge / longestEdge) : 1;
-      const width = Math.max(1, Math.round(naturalWidth * scale));
-      const height = Math.max(1, Math.round(naturalHeight * scale));
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const context = canvas.getContext("2d", { alpha: true });
-      if (!context) {
-        reject(new Error("无法创建广场压缩图"));
-        return;
-      }
-      context.imageSmoothingEnabled = true;
-      context.imageSmoothingQuality = "high";
-      context.drawImage(image, 0, 0, width, height);
-      try {
-        resolve({ dataUrl: canvas.toDataURL("image/webp", 0.82), width, height });
-      } catch {
-        resolve({ dataUrl: canvas.toDataURL("image/png"), width, height });
-      }
-    };
-    image.onerror = () => reject(new Error("无法读取广场推荐图"));
-    image.src = dataUrl;
-  });
-}
 
 async function fileToReference(file: File): Promise<UploadedReference> {
   const type = normalizeImageType(file);
@@ -2709,24 +1757,7 @@ async function fileToReference(file: File): Promise<UploadedReference> {
   };
 }
 
-async function dataUrlToBlob(dataUrl: string) {
-  const response = await fetch(dataUrl);
-  return response.blob();
-}
 
-// 原图不可用的原因分类：预览/下载要据此给出具体提示，绝不能静默降级成缩略图
-type FullImageFailReason = "purged" | "lost" | "network";
-
-class FullImageError extends Error {
-  reason: FullImageFailReason;
-  status?: number;
-  constructor(reason: FullImageFailReason, message: string, status?: number) {
-    super(message);
-    this.name = "FullImageError";
-    this.reason = reason;
-    this.status = status;
-  }
-}
 
 function describeFullImageError(error: unknown): { title: string; hint: string; canRetry: boolean } {
   const reason = error instanceof FullImageError ? error.reason : "network";
@@ -2752,38 +1783,7 @@ function describeFullImageError(error: unknown): { title: string; hint: string; 
   };
 }
 
-async function generatedImageToBlob(image: { url?: string; dataUrl?: string }): Promise<Blob> {
-  if (image.url) {
-    let response: Response;
-    try {
-      response = await fetch(image.url);
-    } catch {
-      throw new FullImageError("network", "读取服务器图片失败（网络错误）");
-    }
-    if (!response.ok) {
-      // 404 = 文件已被日志裁剪清理，与网络故障是两回事，提示文案也不同
-      throw new FullImageError(
-        response.status === 404 ? "purged" : "network",
-        `读取服务器图片失败（HTTP ${response.status}）`,
-        response.status,
-      );
-    }
-    return response.blob();
-  }
-  if (image.dataUrl) {
-    return dataUrlToBlob(image.dataUrl);
-  }
-  throw new FullImageError("lost", "响应中没有图片数据");
-}
 
-function getImageSize(url: string): Promise<{ width: number; height: number }> {
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
-    image.onerror = () => reject(new Error("无法读取图片尺寸"));
-    image.src = url;
-  });
-}
 
 function downloadUrl(url: string, filename: string) {
   const anchor = document.createElement("a");
@@ -2911,10 +1911,6 @@ function loadBooleanSetting(key: string, fallback: boolean) {
   return fallback;
 }
 
-function truncateForLog(value: string, limit = LOG_TEXT_LIMIT) {
-  if (value.length <= limit) return value;
-  return `${value.slice(0, limit)}...(${value.length} chars)`;
-}
 
 function describeReferenceForLog(summary: ReferenceSummary, model: string) {
   if (summary.status === "none") return `模型 ${model}，无参考图。`;
@@ -3012,41 +2008,19 @@ function isRetryableError(errorDetail: unknown): boolean {
   } else if (typeof record.errorMessage === "string") {
     messageRaw = record.errorMessage;
   }
-  return /timeout|network|connection|abort|fetch failed|econnreset|etimedout|enotfound/.test(messageRaw.toLowerCase());
+  return /timeout|network|connection|abort|fetch failed|failed to fetch|load failed|econnreset|etimedout|enotfound/.test(messageRaw.toLowerCase());
 }
 
-async function readApiJson<T>(response: Response, endpoint: string): Promise<T> {
-  const contentType = response.headers.get("content-type") || "";
-  const text = await response.text();
-  if (!text.trim()) return {} as T;
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    const looksHtml = /^\s*</.test(text);
-    throw {
-      status: response.status,
-      endpoint,
-      contentType,
-      error: looksHtml
-        ? "服务返回了 HTML，不是 JSON。线上通常是 /api 路由未命中、请求体过大、网关拦截或部署平台返回了错误页。"
-        : "服务返回了不可解析的 JSON。",
-      raw: truncateForLog(text, 1600),
-    };
-  }
-}
 
-function maskApiKeyForLog(apiKey: string, rememberKey: boolean) {
+function maskApiKeyForLog(apiKey: string, _rememberKey: boolean) {
   const trimmed = apiKey.trim();
   return {
     present: trimmed.length > 0,
     length: trimmed.length,
-    prefix: trimmed ? trimmed.slice(0, 6) : "",
-    suffix: trimmed.length > 4 ? trimmed.slice(-4) : "",
-    source: trimmed
-      ? rememberKey
-        ? "localStorage:imageStudioApiKey"
-        : "sessionStorage:imageStudioApiKey"
-      : "empty",
+    // 只留前缀，且短 Key 一律不回显：诊断文件是用户会直接发给客服的，
+    // 前缀+后缀+精确长度合起来足以显著缩小暴力猜测空间。
+    // 也不再输出 source（Key 存在哪个 storage）——那等于附赠一份取用说明。
+    prefix: trimmed.length >= API_KEY_MASK_MIN_LENGTH ? trimmed.slice(0, 4) : "",
   };
 }
 
@@ -3169,6 +2143,16 @@ function preferModel(models: string[], current: string) {
   );
 }
 
+// 只取上游真实返回、且在白名单内、且与当前协议匹配的生图模型。
+// 这是「用户这把 Key 到底能不能生图」的唯一判据。
+function upstreamImageModels(protocol: ImageProtocol, upstreamModels: string[] = []) {
+  return filterAllowedImageModels(upstreamModels)
+    .filter((model) => protocolMatchesImageModel(protocol, model));
+}
+
+// 含协议默认模型的列表，仅用于「尚未验证 Key」时的界面预览。
+// 注意：绝不能拿它当作可生成的依据——默认模型是本地常量，
+// 用户的 Key 未必有权限，混进去会让按钮可点、点了却在上游失败。
 function imageModelsForProtocol(protocol: ImageProtocol, upstreamModels: string[] = []) {
   return filterAllowedImageModels([
     ...upstreamModels,
@@ -3625,6 +2609,8 @@ function createJob(
 ): Job {
   return {
     id: uid(),
+    // 用户点击时即分配 requestId；后续前端排队、落盘、POST、对账都沿用这一 ID。
+    requestId: uid(),
     batchId,
     index,
     total,
@@ -3651,6 +2637,38 @@ export default function App() {
   const [homePrompt, setHomePrompt] = useState("");
   // 首页提交后落进 studio 的待办（时间戳 + 提示词快照），等 canRequestGenerate 就绪后自动发车
   const homeSubmitPendingRef = useRef<{ at: number; prompt: string } | null>(null);
+  // 工作台记录 → 画布的待导入载荷；画布挂载并加载完成后消费一次即清空
+  const [canvasImport, setCanvasImport] = useState<CanvasImportPayload | null>(null);
+  // 推荐到广场时隐藏提示词（roadmap PRD B1，本机偏好）
+  const [hidePromptOnShare, setHidePromptOnShare] = useState(() => {
+    try { return localStorage.getItem("imageStudioHidePromptOnShare") === "true"; } catch { return false; }
+  });
+  // 配方快照 + 参考图库（roadmap PRD B2/B3，本机 IndexedDB）
+  const [recipes, setRecipes] = useState<Recipe[]>([]);
+  const [referenceLibrary, setReferenceLibrary] = useState<ReferenceLibraryItem[]>([]);
+  const [isRefLibraryOpen, setIsRefLibraryOpen] = useState(false);
+  // 需求反馈弹窗（2026-07-27）
+  const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
+  // 侧栏历史筛选（roadmap PRD B4）
+  const [sidebarFilterStatus, setSidebarFilterStatus] = useState<"all" | "success" | "error">("all");
+  const [sidebarSearch, setSidebarSearch] = useState("");
+
+  useEffect(() => {
+    void refreshRecipes();
+    void refreshReferenceLibrary();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // 跨页轻提示（任务完成、未知链接等），4 秒自动消失
+  const [appNotice, setAppNotice] = useState("");
+  const appNoticeTimerRef = useRef(0);
+  function showAppNotice(message: string) {
+    setAppNotice(message);
+    window.clearTimeout(appNoticeTimerRef.current);
+    appNoticeTimerRef.current = window.setTimeout(() => setAppNotice(""), 4000);
+  }
+  // 人在别的页面时任务全部跑完 → 提醒一句（roadmap PRD N2 跨页任务感知）。
+  // 只在「有→无」的沿上触发一次，studio 页内已有自己的完成反馈，不重复打扰。
+  const prevActiveJobsRef = useRef(0);
   const [activePage, setActivePage] = useState<AppPage>(pageFromHash);
   const [configVersion, setConfigVersion] = useState(0);
   const [modelStats, setModelStats] = useState<Record<string, ModelStat>>({});
@@ -3674,6 +2692,15 @@ export default function App() {
   const [verifiedModelAt, setVerifiedModelAt] = useState(0);
   const [visibleRecords, setVisibleRecords] = useState<Job[]>([]);
   const [sidebarRecords, setSidebarRecords] = useState<HistoryRecord[]>([]);
+  const filteredSidebarRecords = useMemo(() => {
+    const query = sidebarSearch.trim().toLowerCase();
+    return sidebarRecords.filter((record) => {
+      if (sidebarFilterStatus === "success" && record.status !== "success") return false;
+      if (sidebarFilterStatus === "error" && record.status !== "error") return false;
+      if (query && !record.prompt.toLowerCase().includes(query) && !record.model.toLowerCase().includes(query)) return false;
+      return true;
+    });
+  }, [sidebarRecords, sidebarFilterStatus, sidebarSearch]);
   const [highlightedRecordId, setHighlightedRecordId] = useState<string>("");
   const [previewItem, setPreviewItem] = useState<PreviewItem | null>(null);
   const [squareRecommendState, setSquareRecommendState] = useState<Record<string, SquareRecommendStatus>>({});
@@ -3753,6 +2780,7 @@ export default function App() {
   const paramsRef = useRef(params);
   const recordElementRefs = useRef(new Map<string, HTMLElement>());
   const startIntentRef = useRef(0);
+  const pendingGenerationIntentRef = useRef<GenerationIntent | null>(null);
   const sendLaunchFrameRef = useRef<number | undefined>(undefined);
   const sendLaunchTimerRef = useRef<number | undefined>(undefined);
   const modelLoadRequestRef = useRef(0);
@@ -3793,14 +2821,23 @@ export default function App() {
 
   const selectableImageModels = useMemo(
     () => {
-      // 配置已加载时，只显示后台模型白名单里启用的模型（精确、按配置排序）
+      // Key 已验证：只列出「后台白名单 ∩ 这把 Key 实际可用」的模型。
+      // 列白名单全量会让用户选到自己没权限的模型，点了才在上游失败。
+      if (isModelConnectionVerified && models.length > 0) {
+        if (runtimeModelConfig.length > 0) {
+          const owned = new Set(models.map((m) => normalizedModelId(m)));
+          return runtimeModelConfig.map((m) => m.id).filter((id) => owned.has(normalizedModelId(id)));
+        }
+        return models;
+      }
+      // 未验证时展示白名单全量，仅供预览（此时 canGenerate 本就为 false）
       if (runtimeModelConfig.length > 0) {
         return runtimeModelConfig.map((m) => m.id);
       }
       return filterAllowedImageModels([...models, ...PRIMARY_IMAGE_MODELS]);
     },
     // configVersion 参与依赖：配置拉取完成后重新计算，剔除非白名单模型
-    [models, configVersion],
+    [models, configVersion, isModelConnectionVerified],
   );
   const filteredModels = useMemo(() => {
     const query = modelFilter.trim().toLowerCase();
@@ -3819,11 +2856,13 @@ export default function App() {
         stats[record.status] += 1;
         return stats;
       },
-      { queued: 0, running: 0, success: 0, error: 0 } as Record<JobStatus, number>,
+      { submitting: 0, queued: 0, running: 0, success: 0, error: 0 } as Record<JobStatus, number>,
     );
   }, [visibleRecords]);
   const successfulVisibleRecords = visibleRecords.filter((record) => record.status === "success" && record.imageUrl);
-  const selectableVisibleRecords = visibleRecords.filter((record) => record.status !== "running");
+  const selectableVisibleRecords = visibleRecords.filter(
+    (record) => record.status === "success" || record.status === "error",
+  );
   const selectedRecords = useMemo(
     () => visibleRecords.filter((record) => selectedRecordIds.has(record.id)),
     [selectedRecordIds, visibleRecords],
@@ -3871,11 +2910,28 @@ export default function App() {
     isModelConnectionVerified &&
     aspectRatioSupported;
   const canRequestGenerate = canGenerate && !isPromptAnalyzing && !analysisCountdown && !isAgentModeBusy;
+  // 按钮变灰必须说得出原因，否则用户只会反复点击然后困惑
+  const blockedReason = (() => {
+    if (canGenerate) return "";
+    if (apiConfig.apiKey.trim().length < API_KEY_MIN_LENGTH) return "请先填写 API Key";
+    if (modelState.status === "loading" || isAutoLoadingModels) return "正在验证 API Key 并读取模型";
+    if (modelState.status === "error") return modelState.message || "API Key 验证失败";
+    if (!isModelConnectionVerified) return "等待 API Key 验证通过";
+    if (models.length === 0 || selectableImageModels.length === 0) {
+      return "该 API Key 下没有可用的生图模型，请更换 Key 或联系服务商开通";
+    }
+    if (!selectedModel) return "请选择一个生图模型";
+    if (!models.includes(selectedModel)) return `当前 Key 没有 ${selectedModel} 的权限，请换一个模型`;
+    if (!aspectRatioSupported) return "当前宽高比不被该模型支持";
+    if (!prompt.trim()) return "请输入提示词";
+    return "暂时无法生成";
+  })();
   const canUseSquareIdentity = apiConfig.apiKey.trim().length >= API_KEY_MIN_LENGTH;
 
   useEffect(() => {
     void loadMainRecordsPage();
     void loadSidebarRecordsPage();
+    void importServerOrphanTasks();
   }, []);
 
   // 老记录回填缩略图：分批小步跑，避免一次解码大量原图把主线程顶住。
@@ -3988,12 +3044,31 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const active = queueStats.running + queueStats.queued;
+    const prev = prevActiveJobsRef.current;
+    prevActiveJobsRef.current = active;
+    if (prev > 0 && active === 0 && activePage !== "studio") {
+      showAppNotice("生成任务已全部完成，可回工作台查看");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queueStats, activePage]);
+
+  useEffect(() => {
     let cancelled = false;
     const hash = window.location.hash;
     const isOauthReturn = hash === "#oauth-success" || hash === "#oauth-error";
     if (isOauthReturn) {
       window.history.replaceState(null, "", window.location.pathname);
       setActivePage("home");
+    } else if (hash === "#login") {
+      // /login 直链（roadmap PRD N3）：直接进 OAuth 流程，分享登录入口的真实场景
+      window.history.replaceState(null, "", window.location.pathname);
+      window.location.href = "/api/auth/oauth/login";
+      return;
+    } else if (hash && !["#studio", "#square", "#canvas"].includes(hash) && !hash.startsWith("#admin")) {
+      // 未知 hash：pageFromHash 已静默落回首页，这里补一句提示，别让用户以为链接坏了
+      window.history.replaceState(null, "", window.location.pathname);
+      showAppNotice("页面不存在，已回到首页");
     }
 
     (async () => {
@@ -4021,7 +3096,9 @@ export default function App() {
               ...prev,
               apiKey: me.apiKey!,
               baseUrl: normalizeApiBaseUrl(baseUrl) || prev.baseUrl,
-              rememberKey: true,
+              // 不强制 rememberKey：这是提供方下发的真实上游 Key，
+              // 用户若刻意取消了「记住 API Key」，登录不应替他改回长期存储。
+              // 未勾选时它仍在 sessionStorage 中，本次会话照常可用。
             }));
           }
         } else if (hash === "#oauth-error") {
@@ -4380,13 +3457,374 @@ export default function App() {
     }
   }
 
+  async function importServerOrphanTasks() {
+    const since = Date.now() - 24 * 60 * 60 * 1000;
+    try {
+      const [localRecovery, serverTasks] = await Promise.all([
+        getRecentHistoryRecovery(since),
+        fetchGenerationTasks({ clientId: getClientId(), since }),
+      ]);
+      const recovered = serverTasks
+        .filter((task) => !localRecovery.requestIds.has(task.requestId))
+        .map(recoveredTaskRecord);
+      await Promise.all(recovered.map(saveHistoryRecord));
+      const pendingHistory = localRecovery.pendingRecords.map((record): HistoryRecord => ({
+        ...record,
+        params: normalizeImageParams(record.params),
+        referenceImages: normalizeStoredReferenceImages(record.referenceImages),
+      }));
+      const recoveredHistory = recovered.map((record): HistoryRecord => ({
+        ...record,
+        referenceImages: normalizeStoredReferenceImages(record.referenceImages),
+      }));
+      const resumableHistory = [...pendingHistory, ...recoveredHistory];
+      if (resumableHistory.length === 0) return;
+      setVisibleRecords((current) =>
+        mergeHistoricalJobs(current, resumableHistory.map(historyRecordToJob)));
+      setSidebarRecords((current) => mergeHistoryRecords(current, resumableHistory));
+      if (recovered.length > 0) {
+        showAppNotice(`已找回 ${recovered.length} 个服务端任务，正在同步结果`);
+      }
+    } catch {
+      // 启动恢复失败不阻塞工作台；常驻任务对账和下次刷新还会继续尝试。
+    }
+  }
+
+  // ── Studio 任务对账 ──────────────────────────────────────────
+  // 服务端异步执行后，结果不再随 POST 返回。这里轮询 /api/tasks，
+  // 把 queued/running 的记录推进到终态，并把图片取回本地。
+  // 关掉页面再回来同样走这条路径——这正是「关页面不丢」的实现。
+  const visibleRecordsRef = useRef<Job[]>([]);
+  visibleRecordsRef.current = visibleRecords;
+  const reconcilingRef = useRef(false);
+  const studioTaskMissCountsRef = useRef<Map<string, number>>(new Map());
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const reconcile = async () => {
+      if (reconcilingRef.current) return;
+      const pending = visibleRecordsRef.current.filter(
+        (job) => (
+          job.status === "submitting"
+          || job.status === "queued"
+          || job.status === "running"
+        ) && job.requestId,
+      );
+      if (pending.length === 0) return;
+      reconcilingRef.current = true;
+      try {
+        const ids = pending.flatMap((job) => job.requestId ? [job.requestId] : []);
+        const tasks = await fetchGenerationTasks({ clientId: getClientId(), ids });
+        if (cancelled) return;
+        const byId = new Map(tasks.map((task) => [task.requestId, task]));
+
+        for (const job of pending) {
+          const task = byId.get(job.requestId as string);
+          if (!task) {
+            // 查询本身成功但连续 60 秒都找不到该 ID，说明两次同 ID POST 都没有被受理。
+            // 此时转为可重试失败，避免“状态确认中”永久悬挂；查询接口不可达不会进入这里。
+            const misses = (studioTaskMissCountsRef.current.get(job.id) || 0) + 1;
+            studioTaskMissCountsRef.current.set(job.id, misses);
+            if (misses >= 30) {
+              studioTaskMissCountsRef.current.delete(job.id);
+              const finishedAt = Date.now();
+              const errorDetail = {
+                error: "服务端持续未找到该任务，确认未接单；可以安全重试",
+                requestId: job.requestId,
+              };
+              patchVisibleRecord(job.id, { status: "error", errorDetail, finishedAt });
+              const failed = storedRecordForJob(job, {
+                status: "error",
+                errorDetail,
+                finishedAt,
+              });
+              await saveHistoryRecord(failed);
+              setSidebarRecords((current) => mergeHistoryRecords(current, [{
+                ...failed,
+                referenceImages: normalizeStoredReferenceImages(failed.referenceImages),
+              }]));
+              void reportGenerationClientEvent({
+                requestId: job.requestId as string,
+                clientId: getClientId(),
+                phase: "client_error_received",
+                occurredAt: finishedAt,
+                surface: "studio",
+                localRecordId: job.id,
+                detail: "连续对账未找到服务端任务，前端已显示可安全重试",
+              });
+              pushLocalLog({
+                type: "image_generation",
+                level: "error",
+                title: `任务对账失败 #${job.index}/${job.total}`,
+                message: errorDetail.error,
+                endpoint: "/api/tasks",
+                requestId: job.requestId,
+                durationMs: Math.max(0, finishedAt - (job.startedAt || job.createdAt)),
+                response: { phase: "client_error_received", error: errorDetail.error },
+              });
+            }
+            continue;
+          }
+          studioTaskMissCountsRef.current.delete(job.id);
+          if (task.status === "queued" || task.status === "running") {
+            // 状态可能从 queued 前进到 running，同步一下让 UI 有反馈
+            if (task.status !== job.status) {
+              patchVisibleRecord(job.id, {
+                status: task.status as JobStatus,
+                stages: task.stages,
+                errorDetail: undefined,
+              });
+              await saveHistoryRecord(storedRecordForJob(job, {
+                status: task.status,
+                stages: task.stages,
+                errorDetail: undefined,
+              }));
+            }
+            continue;
+          }
+          if (task.status === "success" && task.images?.[0]?.url) {
+            try {
+              const blob = await generatedImageToBlob({ url: task.images[0].url });
+              if (cancelled) return;
+              const objectUrl = URL.createObjectURL(blob);
+              const { width, height } = await getImageSize(objectUrl);
+              const thumb = await createListThumbnail(blob);
+              const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
+              if (cancelled) return;
+              const finishedAt = Date.now();
+              patchVisibleRecord(job.id, {
+                status: "success",
+                imageBlob: blob,
+                imageUrl: objectUrl,
+                thumbUrl,
+                width,
+                height,
+                finishedAt,
+                durationMs: task.durationMs,
+                stages: task.stages,
+              });
+              const record: StoredHistoryRecord = {
+                id: job.id,
+                requestId: job.requestId,
+                batchId: job.batchId,
+                index: job.index,
+                total: job.total,
+                protocol: job.protocol,
+                prompt: job.prompt,
+                model: job.model,
+                params: job.params,
+                referenceImages: referenceImagesForHistory(job.referenceImages),
+                submittedReferenceImages: job.submittedReferenceImages,
+                status: "success",
+                createdAt: job.createdAt,
+                startedAt: job.startedAt,
+                finishedAt,
+                durationMs: task.durationMs,
+                stages: task.stages,
+                imageBlob: blob,
+                thumbBlob: thumb?.blob,
+                thumbWidth: thumb?.width,
+                thumbHeight: thumb?.height,
+                width,
+                height,
+                agentId: job.agentId,
+                agentName: job.agentName,
+                agentScenario: job.agentScenario,
+                promptVariant: job.promptVariant,
+              };
+              await saveHistoryRecord(record);
+              setSidebarRecords((current) => mergeHistoryRecords(current, [{
+                ...record,
+                referenceImages: normalizeStoredReferenceImages(record.referenceImages),
+                objectUrl,
+                thumbUrl,
+              }]));
+              void reportGenerationClientEvent({
+                requestId: job.requestId as string,
+                clientId: getClientId(),
+                phase: "client_result_received",
+                occurredAt: finishedAt,
+                surface: "studio",
+                localRecordId: job.id,
+                detail: "前端已取回图片、完成解码并写入本地历史",
+              });
+              pushLocalLog({
+                type: "image_generation",
+                level: "success",
+                title: `生成完成并返回前端 #${job.index}/${job.total}`,
+                message: "已从服务端取回图片，完成解码、缩略图生成与本地历史保存。",
+                endpoint: "/api/tasks",
+                requestId: job.requestId,
+                durationMs: task.durationMs,
+                response: {
+                  phase: "client_result_received",
+                  status: task.status,
+                  imageCount: task.images?.length || 0,
+                  stages: task.stages,
+                },
+              });
+              // 补传缩略图给服务端供管理后台用：任务在用户离线时完成的话，
+              // 这是唯一的补齐时机（服务端没有图片处理能力）
+              if (thumb && job.requestId) {
+                void blobToDataUrl(thumb.blob)
+                  .then((thumbnailDataUrl) => fetch("/api/images/thumb", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ requestId: job.requestId, index: 0, thumbnailDataUrl, clientId: getClientId() }),
+                  }))
+                  .catch(() => undefined);
+              }
+            } catch {
+              // 图取不回来（多半是被日志裁剪清理了）才判失败
+              const imageMissingAt = Date.now();
+              patchVisibleRecord(job.id, {
+                status: "error",
+                errorDetail: { error: "图片已被服务器清理" },
+                finishedAt: imageMissingAt,
+              });
+              void reportGenerationClientEvent({
+                requestId: job.requestId as string,
+                clientId: getClientId(),
+                phase: "client_error_received",
+                occurredAt: imageMissingAt,
+                surface: "studio",
+                localRecordId: job.id,
+                detail: "服务端任务成功，但前端无法取回图片文件",
+              });
+            }
+          } else if (task.status === "error") {
+            const finishedAt = Date.now();
+            const errorDetail = { error: task.errorMessage || "生成失败" };
+            patchVisibleRecord(job.id, {
+              status: "error",
+              errorDetail,
+              finishedAt,
+              durationMs: task.durationMs,
+              stages: task.stages,
+            });
+            // 必须同时落库：只改内存的话，刷新后记录会以 queued 重新加载，
+            // 然后再次对账、再次只改内存——永远推进不到终态
+            const failed: StoredHistoryRecord = {
+              id: job.id,
+              requestId: job.requestId,
+              batchId: job.batchId,
+              index: job.index,
+              total: job.total,
+              protocol: job.protocol,
+              prompt: job.prompt,
+              model: job.model,
+              params: job.params,
+              referenceImages: referenceImagesForHistory(job.referenceImages),
+              submittedReferenceImages: job.submittedReferenceImages,
+              status: "error",
+              createdAt: job.createdAt,
+              startedAt: job.startedAt,
+              finishedAt,
+              durationMs: task.durationMs,
+              stages: task.stages,
+              errorDetail,
+              agentId: job.agentId,
+              agentName: job.agentName,
+              agentScenario: job.agentScenario,
+              promptVariant: job.promptVariant,
+            };
+            await saveHistoryRecord(failed);
+            setSidebarRecords((current) => mergeHistoryRecords(current, [{
+              ...failed,
+              referenceImages: normalizeStoredReferenceImages(failed.referenceImages),
+            }]));
+            void reportGenerationClientEvent({
+              requestId: job.requestId as string,
+              clientId: getClientId(),
+              phase: "client_error_received",
+              occurredAt: finishedAt,
+              surface: "studio",
+              localRecordId: job.id,
+              detail: task.errorMessage || "前端已收到服务端失败结果",
+            });
+            pushLocalLog({
+              type: "image_generation",
+              level: "error",
+              title: `服务端返回生成失败 #${job.index}/${job.total}`,
+              message: task.errorMessage || "生成失败",
+              endpoint: "/api/tasks",
+              requestId: job.requestId,
+              durationMs: task.durationMs,
+              response: {
+                phase: "client_error_received",
+                status: task.status,
+                errorType: task.errorType,
+                stages: task.stages,
+              },
+            });
+          }
+        }
+      } catch {
+        // 单轮对账失败不影响使用，下一轮重试
+      } finally {
+        reconcilingRef.current = false;
+      }
+    };
+
+    void reconcile();
+    const timer = window.setInterval(() => { void reconcile(); }, 2000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function patchVisibleRecord(id: string, patch: Partial<Job>) {
     setVisibleRecords((current) =>
       sortGenerationRecords(current.map((record) => (record.id === id ? { ...record, ...patch } : record))),
     );
   }
 
+  function recordStudioSubmissionIntent(job: Job, config: ApiConfig) {
+    if (!job.requestId) return;
+    pushLocalLog({
+      type: "image_generation",
+      level: "info",
+      title: `用户点击提交 #${job.index}/${job.total}`,
+      message: "已分配 requestId，任务进入前端队列；接下来将准备参考图并在 POST 前写入本地数据库。",
+      endpoint: "/api/images/generate",
+      requestId: job.requestId,
+      params: imageRequestParamsForLog(job, config),
+      response: {
+        phase: "client_submitted",
+        localRecordId: job.id,
+        submittedAt: job.createdAt,
+      },
+    });
+    void reportGenerationClientEvent({
+      requestId: job.requestId,
+      clientId: getClientId(),
+      phase: "client_submitted",
+      occurredAt: job.createdAt,
+      surface: "studio",
+      localRecordId: job.id,
+      detail: `用户点击提交，前端批次 ${job.index}/${job.total}`,
+      context: {
+        protocol: job.protocol,
+        model: job.model,
+        prompt: job.prompt,
+        baseUrl: normalizeApiBaseUrl(config.baseUrl),
+        batchId: job.batchId,
+        batchIndex: job.index,
+        batchTotal: job.total,
+        aspectRatio: job.params.aspectRatio,
+        resolution: job.params.resolution,
+        size: job.params.size,
+        referenceCount: job.referenceImages.length,
+      },
+    });
+  }
+
   function enqueueJobs(records: Job[], config: ApiConfig) {
+    for (const job of records) {
+      // attempt > 1 是同一 requestId 的自动重试，不重复伪装成一次新的用户点击。
+      if ((job.attempt ?? 1) > 1 || !job.requestId || job.submissionIntentLogged) continue;
+      recordStudioSubmissionIntent(job, config);
+    }
     pendingQueueRef.current.push(...records.map((job) => ({ job, config })));
     syncQueueStats();
     pumpQueue();
@@ -4438,7 +3876,7 @@ export default function App() {
   }
 
   function toggleRecordSelection(record: Job) {
-    if (record.status === "running") return;
+    if (record.status !== "success" && record.status !== "error") return;
     setIsSelectionMode(true);
     setSelectedRecordIds((current) => {
       const next = new Set(current);
@@ -4496,7 +3934,9 @@ export default function App() {
   }
 
   function requestBulkDelete() {
-    const ids = selectedRecords.filter((record) => record.status !== "running").map((record) => record.id);
+    const ids = selectedRecords
+      .filter((record) => record.status === "success" || record.status === "error")
+      .map((record) => record.id);
     if (ids.length === 0) return;
     setPendingDeleteIds(ids);
   }
@@ -4576,6 +4016,92 @@ export default function App() {
     setIsComposerCollapsed(false);
     const nextImages = await Promise.all(incomingFiles.slice(0, REFERENCE_LIMIT).map(fileToReference));
     setReferenceImages((current) => [...current, ...nextImages].slice(0, REFERENCE_LIMIT));
+  }
+
+  // ── 配方快照（roadmap PRD B2）：命名的 prompt + params 组合，只存本机 IndexedDB ──
+  async function refreshRecipes() {
+    try { setRecipes(await listRecipes()); } catch { /* IDB 不可用时静默降级 */ }
+  }
+
+  async function saveCurrentAsRecipe() {
+    const trimmed = prompt.trim();
+    if (!trimmed) { showAppNotice("先写好提示词再存配方"); return; }
+    // 注意：组件内 prompt 是 state，浏览器对话框必须写 window.prompt
+    const name = window.prompt("配方名称", trimmed.replace(/\s+/g, " ").slice(0, 20));
+    if (!name || !name.trim()) return;
+    try {
+      await saveRecipe({
+        id: uid(),
+        name: name.trim().slice(0, 40),
+        prompt: trimmed,
+        model: selectedModel,
+        params,
+        createdAt: Date.now(),
+      });
+      await refreshRecipes();
+      showAppNotice("配方已保存（仅存本机浏览器）");
+    } catch {
+      showAppNotice("配方保存失败");
+    }
+  }
+
+  function applyRecipe(recipe: Recipe) {
+    setPrompt(recipe.prompt);
+    if (isAllowedImageModel(recipe.model)) setSelectedModel(recipe.model);
+    setParams((current) => ({ ...current, ...recipe.params }));
+    showAppNotice(`已应用配方「${recipe.name}」`);
+  }
+
+  async function deleteRecipeById(id: string) {
+    try {
+      await idbDelete(RECIPES_STORE, id);
+      await refreshRecipes();
+    } catch { /* 忽略 */ }
+  }
+
+  function exportRecipes() {
+    const blob = new Blob([JSON.stringify(recipes, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `imagehub-recipes-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // ── 参考图库（roadmap PRD B3）：只存本机 IndexedDB，服务端仍是 10 分钟内存 TTL ──
+  async function refreshReferenceLibrary() {
+    try { setReferenceLibrary(await listReferenceLibrary()); } catch { /* 忽略 */ }
+  }
+
+  async function addReferenceToLibrary(image: UploadedReference) {
+    try {
+      const blob = await (await fetch(image.dataUrl)).blob();
+      await saveReferenceLibraryItem({
+        id: uid(),
+        name: image.name || "参考图",
+        blob,
+        mime: blob.type || image.type,
+        bytes: blob.size,
+        createdAt: Date.now(),
+      });
+      await refreshReferenceLibrary();
+      showAppNotice("已收藏到参考图库（仅存本机浏览器）");
+    } catch (error) {
+      showAppNotice(error instanceof Error ? error.message : "收藏失败");
+    }
+  }
+
+  async function useLibraryItem(item: ReferenceLibraryItem) {
+    await handleFiles([new File([item.blob], item.name, { type: item.mime })]);
+    setIsRefLibraryOpen(false);
+  }
+
+  async function deleteLibraryItem(id: string) {
+    try {
+      await idbDelete(REFERENCE_LIBRARY_STORE, id);
+      await refreshReferenceLibrary();
+    } catch { /* 忽略 */ }
   }
 
   function onReferenceInput(event: ChangeEvent<HTMLInputElement>) {
@@ -4787,10 +4313,15 @@ export default function App() {
       if (upstreamModels.length === 0) {
         throw new Error("接口返回了空模型列表");
       }
-      const nextModels = imageModelsForProtocol(config.protocol, upstreamModels);
+      // 只认上游真实返回的生图模型：把协议默认模型混进来会让「没有生图权限的 Key」
+      // 也通过验证，用户点生成才在上游失败
+      const nextModels = upstreamImageModels(config.protocol, upstreamModels);
       const nextAnalysisModels = filterAnalysisModels(upstreamModels);
       if (nextModels.length === 0) {
-        throw new Error("未找到可用的图片模型");
+        const allowed = runtimeModelConfig.length > 0
+          ? runtimeModelConfig.map((m) => m.displayName || m.id).slice(0, 4).join("、")
+          : "gpt-image-2 系列";
+        throw new Error(`该 API Key 下没有可用的生图模型（需要 ${allowed} 之一），请更换 Key 或联系服务商开通`);
       }
       const nextSelectedModel = preferModel(nextModels, selectedModel);
       const nextSelectedAnalysisModel = preferAnalysisModel(nextAnalysisModels, selectedAnalysisModel);
@@ -4963,8 +4494,15 @@ export default function App() {
 
   async function generateSingle(job: Job, config: ApiConfig) {
     const startedAt = Date.now();
+    const plannedRequestId = job.requestId || uid();
     let requestParamsForLog: Record<string, unknown> = imageRequestParamsForLog(job, config);
-    patchVisibleRecord(job.id, { status: "running", startedAt, durationMs: 0 });
+    patchVisibleRecord(job.id, {
+      requestId: plannedRequestId,
+      status: "submitting",
+      startedAt,
+      durationMs: 0,
+      errorDetail: undefined,
+    });
 
     const protocolSupportsRefs = getProtocolDefinition(job.protocol).supportsReferenceImages;
     const userRefsCount = job.referenceImages.length;
@@ -5042,152 +4580,169 @@ export default function App() {
         params: requestParamsForLog,
       });
 
-      const response = await fetch("/api/images/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          baseUrl: normalizeApiBaseUrl(config.baseUrl),
-          apiKey: config.apiKey,
-          clientId: getClientId(),
-          request: {
-            batchId: job.batchId,
-            index: job.index,
-            total: job.total,
-            protocol: job.protocol,
-            model: job.model,
-            prompt: job.prompt,
-            aspectRatio: job.params.aspectRatio,
-            size: job.params.size || resolveRequestSize(job.params.aspectRatio, job.params.resolution, job.protocol, job.model),
-            resolution: job.params.resolution,
-            quality: job.params.quality,
-            outputFormat: job.params.outputFormat,
-            seed: job.params.seed,
-            negativePrompt: job.params.negativePrompt,
-            agentId: job.agentId,
-            agentName: job.agentName,
-            agentScenario: job.agentScenario,
-            promptVariant: job.promptVariant,
-            referenceImages: requestReferenceImages,
-          },
-        }),
-      });
-      const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
-        throw payload.detail && typeof payload.detail === "object"
-          ? { ...payload.detail as Record<string, unknown>, requestId: payload.requestId, stages: payload.stages }
-          : { error: payload.detail || payload, requestId: payload.requestId, stages: payload.stages };
-      }
+      const clientId = getClientId();
+      const submissionBody: GenerationSubmissionBody = {
+        baseUrl: normalizeApiBaseUrl(config.baseUrl),
+        apiKey: config.apiKey,
+        clientId,
+        requestId: plannedRequestId,
+        trace: {
+          surface: "studio",
+          localRecordId: job.id,
+          submittedAt: job.createdAt,
+        },
+        request: {
+          batchId: job.batchId,
+          index: job.index,
+          total: job.total,
+          protocol: job.protocol,
+          model: job.model,
+          prompt: job.prompt,
+          aspectRatio: job.params.aspectRatio,
+          size: job.params.size || resolveRequestSize(job.params.aspectRatio, job.params.resolution, job.protocol, job.model),
+          resolution: job.params.resolution,
+          quality: job.params.quality,
+          outputFormat: job.params.outputFormat,
+          seed: job.params.seed,
+          negativePrompt: job.params.negativePrompt,
+          agentId: job.agentId,
+          agentName: job.agentName,
+          agentScenario: job.agentScenario,
+          promptVariant: job.promptVariant,
+          referenceImages: requestReferenceImages,
+        },
+      };
 
-      const blob = await generatedImageToBlob(payload.images[0]);
-      const objectUrl = URL.createObjectURL(blob);
-      const { width, height } = await getImageSize(objectUrl);
-      const finishedAt = Date.now();
-      const durationMs = finishedAt - startedAt;
-      const revisedPrompt = payload.images[0].revisedPrompt || "";
-      const successSummary: ReferenceSummary = preparedSummary.hasReferences && preparedSummary.status === "prepared"
-        ? { ...preparedSummary, status: "sent_ok" }
-        : preparedSummary;
+      // requestId 和完整任务快照必须在 POST 之前持久化。这样 202 丢失时，
+      // 刷新页面仍能按同一个 ID 对账，而不是创建第二个收费任务。
+      await saveHistoryRecord(storedRecordForJob(job, {
+        requestId: plannedRequestId,
+        submittedReferenceImages: submittedRefSnapshot.length > 0 ? submittedRefSnapshot : undefined,
+        status: "submitting",
+        startedAt,
+        durationMs: 0,
+      }));
+      const persistedAt = Date.now();
+      submissionBody.trace = {
+        ...submissionBody.trace!,
+        persistedAt,
+      };
+      void reportGenerationClientEvent({
+        requestId: plannedRequestId,
+        clientId,
+        phase: "client_persisted",
+        occurredAt: persistedAt,
+        surface: "studio",
+        localRecordId: job.id,
+        detail: "任务快照已写入 IndexedDB，允许发送 POST",
+      });
       pushLocalLog({
         type: "image_generation",
-        level: "success",
-        title: `图片生成成功 #${job.index}/${job.total}${successSummary.hasReferences ? ` · 参考图 ${successSummary.count} 张已上传` : " · 无参考图"}`,
-        message: `生成完成，尺寸 ${width} x ${height}。${successSummary.hasReferences ? `参考图 ${successSummary.count} 张${successSummary.totalBytes > 0 ? `（${formatBytes(successSummary.totalBytes)}）` : ""}已发送给上游。` : ""}`,
+        level: "info",
+        title: `任务快照已保存 #${job.index}/${job.total}`,
+        message: "requestId 与完整生成参数已落盘，正在发送生成请求。",
         endpoint: "/api/images/generate",
-        requestId: payload.requestId,
-        durationMs,
-        referenceSummary: successSummary,
+        requestId: plannedRequestId,
+        durationMs: persistedAt - startedAt,
+        params: requestParamsForLog,
+        response: { phase: "client_persisted", persistedAt },
+      });
+
+      const submission = await submitGenerationTask(submissionBody);
+      const acceptedRequestId = submission.requestId || plannedRequestId;
+      const acceptedStatus: JobStatus =
+        submission.status === "queued" || submission.status === "running"
+          ? submission.status
+          : "submitting";
+      // 入队成功：记录转入「排队中」并落库。此后不再等待图片——
+      // 服务端在后台执行，由 useTaskReconcile 轮询把结果取回来。
+      patchVisibleRecord(job.id, {
+        requestId: acceptedRequestId,
+        status: acceptedStatus,
+        startedAt,
+        stages: submission.stages,
+      });
+      await saveHistoryRecord(storedRecordForJob(job, {
+        requestId: acceptedRequestId,
+        submittedReferenceImages: submittedRefSnapshot.length > 0 ? submittedRefSnapshot : undefined,
+        status: acceptedStatus,
+        startedAt,
+        stages: submission.stages,
+      }));
+      pushLocalLog({
+        type: "image_generation",
+        level: "info",
+        title: `服务端已接单 #${job.index}/${job.total}`,
+        message: submission.idempotent
+          ? "已通过同一 requestId 接管服务端已有任务，等待后台生成结果。"
+          : "已收到接单响应，任务正在服务端排队或生成。",
+        endpoint: "/api/images/generate",
+        requestId: acceptedRequestId,
+        durationMs: Date.now() - startedAt,
+        referenceSummary: preparedSummary,
         params: requestParamsForLog,
         response: {
-          width,
-          height,
-          revisedPrompt: truncateForLog(revisedPrompt || "", 500),
-          imageCount: payload.images.length,
-          proxyResponse: sanitizeClientLogValue(payload),
+          ok: true,
+          status: submission.status,
+          idempotent: submission.idempotent,
+          stages: submission.stages,
         },
       });
+      return;
 
-      patchVisibleRecord(job.id, {
-        requestId: payload.requestId,
-        status: "success",
-        imageBlob: blob,
-        imageUrl: objectUrl,
-        width,
-        height,
-        revisedPrompt,
-        startedAt,
-        finishedAt,
-        durationMs,
-        stages: payload.stages,
-      });
-
-      const historyRecord: StoredHistoryRecord = {
-        id: job.id,
-        requestId: payload.requestId,
-        batchId: job.batchId,
-        index: job.index,
-        total: job.total,
-        protocol: job.protocol,
-        prompt: job.prompt,
-        model: job.model,
-        params: job.params,
-        referenceImages: referenceImagesForHistory(job.referenceImages),
-        submittedReferenceImages: submittedRefSnapshot.length > 0 ? submittedRefSnapshot : undefined,
-        status: "success",
-        createdAt: job.createdAt,
-        startedAt,
-        finishedAt,
-        durationMs,
-        imageBlob: blob,
-        width,
-        height,
-        revisedPrompt,
-        agentId: job.agentId,
-        agentName: job.agentName,
-        agentScenario: job.agentScenario,
-        promptVariant: job.promptVariant,
-      };
-      await saveHistoryRecord(historyRecord);
-      setSidebarRecords((current) => mergeHistoryRecords(current, [{
-        ...historyRecord,
-        referenceImages: normalizeStoredReferenceImages(historyRecord.referenceImages),
-        objectUrl,
-      }]));
-
-      // 缩略图在图已经显示之后再算：解码 + WebP 编码是主线程活儿，不能挡在用户看到图之前。
-      // 失败或未完成时，所有渲染点的 `thumbUrl ?? objectUrl` 会回退原图。
-      void createListThumbnail(blob).then(async (thumb) => {
-        if (!thumb) return;
-        const patch = { thumbBlob: thumb.blob, thumbWidth: thumb.width, thumbHeight: thumb.height };
-        try {
-          await saveHistoryRecord({ ...historyRecord, ...patch });
-        } catch {
-          return;
-        }
-        const thumbUrl = URL.createObjectURL(thumb.blob);
-        patchVisibleRecord(job.id, { thumbUrl });
-        setSidebarRecords((current) => current.map((r) => (r.id === job.id ? { ...r, ...patch, thumbUrl } : r)));
-        if (payload.requestId) {
-          // 供管理后台列表用；fire-and-forget，失败不影响用户
-          void blobToDataUrl(thumb.blob)
-            .then((thumbnailDataUrl) =>
-              fetch("/api/images/thumb", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ requestId: payload.requestId, index: 0, thumbnailDataUrl, clientId: getClientId() }),
-              }),
-            )
-            .catch(() => undefined);
-        }
-      });
     } catch (error) {
       const finishedAt = Date.now();
       const durationMs = finishedAt - startedAt;
-      const errorDetail = error instanceof Error ? { error: error.message } : error;
-      const requestId = errorDetail && typeof errorDetail === "object" && "requestId" in errorDetail
-        ? String((errorDetail as { requestId?: unknown }).requestId || "")
-        : undefined;
+      const submissionError = error instanceof GenerationSubmissionError ? error : null;
+      const rawErrorDetail = submissionError
+        ? submissionError.detail
+        : error instanceof Error
+          ? { error: error.message }
+          : error;
+      const errorDetail = rawErrorDetail && typeof rawErrorDetail === "object"
+        ? { ...rawErrorDetail as Record<string, unknown>, requestId: plannedRequestId }
+        : { error: rawErrorDetail, requestId: plannedRequestId };
+      const requestId = submissionError?.requestId || plannedRequestId;
       const attempt = job.attempt ?? 1;
       const maxAttempts = job.maxAttempts ?? 1;
+
+      if (submissionError?.ambiguous) {
+        const confirmingDetail = {
+          ...errorDetail,
+          error: "提交状态确认中：网络响应丢失，系统会继续用同一 requestId 对账",
+        };
+        patchVisibleRecord(job.id, {
+          requestId,
+          status: "submitting",
+          errorDetail: confirmingDetail,
+          startedAt,
+          finishedAt: undefined,
+          durationMs: undefined,
+        });
+        await saveHistoryRecord(storedRecordForJob(job, {
+          requestId,
+          submittedReferenceImages: submittedRefSnapshot.length > 0 ? submittedRefSnapshot : undefined,
+          status: "submitting",
+          startedAt,
+          finishedAt: undefined,
+          durationMs: undefined,
+          errorDetail: confirmingDetail,
+        }));
+        pushLocalLog({
+          type: "image_generation",
+          level: "warning",
+          title: `提交状态确认中 #${job.index}/${job.total}`,
+          message: "连接中断后仍无法确认接单结果；已保留原 requestId，后台对账不会创建第二个任务。",
+          endpoint: "/api/images/generate",
+          requestId,
+          durationMs,
+          referenceSummary: preparedSummary,
+          params: requestParamsForLog,
+          response: { ok: false, requestId, ambiguous: true },
+        });
+        return;
+      }
+
       const canRetry = attempt < maxAttempts && isRetryableError(errorDetail);
       if (canRetry) {
         const nextAttempt = attempt + 1;
@@ -5223,8 +4778,25 @@ export default function App() {
           attempt: nextAttempt,
           maxAttempts,
         });
+        const retryJob: Job = {
+          ...job,
+          requestId,
+          submittedReferenceImages: submittedRefSnapshot.length > 0
+            ? submittedRefSnapshot
+            : job.submittedReferenceImages,
+          attempt: nextAttempt,
+          maxAttempts,
+          status: "queued",
+        };
+        await saveHistoryRecord(storedRecordForJob(retryJob, {
+          status: "queued",
+          startedAt: undefined,
+          finishedAt: undefined,
+          durationMs: undefined,
+          errorDetail,
+        }));
         window.setTimeout(() => {
-          enqueueJobs([{ ...job, attempt: nextAttempt, status: "queued" }], config);
+          enqueueJobs([retryJob], config);
         }, backoffMs);
         return;
       }
@@ -5249,33 +4821,29 @@ export default function App() {
         },
         error: safeLogError(errorDetail),
       });
+      void reportGenerationClientEvent({
+        requestId,
+        clientId: getClientId(),
+        phase: "client_error_received",
+        occurredAt: finishedAt,
+        surface: "studio",
+        localRecordId: job.id,
+        detail: formatError(errorDetail),
+      });
       const errorStages = errorDetail && typeof errorDetail === "object" && "stages" in errorDetail
         ? (errorDetail as { stages?: JobStages }).stages
         : undefined;
       patchVisibleRecord(job.id, { requestId, status: "error", errorDetail, startedAt, finishedAt, durationMs, stages: errorStages });
-      const historyRecord: StoredHistoryRecord = {
-        id: job.id,
+      const historyRecord = storedRecordForJob(job, {
         requestId,
-        batchId: job.batchId,
-        index: job.index,
-        total: job.total,
-        protocol: job.protocol,
-        prompt: job.prompt,
-        model: job.model,
-        params: job.params,
-        referenceImages: referenceImagesForHistory(job.referenceImages),
         submittedReferenceImages: submittedRefSnapshot.length > 0 ? submittedRefSnapshot : undefined,
         status: "error",
-        createdAt: job.createdAt,
         startedAt,
         finishedAt,
         durationMs,
+        stages: errorStages,
         errorDetail,
-        agentId: job.agentId,
-        agentName: job.agentName,
-        agentScenario: job.agentScenario,
-        promptVariant: job.promptVariant,
-      };
+      });
       await saveHistoryRecord(historyRecord);
       setSidebarRecords((current) => mergeHistoryRecords(current, [{
         ...historyRecord,
@@ -5697,6 +5265,18 @@ export default function App() {
         setLastAppliedAgent(analysisCountdown.agentContext);
       }
     }
+    const abandonedIntent = pendingGenerationIntentRef.current;
+    if (abandonedIntent) {
+      pendingGenerationIntentRef.current = null;
+      void reportGenerationClientEvent({
+        requestId: abandonedIntent.requestId,
+        clientId: getClientId(),
+        phase: "client_submission_rejected",
+        occurredAt: Date.now(),
+        surface: "studio",
+        detail: "用户在发送前分析阶段取消了生成",
+      });
+    }
     cancelAnalysisCountdown();
     setAnalysisState({ status: "idle", mode: "send", message: "" });
   }
@@ -5873,6 +5453,8 @@ export default function App() {
     const concurrency = clampNumber(Number(batchParams.concurrency), 1, 6);
     const batchId = uid();
     const batchCreatedAt = Date.now();
+    const pendingIntent = pendingGenerationIntentRef.current;
+    pendingGenerationIntentRef.current = null;
     const snapshotConfig = { ...apiConfig };
     const snapshotParams = {
       ...batchParams,
@@ -5891,8 +5473,8 @@ export default function App() {
     const snapshotReferenceImages = getProtocolDefinition(apiConfig.protocol).supportsReferenceImages
       ? candidateReferenceImages.filter(isReferenceUsable)
       : [];
-    const nextJobs = Array.from({ length: total }, (_, index) =>
-      createJob(
+    const nextJobs = Array.from({ length: total }, (_, index) => {
+      const job = createJob(
         index + 1,
         total,
         batchId,
@@ -5901,10 +5483,17 @@ export default function App() {
         selectedModel,
         snapshotParams,
         snapshotReferenceImages,
-        batchCreatedAt - index / 1000,
+        (pendingIntent?.submittedAt || batchCreatedAt) - index / 1000,
         options.agentContext,
-      ),
-    );
+      );
+      return index === 0 && pendingIntent
+        ? {
+            ...job,
+            requestId: pendingIntent.requestId,
+            submissionIntentLogged: true,
+          }
+        : job;
+    });
     setHighlightedRecordId("");
     setVisibleRecords((current) => sortGenerationRecords([...nextJobs, ...current]));
     enqueueJobs(nextJobs, snapshotConfig);
@@ -5952,6 +5541,8 @@ export default function App() {
       : [];
     const batchId = uid();
     const batchCreatedAt = Date.now();
+    const pendingIntent = pendingGenerationIntentRef.current;
+    pendingGenerationIntentRef.current = null;
     const nextJobs = expandedSpecs.map((spec, index) => {
       const baseJob = createJob(
         index + 1,
@@ -5962,10 +5553,14 @@ export default function App() {
         selectedModel,
         buildAgentModeJobParams(spec),
         snapshotReferenceImages,
-        batchCreatedAt - index / 1000,
+        (pendingIntent?.submittedAt || batchCreatedAt) - index / 1000,
       );
       return {
         ...baseJob,
+        ...(index === 0 && pendingIntent ? {
+          requestId: pendingIntent.requestId,
+          submissionIntentLogged: true,
+        } : {}),
         agentId: "agent-mode-a",
         agentName: AGENT_MODE_NAME,
         agentScenario: spec.title || options.scenarioLabel || options.analysisResult.intentType,
@@ -6309,6 +5904,18 @@ export default function App() {
         },
         error: safeLogError(error),
       });
+      const failedIntent = pendingGenerationIntentRef.current;
+      if (failedIntent) {
+        pendingGenerationIntentRef.current = null;
+        void reportGenerationClientEvent({
+          requestId: failedIntent.requestId,
+          clientId: getClientId(),
+          phase: "client_error_received",
+          occurredAt: Date.now(),
+          surface: "studio",
+          detail: `发送前 Agent 解析失败，生成 POST 未发送：${formatError(error)}`,
+        });
+      }
     }
   }
 
@@ -6326,9 +5933,52 @@ export default function App() {
     const nextStart = performance.now();
     if (nextStart - startIntentRef.current < 400) return;
     startIntentRef.current = nextStart;
-    const apiKeyReady = await verifyApiKeyBeforeGeneration();
-    if (!apiKeyReady) return;
     const submittedPrompt = prompt.trim();
+    const submittedAt = Date.now();
+    const supersededIntent = pendingGenerationIntentRef.current;
+    if (supersededIntent) {
+      void reportGenerationClientEvent({
+        requestId: supersededIntent.requestId,
+        clientId: getClientId(),
+        phase: "client_submission_rejected",
+        occurredAt: submittedAt,
+        surface: "studio",
+        detail: "用户发起了新的提交，上一条尚未发送的生成意图已取消",
+      });
+    }
+    const generationIntent: GenerationIntent = { requestId: uid(), submittedAt };
+    pendingGenerationIntentRef.current = generationIntent;
+    const intentPreview = {
+      ...createJob(
+        1,
+        clampNumber(Number(params.batchCount), 1, 20),
+        generationIntent.requestId,
+        apiConfig.protocol,
+        submittedPrompt,
+        selectedModel,
+        params,
+        getProtocolDefinition(apiConfig.protocol).supportsReferenceImages ? usableReferenceImages : [],
+        submittedAt,
+      ),
+      id: `intent-${generationIntent.requestId}`,
+      requestId: generationIntent.requestId,
+      submissionIntentLogged: true,
+    };
+    recordStudioSubmissionIntent(intentPreview, apiConfig);
+    const apiKeyReady = await verifyApiKeyBeforeGeneration();
+    if (!apiKeyReady) {
+      pendingGenerationIntentRef.current = null;
+      void reportGenerationClientEvent({
+        requestId: generationIntent.requestId,
+        clientId: getClientId(),
+        phase: "client_error_received",
+        occurredAt: Date.now(),
+        surface: "studio",
+        localRecordId: intentPreview.id,
+        detail: "提交前 API Key / 模型校验未通过，生成 POST 未发送",
+      });
+      return;
+    }
     if (isAgentModeEnabled) {
       triggerSendLaunchAnimation();
       void requestAgentModeExecution(submittedPrompt);
@@ -6412,7 +6062,9 @@ export default function App() {
       if (record.objectUrl) URL.revokeObjectURL(record.objectUrl);
       if (record.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
     });
-    setSidebarRecords([]);
+    setSidebarRecords((current) => current.filter(
+      (record) => record.status === "submitting" || record.status === "queued" || record.status === "running",
+    ));
     setVisibleRecords((current) => {
       current.forEach((record) => {
         if ((record.status === "success" || record.status === "error") && record.imageUrl) {
@@ -6420,7 +6072,9 @@ export default function App() {
           if (record.thumbUrl) URL.revokeObjectURL(record.thumbUrl);
         }
       });
-      return current.filter((record) => record.status === "queued" || record.status === "running");
+      return current.filter(
+        (record) => record.status === "submitting" || record.status === "queued" || record.status === "running",
+      );
     });
     mainCursorRef.current = undefined;
     sidebarCursorRef.current = undefined;
@@ -6610,6 +6264,7 @@ export default function App() {
           prompt: item.prompt,
           params: item.params,
           caption: item.agentScenario || item.prompt.replace(/\s+/g, " ").slice(0, 120),
+          hidePrompt: hidePromptOnShare,
           sourceType,
           reasonPlan: {
             agentName: item.agentName,
@@ -6874,6 +6529,56 @@ export default function App() {
     }
   }
 
+  // 工作台成功记录 → 画布节点（roadmap PRD N2）。
+  // objectUrl 在本页面生命周期内始终有效，画布挂载后 fetch 它拿 blob。
+  function openRecordInCanvas(job: Job) {
+    if (job.status !== "success" || !job.imageUrl) return;
+    setCanvasImport({
+      imageUrl: job.imageUrl,
+      prompt: job.prompt,
+      model: job.model,
+      protocol: job.protocol,
+      params: job.params,
+      requestId: job.requestId,
+    });
+    enterCanvas();
+  }
+
+  // 广场作品 → 工作台复现（roadmap PRD B1）：参数与提示词回填。
+  // 隐藏提示词的作品只回填参数；模型不在白名单时保留当前选择并提醒。
+  function applySquareItemToStudio(item: SquareFeedItem) {
+    if (item.prompt) setPrompt(item.prompt);
+    const modelAllowed = isAllowedImageModel(item.model);
+    if (modelAllowed) setSelectedModel(item.model);
+    const p = item.params || {};
+    setParams((current) => ({
+      ...current,
+      aspectRatio: typeof p.aspectRatio === "string" && p.aspectRatio ? p.aspectRatio : current.aspectRatio,
+      size: typeof p.size === "string" && p.size ? p.size : current.size,
+      resolution: p.resolution === "1K" || p.resolution === "2K" || p.resolution === "4K" ? p.resolution : current.resolution,
+      quality: typeof p.quality === "string" && p.quality ? p.quality : current.quality,
+    }));
+    enterStudio();
+    showAppNotice(modelAllowed
+      ? (item.prompt ? "已带入同款提示词与参数，可直接生成" : "该作品未公开提示词，已带入生成参数")
+      : `模型 ${item.model} 不在当前站点，已带入其余参数`);
+  }
+
+  // 画布节点 → 工作台（roadmap PRD N2）：prompt + params 回填，模型不在白名单则保留当前选择
+  function applyCanvasNodeToStudio(payload: { prompt: string; model: string; params: ImageParams }) {
+    setPrompt(payload.prompt);
+    if (isAllowedImageModel(payload.model)) setSelectedModel(payload.model);
+    setParams((current) => ({
+      ...current,
+      aspectRatio: payload.params.aspectRatio || current.aspectRatio,
+      size: payload.params.size || current.size,
+      resolution: payload.params.resolution || current.resolution,
+      quality: payload.params.quality || current.quality,
+    }));
+    enterStudio();
+    showAppNotice("已把该图的提示词与参数带到工作台");
+  }
+
   function returnHome() {
     setActivePage("home");
     if (window.location.hash) {
@@ -6890,6 +6595,21 @@ export default function App() {
       await fetch("/api/auth/oauth/logout", { method: "POST", credentials: "same-origin" });
     } catch { /* ignore */ }
     setOauthUser(null);
+    // 登出必须连 Key 一起清掉。OAuth 登录时服务端把真实上游 Key 交给了浏览器，
+    // 只清 oauthUser 会让它留在 state / sessionStorage / localStorage 里，
+    // 共享设备上的下一个人直接继承一把可用的 Key。
+    clearApiKey();
+  }
+
+  // 把 Key 从内存与两处浏览器存储中一并抹掉（登出与「清除 Key」按钮共用）。
+  // 模型列表 / verifiedModelKey 的清理交给监听 apiConfig.apiKey 的那个 effect，
+  // 它在 Key 短于 API_KEY_MIN_LENGTH 时已经会把这些状态复位。
+  function clearApiKey() {
+    setApiConfig((prev) => ({ ...prev, apiKey: "" }));
+    try {
+      sessionStorage.removeItem("imageStudioApiKey");
+      localStorage.removeItem("imageStudioApiKey");
+    } catch { /* 存储不可用时忽略 */ }
   }
 
   function completeOnboarding() {
@@ -6916,11 +6636,53 @@ export default function App() {
       onDismiss={() => setAvailableFrontendVersion("")}
     />
   ) : null;
+  // 跨页轻提示：随 frontendUpdateNotice 一起挂到每个页面分支的顶层
+  const appNoticeElement = appNotice ? (
+    <div className="app-notice" role="status">{appNotice}</div>
+  ) : null;
+
+  // 全局一级导航（2026-07-27 用户反馈定版）：四个主页面渲染**同一个**头部结构——
+  // 品牌固定最左、四个 tab 绝对居中（不受左右内容宽度影响）、账号/管理固定最右。
+  // 切页时导航的位置、大小、内容零变化；页面风格可以不同，这条头部不允许变。
+  const appHeaderEnd = (
+    <>
+      {oauthUser ? (
+        <div className="home-account">
+          <User size={15} />
+          <span>{oauthUser.displayName || oauthUser.username}</span>
+          <button type="button" onClick={() => void oauthLogout()}>退出</button>
+        </div>
+      ) : oauthEnabled ? (
+        <button type="button" className="home-login" onClick={oauthLogin}>登录</button>
+      ) : null}
+      <button type="button" className="home-admin-icon" onClick={enterAdmin} aria-label="管理后台" title="管理后台">
+        <ShieldCheck size={16} />
+      </button>
+    </>
+  );
+  const renderAppHeader = (page: "home" | "studio" | "canvas" | "square") => (
+    <header className="app-header">
+      <AppNav
+        current={page}
+        brandLogo={imageStudioLogo}
+        runningCount={queueStats.running + queueStats.queued}
+        onNavigate={(target) => {
+          if (target === "home") returnHome();
+          else if (target === "studio") enterStudio();
+          else if (target === "canvas") enterCanvas();
+          else enterSquare();
+        }}
+        end={appHeaderEnd}
+      />
+    </header>
+  );
 
   if (activePage === "home") {
     return (
       <>
         {frontendUpdateNotice}
+        {appNoticeElement}
+        {renderAppHeader("home")}
         <HomePage
           onEnter={enterStudio}
           onSquare={enterSquare}
@@ -6939,6 +6701,7 @@ export default function App() {
           onSelectModel={selectImageModel}
           recentRecords={sidebarRecords}
           hasApiKey={apiConfig.apiKey.trim().length >= API_KEY_MIN_LENGTH}
+          runningCount={queueStats.running + queueStats.queued}
         />
       </>
     );
@@ -6948,11 +6711,15 @@ export default function App() {
     return (
       <>
         {frontendUpdateNotice}
+        {appNoticeElement}
+        {renderAppHeader("square")}
         <SquarePage
           apiKey={apiConfig.apiKey}
           onBackHome={returnHome}
           onEnterStudio={enterStudio}
           onCanvas={enterCanvas}
+          runningCount={queueStats.running + queueStats.queued}
+          onReproduce={applySquareItemToStudio}
         />
       </>
     );
@@ -6962,6 +6729,8 @@ export default function App() {
     return (
       <>
         {frontendUpdateNotice}
+        {appNoticeElement}
+        {renderAppHeader("canvas")}
         <CanvasPage
           apiConfig={apiConfig}
           selectedModel={selectedModel}
@@ -6970,6 +6739,11 @@ export default function App() {
           onBackHome={returnHome}
           onEnterStudio={enterStudio}
           onEnterSquare={enterSquare}
+          runningCount={queueStats.running + queueStats.queued}
+          pendingImport={canvasImport}
+          onImportConsumed={() => setCanvasImport(null)}
+          onSendToStudio={applyCanvasNodeToStudio}
+          hidePromptOnShare={hidePromptOnShare}
         />
       </>
     );
@@ -6979,6 +6753,7 @@ export default function App() {
     return (
       <>
         {frontendUpdateNotice}
+        {appNoticeElement}
         <AdminApp onBackHome={returnHome} onEnterStudio={enterStudio} oauthEnabled={oauthEnabled} onOauthLogin={oauthLogin} />
       </>
     );
@@ -6987,6 +6762,8 @@ export default function App() {
   return (
     <>
     {frontendUpdateNotice}
+    {appNoticeElement}
+    {renderAppHeader("studio")}
     <div className={`app-shell ${isLeftSidebarOpen ? "left-open" : "left-closed"} ${isSettingsOpen ? "settings-open" : "settings-closed"}`}>
       <button
         className="drawer-backdrop"
@@ -7042,11 +6819,34 @@ export default function App() {
           </button>
         </div>
 
+        {/* 历史筛选（roadmap PRD B4）：筛的是已加载的记录，继续下拉仍会加载更多 */}
+        <div className="history-filter">
+          <div className="history-filter-tabs">
+            {([["all", "全部"], ["success", "成功"], ["error", "失败"]] as const).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                className={sidebarFilterStatus === key ? "is-active" : ""}
+                onClick={() => setSidebarFilterStatus(key)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <input
+            type="search"
+            value={sidebarSearch}
+            onChange={(event) => setSidebarSearch(event.target.value)}
+            placeholder="搜提示词 / 模型…"
+            aria-label="搜索历史记录"
+          />
+        </div>
+
         <div className="history-list" ref={sidebarListRef}>
-          {sidebarRecords.length === 0 && !isLoadingSidebarRecords ? (
-            <div className="muted-box">暂无记录</div>
+          {filteredSidebarRecords.length === 0 && !isLoadingSidebarRecords ? (
+            <div className="muted-box">{sidebarRecords.length === 0 ? "暂无记录" : "没有符合筛选条件的记录"}</div>
           ) : (
-            sidebarRecords.map((record) => (
+            filteredSidebarRecords.map((record) => (
               <button
                 key={record.id}
                 type="button"
@@ -7056,12 +6856,24 @@ export default function App() {
                 <div className={`history-thumb ${record.status}`}>
                   {(record.thumbUrl ?? record.objectUrl) ? (
                     <img src={record.thumbUrl ?? record.objectUrl} alt="" loading="lazy" decoding="async" />
+                  ) : record.status === "submitting" || record.status === "queued" || record.status === "running" ? (
+                    <Loader2 size={18} className="spin" />
                   ) : (
                     <AlertCircle size={18} />
                   )}
                 </div>
                 <div className="history-copy">
-                  <strong>{record.status === "success" ? record.prompt : "生成失败"}</strong>
+                  <strong>
+                    {record.status === "success"
+                      ? record.prompt
+                      : record.status === "error"
+                        ? "生成失败"
+                        : record.status === "submitting"
+                          ? "状态确认中"
+                          : record.status === "queued"
+                            ? "排队中"
+                            : "生成中"}
+                  </strong>
                   <span>
                     {record.model} · {formatDate(record.finishedAt || record.createdAt)}
                   </span>
@@ -7083,14 +6895,6 @@ export default function App() {
               title={isLeftSidebarOpen ? "收起最近记录" : "打开最近记录"}
               onClick={() => setIsLeftSidebarOpen((value) => !value)}
             />
-            <button type="button" className="topbar-home-button" onClick={returnHome}>
-              <WandSparkles size={15} />
-              首页
-            </button>
-            <button type="button" className="topbar-home-button" onClick={enterSquare}>
-              <ExternalLink size={15} />
-              广场
-            </button>
             <div className={`status-pill ${modelState.status}`}>
               {modelState.status === "ready" ? <Wifi size={16} /> : <Settings2 size={16} />}
               <span>{modelState.status === "ready" ? "已连接" : modelState.message}</span>
@@ -7107,6 +6911,20 @@ export default function App() {
                 <span>{oauthUser.displayName || oauthUser.username}</span>
               </div>
             )}
+            <button
+              type="button"
+              className="icon-button"
+              title="需求反馈：告诉我们你想要什么功能"
+              onClick={() => {
+                if (apiConfig.apiKey.trim().length < API_KEY_MIN_LENGTH) {
+                  showAppNotice("请先配置 API Key 再提交反馈（用于防滥用与查看回复）");
+                  return;
+                }
+                setIsFeedbackOpen(true);
+              }}
+            >
+              <MessageSquare size={15} />
+            </button>
             <button
               type="button"
               className={`topbar-log-button ${latestLocalLogLevel ? `is-${latestLocalLogLevel}` : ""}`}
@@ -7200,7 +7018,11 @@ export default function App() {
               <div className="batch-toolbar">
                 <div className="record-summary">
                   <span>全部生成记录 · 已显示 {visibleRecords.length} 条</span>
-                  <small>运行中 {queueStats.running} / 排队 {queueStats.queued} / 成功 {visibleStats.success} / 失败 {visibleStats.error}</small>
+                  <small>
+                    运行中 {queueStats.running} / 排队 {queueStats.queued}
+                    {visibleStats.submitting > 0 ? ` / 状态确认 ${visibleStats.submitting}` : ""}
+                    {` / 成功 ${visibleStats.success} / 失败 ${visibleStats.error}`}
+                  </small>
                 </div>
                 <div className="toolbar-actions">
                   {isSelectionMode ? (
@@ -7243,13 +7065,14 @@ export default function App() {
                       recordRef={(element) => registerRecordElement(job.id, element)}
                       selected={selectedRecordIds.has(job.id)}
                       selectionMode={isSelectionMode}
-                      selectable={job.status !== "running"}
+                      selectable={job.status === "success" || job.status === "error"}
                       onToggleSelect={() => toggleRecordSelection(job)}
                       onRetry={() => void retryJob(job)}
                       onPreview={() => previewCurrent(job)}
                       onDownload={() => downloadCurrent(job)}
                       onCopyPrompt={() => copyPrompt(job.prompt)}
                       onRecommend={() => void recommendToSquare(job)}
+                      onOpenInCanvas={() => openRecordInCanvas(job)}
                       recommendState={squareRecommendState[job.id]}
                       canRecommend={canUseSquareIdentity}
                       feedback={job.requestId ? feedbackMap[job.requestId] : undefined}
@@ -7295,12 +7118,34 @@ export default function App() {
               <Send size={16} />
             </button>
           )}
-          <AgentModeSwitch
-            enabled={isAgentModeEnabled}
-            status={agentModeState.status}
-            onToggle={() => setIsAgentModeEnabled((value) => !value)}
-          />
-          {!isAgentModeEnabled && (
+          {isAgentModeEnabled ? (
+            <AgentModeSwitch
+              enabled
+              status={agentModeState.status}
+              onToggle={() => setIsAgentModeEnabled((value) => !value)}
+            />
+          ) : (
+            // 未启用的功能全部收进这一行 chip，点开才展开，避免 composer 常驻五层
+            <div className="composer-toolbar">
+              <AgentModeSwitch
+                enabled={false}
+                status={agentModeState.status}
+                onToggle={() => setIsAgentModeEnabled((value) => !value)}
+              />
+              {!isAgentEnabled && !lastAppliedAgent && (
+                <button
+                  type="button"
+                  className="composer-tool-chip"
+                  onClick={() => openAgentPanel()}
+                  title="选择行业工作流，不填也能生成标准图"
+                >
+                  <WandSparkles size={14} />
+                  行业 Agent
+                </button>
+              )}
+            </div>
+          )}
+          {!isAgentModeEnabled && (isAgentEnabled || lastAppliedAgent) && (
             <div className="agent-quickbar">
               <button
                 type="button"
@@ -7635,6 +7480,11 @@ export default function App() {
                   <div className="reference-status" title={image.message || "可用"}>
                     {image.status === "error" ? <AlertCircle size={14} /> : <CheckCircle2 size={14} />}
                   </div>
+                  {image.dataUrl && (
+                    <button type="button" title="收藏到参考图库（仅存本机）" onClick={() => void addReferenceToLibrary(image)}>
+                      <Star size={14} />
+                    </button>
+                  )}
                   <button type="button" title="移除参考图" onClick={() => removeReference(image.id)}>
                     <X size={14} />
                   </button>
@@ -7822,6 +7672,14 @@ export default function App() {
             >
               <UploadCloud size={19} />
             </button>
+            <button
+              type="button"
+              className="icon-button upload-button"
+              title="从参考图库选择（本机收藏）"
+              onClick={() => { void refreshReferenceLibrary(); setIsRefLibraryOpen(true); }}
+            >
+              <Star size={18} />
+            </button>
             {!isAgentModeEnabled && (
               <button
                 type="button"
@@ -7871,13 +7729,15 @@ export default function App() {
               type="button"
               className={`send-button${isSendLaunching ? " is-launching" : ""}`}
               title={
-                isAgentModeEnabled
-                  ? agentModeState.status === "analyzing"
-                    ? "正在理解任务"
-                    : "开始由 Agent 自动编排"
-                  : isPromptAnalyzing
-                    ? "正在分析提示词"
-                    : "生成"
+                blockedReason
+                  ? blockedReason
+                  : isAgentModeEnabled
+                    ? agentModeState.status === "analyzing"
+                      ? "正在理解任务"
+                      : "开始由 Agent 自动编排"
+                    : isPromptAnalyzing
+                      ? "正在分析提示词"
+                      : "生成"
               }
               aria-label={isAgentModeEnabled ? "开始 Agent 编排" : "生成图片"}
               disabled={!canRequestGenerate}
@@ -7923,9 +7783,10 @@ export default function App() {
                 <span className={referenceIssueCount > 0 ? "has-error" : referenceWarningCount > 0 ? "has-warning" : ""}>
                   {referenceMetaLabel}
                 </span>
-                <span className={`composer-config-meta ${aspectRatioSupported ? "" : "has-error"}`}>
-                  {composerConfigSummary} · {resolvedRequestSize} · {params.outputFormat.toUpperCase()}
-                </span>
+                {/* 只在「有提示词但仍不能生成」时提示——空输入框时提示「请输入提示词」是噪声 */}
+                {blockedReason && prompt.trim().length > 0 && (
+                  <span className="composer-config-meta has-error">{blockedReason}</span>
+                )}
                 <label className="composer-auto-toggle" title="发送前自动优化提示词">
                   <input
                     type="checkbox"
@@ -8056,6 +7917,29 @@ export default function App() {
             />
             <span>记住 API Key</span>
           </label>
+          <label className="check-row" title="勾选后，推荐到广场的作品不公开提示词，仅展示生成参数">
+            <input
+              type="checkbox"
+              checked={hidePromptOnShare}
+              onChange={(event) => {
+                setHidePromptOnShare(event.target.checked);
+                try { localStorage.setItem("imageStudioHidePromptOnShare", String(event.target.checked)); } catch { /* 忽略 */ }
+              }}
+            />
+            <span>推荐到广场时隐藏提示词</span>
+          </label>
+          <div className="api-key-storage-note" role="note">
+            <span>
+              {apiConfig.rememberKey
+                ? "Key 以明文保存在本机浏览器，换人使用请先清除。"
+                : "Key 仅保留在本次会话，关闭浏览器即失效。"}
+            </span>
+            {apiConfig.apiKey ? (
+              <button type="button" className="subtle-button" onClick={clearApiKey}>
+                清除 Key
+              </button>
+            ) : null}
+          </div>
           <button className="primary-action" type="button" onClick={() => void loadModels()} disabled={modelState.status === "loading"}>
             {modelState.status === "loading" ? <Loader2 size={17} className="spin" /> : <RefreshCw size={17} />}
             读取/刷新模型
@@ -8143,6 +8027,49 @@ export default function App() {
               ))
             )}
           </div>
+        </section>
+
+        <section className="settings-section recipe-section">
+          <label>
+            <span>配方（本机保存的提示词 + 参数组合）</span>
+            <div className="recipe-row">
+              <select
+                value=""
+                onChange={(event) => {
+                  const recipe = recipes.find((r) => r.id === event.target.value);
+                  if (recipe) applyRecipe(recipe);
+                }}
+              >
+                <option value="">{recipes.length > 0 ? "选择配方应用…" : "还没有配方"}</option>
+                {recipes.map((r) => (
+                  <option key={r.id} value={r.id}>{r.name} · {r.model}</option>
+                ))}
+              </select>
+              <button type="button" className="subtle-button" title="把当前提示词与参数存为配方" onClick={() => void saveCurrentAsRecipe()}>
+                <Save size={14} /> 存
+              </button>
+              {recipes.length > 0 && (
+                <button type="button" className="subtle-button" title="导出全部配方为 JSON" onClick={exportRecipes}>
+                  <DownloadCloud size={14} />
+                </button>
+              )}
+            </div>
+          </label>
+          {recipes.length > 0 && (
+            <details className="recipe-manage">
+              <summary>管理配方（{recipes.length}/{RECIPES_LIMIT}）</summary>
+              <div className="recipe-manage-list">
+                {recipes.map((r) => (
+                  <div key={r.id} className="recipe-manage-item">
+                    <span title={r.prompt}>{r.name}</span>
+                    <button type="button" className="icon-button" title="删除该配方" onClick={() => void deleteRecipeById(r.id)}>
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
         </section>
 
         <section className="settings-section compact-grid">
@@ -8300,6 +8227,22 @@ export default function App() {
         </details>
       </aside>
 
+      {isRefLibraryOpen && (
+        <ReferenceLibraryModal
+          items={referenceLibrary}
+          onUse={(item) => void useLibraryItem(item)}
+          onDelete={(id) => void deleteLibraryItem(id)}
+          onClose={() => setIsRefLibraryOpen(false)}
+        />
+      )}
+      {isFeedbackOpen && (
+        <FeedbackModal
+          apiKey={apiConfig.apiKey}
+          baseUrl={apiConfig.baseUrl}
+          analysisModel={selectedAnalysisModel}
+          onClose={() => setIsFeedbackOpen(false)}
+        />
+      )}
       {previewItem && (
         <ImagePreviewModal
           item={previewItem}
@@ -8357,7 +8300,9 @@ type AdminConfigData = {
     negativePrompt: string | null;
   };
   systemPrompts: { agentAnalyze: string; promptAnalyze: string };
+  tokenGuide?: { enabled: boolean; siteName: string; tokenUrl: string; groupName: string; note: string };
   quotas: { squareShelfLimit: number; squareDailyRecommend: number; squareDailyLike: number; squareMaxFeed: number; generationDailyLimit?: number; userDiskLimitMB?: number };
+  timeouts?: { apiTimeoutMs: number; generationTimeoutMs: number };
 };
 
 type ConfigSection = "sites" | "presets" | "system";
@@ -8379,6 +8324,9 @@ function AdminConfigCenter() {
   const [agentAnalyze, setAgentAnalyze] = useState("");
   const [promptAnalyze, setPromptAnalyze] = useState("");
   const [quotas, setQuotas] = useState({ squareShelfLimit: 4, squareDailyRecommend: 10, squareDailyLike: 10, squareMaxFeed: 20, generationDailyLimit: 0, userDiskLimitMB: 0 });
+  const [tokenGuide, setTokenGuide] = useState({ enabled: true, siteName: "", tokenUrl: "", groupName: "", note: "" });
+  // 表单里用「秒」，存下去换成毫秒：管理员填 1200 比填 1200000 不容易错一个零
+  const [timeoutSec, setTimeoutSec] = useState({ api: 300, generation: 1200 });
 
   function hydrate(data: AdminConfigData) {
     setConfig(data);
@@ -8391,6 +8339,12 @@ function AdminConfigCenter() {
     setAgentAnalyze(data.systemPrompts.agentAnalyze);
     setPromptAnalyze(data.systemPrompts.promptAnalyze);
     setQuotas({ generationDailyLimit: 0, userDiskLimitMB: 0, ...data.quotas });
+    // 服务端未下发 tokenGuide 时用空值兜底，避免受控输入退化成非受控
+    setTokenGuide({ enabled: true, siteName: "", tokenUrl: "", groupName: "", note: "", ...data.tokenGuide });
+    setTimeoutSec({
+      api: Math.round((data.timeouts?.apiTimeoutMs ?? 300_000) / 1000),
+      generation: Math.round((data.timeouts?.generationTimeoutMs ?? 1_200_000) / 1000),
+    });
   }
 
   async function loadConfig() {
@@ -8645,6 +8599,54 @@ function AdminConfigCenter() {
           </div>
 
           <div className="admin-config-block">
+            <div className="admin-config-block-head"><strong>请求超时</strong>
+              <span className="admin-muted">单位秒，改完对下一个请求立即生效，无需重启</span>
+            </div>
+            <div className="admin-config-grid2">
+              <label>生成请求超时（秒，30–3600）
+                <input
+                  type="number"
+                  min={30}
+                  max={3600}
+                  value={timeoutSec.generation}
+                  onChange={(e) => setTimeoutSec((t) => ({ ...t, generation: Number(e.target.value) }))}
+                />
+              </label>
+              <label>常规接口超时（秒，10–600）
+                <input
+                  type="number"
+                  min={10}
+                  max={600}
+                  value={timeoutSec.api}
+                  onChange={(e) => setTimeoutSec((t) => ({ ...t, api: Number(e.target.value) }))}
+                />
+              </label>
+            </div>
+            <p className="admin-muted admin-config-note">
+              生成超时只作用于打上游生图的那一次请求（4K、多图、上游排队都可能很久）；
+              常规接口超时管模型列表、OAuth、提示词分析这类交互式请求——把它一起放大，
+              会让一个卡死的登录跳转也拖上好几分钟。
+              超过 300 秒时服务端会自动放宽 Node fetch 的底层超时；排队判死时长跟着生成超时上浮（至少 30 分钟）。
+            </p>
+            <div className="admin-config-actions">
+              <button type="button" className="subtle-button" onClick={() => void resetSection("timeouts", "请求超时")}><RefreshCw size={14} /> 恢复默认</button>
+              <button
+                type="button"
+                className="primary-button admin-config-save"
+                disabled={saving === "请求超时"}
+                onClick={() => void saveSection("timeouts", {
+                  timeouts: {
+                    apiTimeoutMs: Math.round(timeoutSec.api * 1000),
+                    generationTimeoutMs: Math.round(timeoutSec.generation * 1000),
+                  },
+                }, "请求超时")}
+              >
+                {saving === "请求超时" ? <Loader2 size={15} className="spin" /> : <Save size={15} />} 保存超时
+              </button>
+            </div>
+          </div>
+
+          <div className="admin-config-block">
             <div className="admin-config-block-head"><strong>配额管理</strong>
               <span className="admin-muted">生成类配额填 0 表示不限制</span>
             </div>
@@ -8663,9 +8665,146 @@ function AdminConfigCenter() {
               </button>
             </div>
           </div>
+
+          <div className="admin-config-block">
+            <div className="admin-config-block-head"><strong>取 Key 引导</strong>
+              <span className="admin-muted">首页给还没有 API Key 的新用户看的指引</span>
+            </div>
+            <label className="admin-config-toggle">
+              <input
+                type="checkbox"
+                checked={tokenGuide.enabled}
+                onChange={(e) => setTokenGuide((g) => ({ ...g, enabled: e.target.checked }))}
+              /> 在首页展示
+            </label>
+            <div className="admin-config-grid2">
+              <label>中转站名称
+                <input
+                  value={tokenGuide.siteName}
+                  placeholder="例如 BobDong"
+                  onChange={(e) => setTokenGuide((g) => ({ ...g, siteName: e.target.value }))}
+                />
+              </label>
+              <label>令牌管理页地址（http/https）
+                <input
+                  className="mono"
+                  value={tokenGuide.tokenUrl}
+                  placeholder="https://example.com/console/token"
+                  onChange={(e) => setTokenGuide((g) => ({ ...g, tokenUrl: e.target.value }))}
+                />
+              </label>
+              <label>令牌分组名
+                <input
+                  value={tokenGuide.groupName}
+                  placeholder="例如 banana Pro 官转"
+                  onChange={(e) => setTokenGuide((g) => ({ ...g, groupName: e.target.value }))}
+                />
+              </label>
+            </div>
+            <div className="admin-config-block-head"><strong>补充说明</strong>
+              <span className="admin-muted">{tokenGuide.note.length} 字</span>
+            </div>
+            <textarea
+              className="admin-config-fulltext"
+              value={tokenGuide.note}
+              placeholder="告诉用户新建令牌时该选哪个分组、复制回来填到哪里"
+              onChange={(e) => setTokenGuide((g) => ({ ...g, note: e.target.value }))}
+            />
+            <div className="admin-config-actions">
+              <button type="button" className="subtle-button" onClick={() => void resetSection("tokenGuide", "取 Key 引导")}><RefreshCw size={14} /> 恢复默认</button>
+              <button type="button" className="primary-button admin-config-save" disabled={saving === "取 Key 引导"} onClick={() => void saveSection("token-guide", { tokenGuide }, "取 Key 引导")}>
+                {saving === "取 Key 引导" ? <Loader2 size={15} className="spin" /> : <Save size={15} />} 保存引导
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </section>
+  );
+}
+
+type CaptchaChallenge = { token: string; gapY: number; trackWidth: number; pieceSize: number; background: string; piece: string };
+
+// 滑块拼图：背景与缺口全部用 CSS/SVG 生成，不需要任何图片处理依赖。
+// 服务端只下发 gapY（视觉用）与 token，正确的 gapX 始终留在服务端校验。
+function SliderCaptcha({ challenge, onSolved, onRefresh, error, solved }: {
+  challenge: CaptchaChallenge | null;
+  onSolved: (x: number) => void;
+  onRefresh: () => void;
+  error: string;
+  solved: boolean;
+}) {
+  const [x, setX] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const trackRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => { setX(0); }, [challenge?.token]);
+
+  const maxX = challenge ? challenge.trackWidth - challenge.pieceSize : 0;
+
+  const startDrag = (clientX: number) => {
+    if (solved || !challenge) return;
+    setDragging(true);
+    const rect = trackRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const move = (cx: number) => {
+      const next = Math.max(0, Math.min(maxX, cx - rect.left - challenge.pieceSize / 2));
+      setX(next);
+    };
+    move(clientX);
+    const onMove = (e: PointerEvent) => move(e.clientX);
+    const onUp = (e: PointerEvent) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      setDragging(false);
+      const final = Math.max(0, Math.min(maxX, e.clientX - rect.left - challenge.pieceSize / 2));
+      setX(final);
+      onSolved(Math.round(final));
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+
+  if (!challenge) {
+    return <div className="captcha-box captcha-loading"><Loader2 size={16} className="spin" /> 正在加载验证…</div>;
+  }
+
+  return (
+    <div className="captcha-box">
+      <div className="captcha-stage" ref={trackRef} style={{ width: challenge.trackWidth }}>
+        {/* 缺口位置只存在于这张图的像素里，接口响应中没有坐标 */}
+        <img className="captcha-bg" src={challenge.background} alt="拖动拼图对齐缺口" draggable={false} />
+        <img
+          className={`captcha-piece${solved ? " is-solved" : ""}`}
+          src={challenge.piece}
+          alt=""
+          draggable={false}
+          style={{ top: challenge.gapY, left: x, width: challenge.pieceSize, height: challenge.pieceSize }}
+        />
+      </div>
+      <div className="captcha-track">
+        <div
+          className={`captcha-handle${dragging ? " is-dragging" : ""}${solved ? " is-solved" : ""}`}
+          style={{ left: x }}
+          onPointerDown={(e) => { e.preventDefault(); startDrag(e.clientX); }}
+          role="slider"
+          aria-label="拖动滑块完成验证"
+          aria-valuenow={Math.round(x)}
+          aria-valuemin={0}
+          aria-valuemax={maxX}
+          tabIndex={0}
+        >
+          {solved ? <CheckCircle2 size={16} /> : <ChevronRight size={16} />}
+        </div>
+        <span className="captcha-hint">{solved ? "验证通过" : "按住滑块拖动完成拼图"}</span>
+      </div>
+      {error && (
+        <div className="captcha-error">
+          {error}
+          <button type="button" onClick={onRefresh}>换一个</button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -8682,18 +8821,25 @@ function AdminApp({
 }) {
   const [user, setUser] = useState<AdminUserView | null>(null);
   // Tab 状态进 URL（#admin / #admin/logs / #admin/config），可深链与刷新保持
-  const [adminTab, setAdminTab] = useState<"overview" | "logs" | "config">(() => {
+  const [adminTab, setAdminTab] = useState<"overview" | "logs" | "config" | "feedback" | "security">(() => {
     if (window.location.hash.startsWith("#admin/logs")) return "logs";
     if (window.location.hash.startsWith("#admin/config")) return "config";
+    if (window.location.hash.startsWith("#admin/feedback")) return "feedback";
+    if (window.location.hash.startsWith("#admin/security")) return "security";
     return "overview";
   });
-  const selectAdminTab = (tab: "overview" | "logs" | "config") => {
+  const selectAdminTab = (tab: "overview" | "logs" | "config" | "feedback" | "security") => {
     setAdminTab(tab);
     window.location.hash = tab === "overview" ? "#admin" : `#admin/${tab}`;
   };
   const [isChecking, setIsChecking] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [loginForm, setLoginForm] = useState({ username: "admin", password: "" });
+  const [captchaRequired, setCaptchaRequired] = useState(false);
+  const [captcha, setCaptcha] = useState<CaptchaChallenge | null>(null);
+  const [captchaX, setCaptchaX] = useState<number | null>(null);
+  const [captchaError, setCaptchaError] = useState("");
+  const [lockedUntil, setLockedUntil] = useState(0);
   const [passwordForm, setPasswordForm] = useState({ oldPassword: "", newPassword: "", confirmPassword: "" });
   const [adminError, setAdminError] = useState("");
   const [stats, setStats] = useState<AdminStats | null>(null);
@@ -8813,18 +8959,71 @@ function AdminApp({
     }
   }
 
+  async function loadCaptcha() {
+    setCaptchaError("");
+    setCaptchaX(null);
+    setCaptcha(null);
+    try {
+      const data = await adminFetch<CaptchaChallenge & { ok: true }>("/captcha");
+      setCaptcha({
+        token: data.token, gapY: data.gapY, trackWidth: data.trackWidth,
+        pieceSize: data.pieceSize, background: data.background, piece: data.piece,
+      });
+    } catch {
+      setCaptchaError("验证加载失败，请点「换一个」重试");
+    }
+  }
+
+  // 进页先问一次：之前失败过就直接显示滑块，别等用户白试一次
+  useEffect(() => {
+    if (user) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const data = await adminFetch<{ ok: true; captchaRequired: boolean; lockedUntil: number }>(
+          `/login-state?username=${encodeURIComponent(loginForm.username)}`,
+        );
+        if (cancelled) return;
+        setLockedUntil(data.lockedUntil || 0);
+        if (data.captchaRequired) {
+          setCaptchaRequired(true);
+          void loadCaptcha();
+        }
+      } catch { /* 前置查询失败不阻塞登录 */ }
+    })();
+    return () => { cancelled = true; };
+  }, [user]);
+
   async function handleLogin(event: FormEvent) {
     event.preventDefault();
     setAdminError("");
     setIsSubmitting(true);
     try {
+      if (captchaRequired && (!captcha || captchaX === null)) {
+        setAdminError("请先拖动滑块完成验证");
+        setIsSubmitting(false);
+        return;
+      }
       const payload = await adminFetch<{ ok: true; user: AdminUserView }>("/login", {
         method: "POST",
-        body: JSON.stringify(loginForm),
+        body: JSON.stringify({
+          ...loginForm,
+          ...(captchaRequired && captcha ? { captchaToken: captcha.token, captchaX } : {}),
+        }),
       });
       setUser(payload.user);
+      setCaptchaRequired(false);
+      setCaptcha(null);
       setPasswordForm((current) => ({ ...current, oldPassword: loginForm.password }));
     } catch (error) {
+      const detail = (error && typeof error === "object" ? error as Record<string, unknown> : {});
+      if (typeof detail.lockedUntil === "number" && detail.lockedUntil > Date.now()) {
+        setLockedUntil(detail.lockedUntil);
+      }
+      if (detail.captchaRequired) {
+        setCaptchaRequired(true);
+        void loadCaptcha();
+      }
       setAdminError(formatError(error));
     } finally {
       setIsSubmitting(false);
@@ -8966,11 +9165,25 @@ function AdminApp({
                 value={loginForm.password}
                 onChange={(event) => setLoginForm((current) => ({ ...current, password: event.target.value }))}
                 autoComplete="current-password"
-                placeholder="默认 admin123456"
+                placeholder="请输入管理员密码"
               />
             </label>
+            {captchaRequired && (
+              <SliderCaptcha
+                challenge={captcha}
+                onSolved={(x) => { setCaptchaX(x); setCaptchaError(""); }}
+                onRefresh={() => void loadCaptcha()}
+                error={captchaError}
+                solved={captchaX !== null}
+              />
+            )}
+            {lockedUntil > Date.now() && (
+              <div className="admin-error">
+                登录尝试过于频繁，请于 {new Date(lockedUntil).toLocaleTimeString("zh-CN")} 后重试
+              </div>
+            )}
             {adminError && <div className="admin-error">{adminError}</div>}
-            <button className="primary-action" type="submit" disabled={isSubmitting}>
+            <button className="primary-action" type="submit" disabled={isSubmitting || lockedUntil > Date.now()}>
               {isSubmitting ? <Loader2 size={17} className="spin" /> : <ShieldCheck size={17} />}
               登录
             </button>
@@ -9056,10 +9269,14 @@ function AdminApp({
       <nav className="admin-tabs">
         <button type="button" className={adminTab === "overview" ? "active" : ""} onClick={() => selectAdminTab("overview")}>概览</button>
         <button type="button" className={adminTab === "logs" ? "active" : ""} onClick={() => selectAdminTab("logs")}>请求日志</button>
+        <button type="button" className={adminTab === "feedback" ? "active" : ""} onClick={() => selectAdminTab("feedback")}>用户反馈</button>
         <button type="button" className={adminTab === "config" ? "active" : ""} onClick={() => selectAdminTab("config")}>接口配置</button>
+        <button type="button" className={adminTab === "security" ? "active" : ""} onClick={() => selectAdminTab("security")}>安全加固</button>
       </nav>
 
       {adminTab === "config" && <AdminConfigCenter />}
+      {adminTab === "feedback" && <AdminFeedbackPanel />}
+      {adminTab === "security" && <AdminSecurityPanel />}
 
       {adminTab === "overview" && (<>
       <section className="admin-stat-grid">
@@ -9238,7 +9455,7 @@ function AdminApp({
         <div className="admin-log-toolbar">
           <div>
             <strong>请求记录</strong>
-            <span>点击任意请求可查看脱敏请求参数、上游 payload、返回内容与已保存的生成图片。</span>
+            <span>从用户点击开始记录；展开可查看前端、服务端、上游与结果取回的完整时间线。</span>
           </div>
           <div className="admin-filter-row">
             <select
@@ -9249,6 +9466,8 @@ function AdminApp({
               }}
             >
               <option value="">全部状态</option>
+              <option value="submitting">提交中</option>
+              <option value="queued">排队中</option>
               <option value="running">运行中</option>
               <option value="success">成功</option>
               <option value="error">失败</option>
@@ -9297,10 +9516,10 @@ function AdminApp({
                       <td>
                         <div className="admin-status-cell">
                           <ChevronRight size={14} />
-                          <span className={`admin-status ${log.status}`}>{log.status}</span>
+                          <span className={`admin-status ${log.status}`}>{ADMIN_STATUS_LABELS[log.status]}</span>
                         </div>
                       </td>
-                      <td>{log.requestType === "prompt_analysis" ? "提示词分析" : "生图"}</td>
+                      <td>{log.requestType === "prompt_analysis" ? "提示词分析" : log.requestType === "agent_analysis" ? "Agent 分析" : "生图"}</td>
                       <td className="admin-model-cell" title={log.agentScenario || ""}>
                         {log.agentName ? `${log.agentName}${log.promptVariant ? ` · ${log.promptVariant}` : ""}` : "-"}
                       </td>
@@ -9310,7 +9529,7 @@ function AdminApp({
                       <td
                         title={[
                           `API：${log.apiBaseUrl}`,
-                          `Key：${log.apiKeyPresent ? `${log.apiKeyPrefix || ""}...${log.apiKeySuffix || ""} · ${log.apiKeyLength || 0} 位` : "未读取到"}`,
+                          `Key：${log.apiKeyPresent ? `${log.apiKeyPrefix ? `${log.apiKeyPrefix}…` : "已提供"} · ${log.apiKeyLength || 0} 位` : "未读取到"}`,
                           log.upstreamPayloadKeys?.length ? `上游字段：${log.upstreamPayloadKeys.join(", ")}` : "",
                           log.upstreamReferenceMode ? `参考图模式：${log.upstreamReferenceMode}` : "",
                         ].filter(Boolean).join("\n")}
@@ -9323,7 +9542,10 @@ function AdminApp({
                           log.upstreamReferenceCount ? `上游 ${log.upstreamReferenceCount} 图` : log.referenceCount ? `${log.referenceCount} 图` : "",
                         ].filter(Boolean).join(" · ") || "-"}
                       </td>
-                      <td>{formatCompactDuration(log.durationMs || 0)}</td>
+                      <td className="admin-latency-cell">
+                        <strong>{formatCompactDuration(adminLifecycleDuration(log))}</strong>
+                        <span title={adminLifecycleLatestLabel(log)}>{adminLifecycleLatestLabel(log)}</span>
+                      </td>
                       <td>{formatFullDate(log.createdAt)}</td>
                       <td className="admin-error-cell" title={log.errorRaw || log.errorMessage || ""}>{log.errorMessage || "-"}</td>
                     </tr>
@@ -9337,30 +9559,7 @@ function AdminApp({
                             </div>
                             <span className="admin-log-safety">不记录 API Key 原文；生成图片保存在服务器本地</span>
                           </div>
-                          {log.stages && (log.stages.upstreamRequestedAt || log.stages.returnedAt) && (() => {
-                            const s = log.stages;
-                            const start = s.receivedAt || log.startedAt || log.createdAt;
-                            const seg = (from?: number, to?: number) => (typeof from === "number" && typeof to === "number" && to >= from) ? to - from : null;
-                            const rows = [
-                              { label: "接收 → 请求上游", ms: seg(start, s.upstreamRequestedAt) },
-                              { label: "上游生成（含参考图转发）", ms: seg(s.upstreamRequestedAt, s.upstreamRespondedAt) },
-                              { label: "图片落盘", ms: seg(s.upstreamRespondedAt, s.imageSavedAt) },
-                              { label: "生成本地链接 → 返回", ms: seg(s.imageSavedAt, s.returnedAt) },
-                            ].filter((row) => row.ms !== null);
-                            return (
-                              <div className="admin-stage-timeline">
-                                <span className="admin-stage-timeline-title">生图链路各环节耗时</span>
-                                <div className="admin-stage-timeline-rows">
-                                  {rows.map((row) => (
-                                    <div className="admin-stage-timeline-row" key={row.label}>
-                                      <span>{row.label}</span>
-                                      <strong>{formatCompactDuration(row.ms || 0)}</strong>
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
-                            );
-                          })()}
+                          <AdminLifecycleTimeline log={log} />
                           {log.savedImages && log.savedImages.length > 0 && (
                             <div className="admin-log-images">
                               {log.savedImages.map((image) => (
@@ -9390,7 +9589,6 @@ function AdminApp({
                                 present: log.apiKeyPresent,
                                 length: log.apiKeyLength,
                                 prefix: log.apiKeyPrefix,
-                                suffix: log.apiKeySuffix,
                               },
                               model: log.model,
                               prompt: log.prompt,
@@ -9473,6 +9671,82 @@ function AdminStatCard({
   );
 }
 
+function AdminLifecycleTimeline({ log }: { log: AdminRequestLog }) {
+  const events = adminLifecycleEvents(log);
+  if (events.length === 0) return null;
+  const stages = log.stages;
+  const segment = (from?: number, to?: number) =>
+    typeof from === "number" && typeof to === "number" && to >= from ? to - from : null;
+  const startAt = stages?.clientSubmittedAt || events[0].at;
+  const isActive = log.status === "submitting" || log.status === "queued" || log.status === "running";
+  const endAt = isActive
+    ? Date.now()
+    : stages?.clientResultReceivedAt
+      || stages?.clientErrorReceivedAt
+      || stages?.taskCompletedAt
+      || log.finishedAt
+      || events[events.length - 1].at;
+  const metrics = [
+    { label: "点击 → 服务端", value: segment(stages?.clientSubmittedAt, stages?.receivedAt) },
+    { label: "服务端排队", value: segment(stages?.enqueuedAt || stages?.receivedAt, stages?.dispatchedAt) },
+    { label: "上游生成", value: segment(stages?.upstreamRequestedAt, stages?.upstreamRespondedAt) },
+    { label: "完整链路", value: segment(startAt, endAt) },
+  ].filter((item): item is { label: string; value: number } => item.value !== null);
+
+  return (
+    <section className="admin-lifecycle">
+      <div className="admin-lifecycle-head">
+        <div>
+          <strong>完整请求链路</strong>
+          <span>{events.length} 个事件 · {log.sourceSurface === "canvas" ? "画布" : log.sourceSurface === "studio" ? "工作台" : "来源未知"}</span>
+        </div>
+        <div className="admin-lifecycle-metrics">
+          {metrics.map((metric) => (
+            <span key={metric.label}>
+              {metric.label}<strong>{formatCompactDuration(metric.value)}</strong>
+            </span>
+          ))}
+          {(log.idempotentReplayCount || 0) > 0 && (
+            <span>幂等命中<strong>{log.idempotentReplayCount} 次</strong></span>
+          )}
+        </div>
+      </div>
+      <ol className="admin-lifecycle-list">
+        {events.map((event, index) => {
+          const previous = events[index - 1];
+          const delta = previous ? Math.max(0, event.at - previous.at) : 0;
+          const cumulative = Math.max(0, event.at - events[0].at);
+          const reportDelay = event.recordedAt && event.source === "client"
+            ? Math.max(0, event.recordedAt - event.at)
+            : 0;
+          return (
+            <li className={`admin-lifecycle-event ${event.source}`} key={`${event.id}-${index}`}>
+              <span className="admin-lifecycle-dot" aria-hidden="true" />
+              <div className="admin-lifecycle-event-main">
+                <div>
+                  <strong>{ADMIN_LIFECYCLE_LABELS[event.phase] || event.phase}</strong>
+                  <span className={`admin-lifecycle-source ${event.source}`}>
+                    {event.source === "client" ? "前端" : event.source === "upstream" ? "上游" : "服务端"}
+                  </span>
+                </div>
+                {event.detail && <p>{event.detail}</p>}
+              </div>
+              <div className="admin-lifecycle-event-time">
+                <time dateTime={new Date(event.at).toISOString()}>{formatFullDate(event.at)}</time>
+                <span>
+                  {index === 0 ? "链路起点" : `距上一步 +${formatCompactDuration(delta)}`}
+                  {index > 0 && ` · 累计 ${formatCompactDuration(cumulative)}`}
+                </span>
+                {reportDelay >= 1000 && <em>客户端事件上报延迟 {formatCompactDuration(reportDelay)}</em>}
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  );
+}
+
 function AdminJsonBlock({ title, value }: { title: string; value: unknown }) {
   return (
     <article className="admin-json-block">
@@ -9482,1486 +9756,8 @@ function AdminJsonBlock({ title, value }: { title: string; value: unknown }) {
   );
 }
 
-// ══════════════════════════════════════
-// Canvas Page Component
-// ══════════════════════════════════════
 
-// 画布节点：memo 化 —— 拖拽/生成时只重渲染发生变化的节点（性能关键路径）
-type CanvasNodeHandlers = {
-  onNodePointerDown: (e: React.PointerEvent, node: CanvasNode) => void;
-  onNodeOptimize: (node: CanvasNode) => void;
-};
 
-const CanvasNodeView = memo(function CanvasNodeView({
-  node,
-  selected,
-  dragging,
-  handlersRef,
-}: {
-  node: CanvasNode;
-  selected: boolean;
-  dragging: boolean;
-  handlersRef: { current: CanvasNodeHandlers };
-}) {
-  return (
-    <div
-      className={`canvas-node ${node.status} ${selected ? "selected" : ""} ${dragging ? "dragging" : ""}`}
-      style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
-      onPointerDown={(e) => handlersRef.current.onNodePointerDown(e, node)}
-      onDoubleClick={() => {
-        if (node.status === "success") handlersRef.current.onNodeOptimize(node);
-      }}
-    >
-      {node.status === "success" && node.objectUrl && (
-        <img src={node.thumbUrl ?? node.objectUrl} alt="" draggable={false} className="canvas-node-image" />
-      )}
-      {node.status === "generating" && (
-        <div className="canvas-node-skeleton">
-          <Loader2 size={24} className="spin" />
-          <span>生成中...</span>
-        </div>
-      )}
-      {node.status === "error" && (
-        <div className="canvas-node-error-content">
-          <AlertCircle size={20} />
-          <span>{node.error || "生成失败"}</span>
-        </div>
-      )}
-      {node.status === "success" && (
-        <>
-          <span className="canvas-node-badge">{node.model}</span>
-          {node.duration != null && (
-            <span className="canvas-node-duration">{formatDuration(node.duration)}</span>
-          )}
-        </>
-      )}
-    </div>
-  );
-}, (prev, next) =>
-  prev.node === next.node &&
-  prev.selected === next.selected &&
-  prev.dragging === next.dragging
-);
-
-function CanvasPage({
-  apiConfig,
-  selectedModel: globalSelectedModel,
-  selectableModels,
-  modelState,
-  onBackHome,
-  onEnterStudio,
-  onEnterSquare,
-}: {
-  apiConfig: ApiConfig;
-  selectedModel: string;
-  selectableModels: string[];
-  modelState: ModelLoadState;
-  onBackHome: () => void;
-  onEnterStudio: () => void;
-  onEnterSquare: () => void;
-}) {
-  // ── State ──
-  const [canvasNodes, setCanvasNodes] = useState<CanvasNode[]>([]);
-  const [canvasEdges, setCanvasEdges] = useState<CanvasEdge[]>([]);
-  const [viewport, setViewport] = useState<CanvasViewport>({ x: 0, y: 0, zoom: 1 });
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const [panelMode, setPanelMode] = useState<CanvasPanelMode>("generate");
-  const [isPanelOpen, setIsPanelOpen] = useState(true);
-  const [canvasPrompt, setCanvasPrompt] = useState("");
-  const [canvasModel, setCanvasModel] = useState(() => globalSelectedModel || selectableModels[0] || "");
-  const [canvasAspectRatio, setCanvasAspectRatio] = useState("1:1");
-  const [canvasResolution, setCanvasResolution] = useState<ImageResolution>("1K");
-  const [canvasSize, setCanvasSize] = useState("");
-  const [canvasQuality, setCanvasQuality] = useState("auto");
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [optimizeSourceNode, setOptimizeSourceNode] = useState<CanvasNode | null>(null);
-  const [optimizePrompt, setOptimizePrompt] = useState("");
-  const [compressedRef, setCompressedRef] = useState<{ dataUrl: string; size: number } | null>(null);
-  const [isSpaceHeld, setIsSpaceHeld] = useState(false);
-  const [toastMessage, setToastMessage] = useState("");
-  const [canvasLoaded, setCanvasLoaded] = useState(false);
-  const [isMinimapVisible, setIsMinimapVisible] = useState(false);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
-
-  // ── Refs ──
-  const containerRef = useRef<HTMLDivElement>(null);
-  const promptInputRef = useRef<HTMLTextAreaElement>(null);
-  const optimizePromptRef = useRef<HTMLTextAreaElement>(null);
-  const nodesRef = useRef(canvasNodes);
-  nodesRef.current = canvasNodes;
-  const edgesRef = useRef(canvasEdges);
-  edgesRef.current = canvasEdges;
-  const viewportRef = useRef(viewport);
-  const transformLayerRef = useRef<HTMLDivElement | null>(null);
-  const viewportRafRef = useRef(0);
-  const wheelCommitTimerRef = useRef(0);
-
-  // 性能：平移/缩放手势期间直接写 DOM transform（零 React 重渲染），手势结束才提交 state
-  const applyViewportToDom = () => {
-    const vp = viewportRef.current;
-    const layer = transformLayerRef.current;
-    if (layer) {
-      layer.style.transform = `translate(${-vp.x * vp.zoom}px, ${-vp.y * vp.zoom}px) scale(${vp.zoom})`;
-    }
-    const el = containerRef.current;
-    if (el) {
-      if (vp.zoom < 0.25) {
-        el.style.backgroundImage = "none";
-      } else {
-        const spacing = vp.zoom < 0.5 ? 40 : 20;
-        const rendered = spacing * vp.zoom;
-        el.style.backgroundImage = `radial-gradient(circle, rgba(245, 244, 239, 0.2) ${Math.max(1, vp.zoom)}px, transparent ${Math.max(1, vp.zoom)}px)`;
-        el.style.backgroundSize = `${rendered}px ${rendered}px`;
-        el.style.backgroundPosition = `${(-vp.x * vp.zoom) % rendered}px ${(-vp.y * vp.zoom) % rendered}px`;
-      }
-    }
-  };
-  const scheduleViewportPaint = () => {
-    if (viewportRafRef.current) return;
-    viewportRafRef.current = requestAnimationFrame(() => {
-      viewportRafRef.current = 0;
-      applyViewportToDom();
-    });
-  };
-  useEffect(() => {
-    // 只有 state 提交时才同步 ref（避免手势中的后台重渲染把 ref 打回旧值）
-    viewportRef.current = viewport;
-    applyViewportToDom();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [viewport]);
-
-  const isPanningRef = useRef(false);
-  const isDraggingNodeRef = useRef(false);
-  const panStartRef = useRef({ screenX: 0, screenY: 0, vpX: 0, vpY: 0 });
-  const dragStartRef = useRef({ nodeId: "", startX: 0, startY: 0, screenX: 0, screenY: 0 });
-  // 节点事件经 ref 转发：memo 组件不因 handler 身份变化而重渲染，也不会捕获过期闭包
-  const canvasNodeHandlersRef = useRef<CanvasNodeHandlers>({ onNodePointerDown: () => {}, onNodeOptimize: () => {} });
-  canvasNodeHandlersRef.current = {
-    onNodePointerDown: (e, node) => handleNodePointerDown(e, node),
-    onNodeOptimize: (node) => void enterOptimizeMode(node),
-  };
-  const saveTimerRef = useRef<number>(0);
-  const toastTimerRef = useRef<number>(0);
-
-  // ── Helper: aspect ratio to number ──
-  function aspectRatioToNumber(ratio: string): number {
-    const parts = ratio.split(":").map(Number);
-    if (parts.length === 2 && parts[0] > 0 && parts[1] > 0) return parts[0] / parts[1];
-    return 1;
-  }
-
-  // ── Helper: show toast ──
-  function showToast(message: string) {
-    setToastMessage(message);
-    window.clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = window.setTimeout(() => setToastMessage(""), 2000);
-  }
-
-  // ── Helper: debounced save ──
-  function scheduleSave() {
-    window.clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = window.setTimeout(() => {
-      const state: CanvasPersistedState = {
-        nodes: nodesRef.current.map(({ objectUrl: _objectUrl, thumbUrl: _thumbUrl, ...rest }) => rest),
-        edges: edgesRef.current,
-        viewport: viewportRef.current,
-        lastSavedAt: Date.now(),
-      };
-      void saveCanvasStateToDB(state);
-    }, CANVAS_SAVE_DEBOUNCE_MS);
-  }
-
-  // ── Load canvas state from IndexedDB on mount ──
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const saved = await loadCanvasStateFromDB();
-        if (cancelled || !saved) { setCanvasLoaded(true); return; }
-        const loadedNodes: CanvasNode[] = [];
-        for (const node of saved.nodes) {
-          if (cancelled) break;
-          if (node.status === "success") {
-            const blob = await loadCanvasImageFromDB(node.id);
-            if (blob) {
-              const thumbBlob = await loadCanvasImageFromDB(canvasThumbKey(node.id));
-              loadedNodes.push({
-                ...node,
-                objectUrl: URL.createObjectURL(blob),
-                thumbUrl: thumbBlob ? URL.createObjectURL(thumbBlob) : undefined,
-              });
-            } else {
-              loadedNodes.push({ ...node, status: "error", error: "图片数据丢失" });
-            }
-          } else if (node.status === "generating") {
-            // Was generating when page closed - mark as error
-            loadedNodes.push({ ...node, status: "error", error: "生成中断（页面关闭）" });
-          } else {
-            loadedNodes.push(node);
-          }
-        }
-        if (cancelled) {
-          // 中途离开画布：已建好的 objectUrl / thumbUrl 不会进入 state，必须就地回收
-          loadedNodes.forEach((n) => {
-            if (n.objectUrl) URL.revokeObjectURL(n.objectUrl);
-            if (n.thumbUrl) URL.revokeObjectURL(n.thumbUrl);
-          });
-          return;
-        }
-        setCanvasNodes(loadedNodes);
-        setCanvasEdges(saved.edges || []);
-        setViewport(saved.viewport || { x: 0, y: 0, zoom: 1 });
-        setCanvasLoaded(true);
-      } catch {
-        if (!cancelled) setCanvasLoaded(true);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
-  // ── Cleanup objectUrls on unmount ──
-  useEffect(() => {
-    return () => {
-      nodesRef.current.forEach((n) => {
-        if (n.objectUrl) URL.revokeObjectURL(n.objectUrl);
-        if (n.thumbUrl) URL.revokeObjectURL(n.thumbUrl);
-      });
-    };
-  }, []);
-
-  // ── Save on beforeunload ──
-  useEffect(() => {
-    const handler = () => {
-      const state: CanvasPersistedState = {
-        nodes: nodesRef.current.map(({ objectUrl: _objectUrl, thumbUrl: _thumbUrl, ...rest }) => rest),
-        edges: edgesRef.current,
-        viewport: viewportRef.current,
-        lastSavedAt: Date.now(),
-      };
-      void saveCanvasStateToDB(state);
-    };
-    window.addEventListener("beforeunload", handler);
-    return () => window.removeEventListener("beforeunload", handler);
-  }, []);
-
-  // ── Auto-save when nodes/edges change ──
-  useEffect(() => {
-    if (canvasLoaded) scheduleSave();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canvasNodes, canvasEdges, canvasLoaded]);
-
-  // ── Zoom helpers ──
-  function clampZoomVal(z: number) { return clampNumber(z, 0.1, 3); }
-
-  function zoomAtPoint(screenX: number, screenY: number, newZoom: number) {
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const vp = viewportRef.current;
-    const canvasX = (screenX - rect.left) / vp.zoom + vp.x;
-    const canvasY = (screenY - rect.top) / vp.zoom + vp.y;
-    setViewport({
-      x: canvasX - (screenX - rect.left) / newZoom,
-      y: canvasY - (screenY - rect.top) / newZoom,
-      zoom: newZoom,
-    });
-  }
-
-  function zoomAtCenter(newZoom: number) {
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    zoomAtPoint(rect.left + rect.width / 2, rect.top + rect.height / 2, newZoom);
-  }
-
-  function fitAllNodes() {
-    if (canvasNodes.length === 0) return;
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const pad = 80;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const n of canvasNodes) {
-      if (n.x < minX) minX = n.x;
-      if (n.y < minY) minY = n.y;
-      if (n.x + n.width > maxX) maxX = n.x + n.width;
-      if (n.y + n.height > maxY) maxY = n.y + n.height;
-    }
-    const cw = maxX - minX + pad * 2;
-    const ch = maxY - minY + pad * 2;
-    const zoom = clampZoomVal(Math.min(rect.width / cw, rect.height / ch));
-    setViewport({
-      x: minX - pad + (cw - rect.width / zoom) / 2,
-      y: minY - pad + (ch - rect.height / zoom) / 2,
-      zoom,
-    });
-  }
-
-  // ── Viewport center in canvas coords ──
-  function viewportCenter() {
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return { x: 0, y: 0 };
-    const vp = viewportRef.current;
-    return {
-      x: vp.x + rect.width / (2 * vp.zoom),
-      y: vp.y + rect.height / (2 * vp.zoom),
-    };
-  }
-
-  // ── Find non-overlapping position ──
-  function findNonOverlappingPos(cx: number, cy: number, w: number, h: number) {
-    let x = cx - w / 2;
-    const y = cy - h / 2;
-    const overlaps = (nx: number, ny: number) =>
-      nodesRef.current.some((n) =>
-        nx < n.x + n.width + 20 && nx + w + 20 > n.x && ny < n.y + n.height + 20 && ny + h + 20 > n.y
-      );
-    let attempts = 0;
-    while (overlaps(x, y) && attempts < 20) {
-      x += w + 40;
-      attempts++;
-    }
-    return { x, y };
-  }
-
-  // ── Pan & Zoom event handlers ──
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-
-    function onWheel(e: WheelEvent) {
-      e.preventDefault();
-      const vp = viewportRef.current;
-      if (e.ctrlKey || e.metaKey) {
-        // Zoom —— 手势期间只写 ref + rAF 直绘，停止 140ms 后提交 state
-        const factor = e.deltaY > 0 ? 1 / 1.08 : 1.08;
-        const nz = clampZoomVal(vp.zoom * factor);
-        const rect = el!.getBoundingClientRect();
-        const cx = (e.clientX - rect.left) / vp.zoom + vp.x;
-        const cy = (e.clientY - rect.top) / vp.zoom + vp.y;
-        viewportRef.current = {
-          x: cx - (e.clientX - rect.left) / nz,
-          y: cy - (e.clientY - rect.top) / nz,
-          zoom: nz,
-        };
-      } else {
-        // Pan
-        viewportRef.current = {
-          x: vp.x + e.deltaX / vp.zoom,
-          y: vp.y + e.deltaY / vp.zoom,
-          zoom: vp.zoom,
-        };
-      }
-      scheduleViewportPaint();
-      window.clearTimeout(wheelCommitTimerRef.current);
-      wheelCommitTimerRef.current = window.setTimeout(() => {
-        setViewport({ ...viewportRef.current });
-      }, 140);
-    }
-
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, []);
-
-  // ── Pointer events for panning and node dragging ──
-  function handleCanvasPointerDown(e: React.PointerEvent) {
-    if (e.target !== e.currentTarget && !isSpaceHeld) return; // clicked on a child, not canvas background
-    // Deselect if clicking on canvas background
-    if (e.button === 0 && !isSpaceHeld) {
-      setSelectedNodeId(null);
-      if (panelMode === "optimize") {
-        setPanelMode("generate");
-        setOptimizeSourceNode(null);
-        setCompressedRef(null);
-      }
-    }
-    // Start pan
-    if (e.button === 1 || e.button === 2 || (e.button === 0 && isSpaceHeld)) {
-      e.preventDefault();
-      isPanningRef.current = true;
-      containerRef.current?.classList.add("is-panning");
-      panStartRef.current = {
-        screenX: e.clientX,
-        screenY: e.clientY,
-        vpX: viewportRef.current.x,
-        vpY: viewportRef.current.y,
-      };
-      (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    }
-  }
-
-  function handleCanvasPointerMove(e: React.PointerEvent) {
-    if (isDraggingNodeRef.current) {
-      const ds = dragStartRef.current;
-      const vp = viewportRef.current;
-      const dx = (e.clientX - ds.screenX) / vp.zoom;
-      const dy = (e.clientY - ds.screenY) / vp.zoom;
-      setCanvasNodes((prev) => prev.map((n) =>
-        n.id === ds.nodeId ? { ...n, x: ds.startX + dx, y: ds.startY + dy } : n
-      ));
-      return;
-    }
-    if (isPanningRef.current) {
-      const ps = panStartRef.current;
-      const vp = viewportRef.current;
-      viewportRef.current = {
-        x: ps.vpX - (e.clientX - ps.screenX) / vp.zoom,
-        y: ps.vpY - (e.clientY - ps.screenY) / vp.zoom,
-        zoom: vp.zoom,
-      };
-      scheduleViewportPaint();
-    }
-  }
-
-  function handleCanvasPointerUp() {
-    if (isDraggingNodeRef.current) {
-      isDraggingNodeRef.current = false;
-      scheduleSave();
-    }
-    if (isPanningRef.current) {
-      isPanningRef.current = false;
-      containerRef.current?.classList.remove("is-panning");
-      // 手势结束提交 state，让 minimap/网格与 React 树同步
-      setViewport({ ...viewportRef.current });
-    }
-  }
-
-  function handleNodePointerDown(e: React.PointerEvent, node: CanvasNode) {
-    if (isSpaceHeld || e.button !== 0) return;
-    e.stopPropagation();
-    setSelectedNodeId(node.id);
-    isDraggingNodeRef.current = true;
-    dragStartRef.current = {
-      nodeId: node.id,
-      startX: node.x,
-      startY: node.y,
-      screenX: e.clientX,
-      screenY: e.clientY,
-    };
-  }
-
-  // ── Keyboard shortcuts ──
-  useEffect(() => {
-    function isInputFocused() {
-      const tag = document.activeElement?.tagName;
-      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
-    }
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key === " " && !isInputFocused()) {
-        e.preventDefault();
-        setIsSpaceHeld(true);
-      }
-      if (e.key === "Escape") {
-        setSelectedNodeId(null);
-        if (panelMode === "optimize") {
-          setPanelMode("generate");
-          setOptimizeSourceNode(null);
-          setCompressedRef(null);
-        }
-        setShowDeleteConfirm(null);
-      }
-      if ((e.key === "Delete" || e.key === "Backspace") && !isInputFocused() && selectedNodeId) {
-        e.preventDefault();
-        setShowDeleteConfirm(selectedNodeId);
-      }
-      if (e.key === "e" && !isInputFocused() && selectedNodeId) {
-        const node = nodesRef.current.find((n) => n.id === selectedNodeId);
-        if (node?.status === "success") void enterOptimizeMode(node);
-      }
-      if (e.key === "m" && !isInputFocused()) {
-        setIsMinimapVisible((v) => !v);
-      }
-      if ((e.metaKey || e.ctrlKey) && (e.key === "=" || e.key === "+")) {
-        e.preventDefault();
-        const nz = clampZoomVal(viewportRef.current.zoom * 1.2);
-        zoomAtCenter(nz);
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === "-") {
-        e.preventDefault();
-        const nz = clampZoomVal(viewportRef.current.zoom / 1.2);
-        zoomAtCenter(nz);
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === "0") {
-        e.preventDefault();
-        zoomAtCenter(1);
-      }
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "f" || e.key === "F")) {
-        e.preventDefault();
-        fitAllNodes();
-      }
-    }
-    function onKeyUp(e: KeyboardEvent) {
-      if (e.key === " ") setIsSpaceHeld(false);
-    }
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNodeId, panelMode]);
-
-  // ── Context menu prevention ──
-  function handleContextMenu(e: React.MouseEvent) {
-    e.preventDefault();
-  }
-
-  // ── Delete node ──
-  function confirmDeleteNode(id: string) {
-    const node = canvasNodes.find((n) => n.id === id);
-    if (node?.objectUrl) URL.revokeObjectURL(node.objectUrl);
-    if (node?.thumbUrl) URL.revokeObjectURL(node.thumbUrl);
-    setCanvasNodes((prev) => prev.filter((n) => n.id !== id));
-    setCanvasEdges((prev) => prev.filter((edge) => edge.fromNodeId !== id && edge.toNodeId !== id));
-    if (selectedNodeId === id) {
-      setSelectedNodeId(null);
-      if (panelMode === "optimize") {
-        setPanelMode("generate");
-        setOptimizeSourceNode(null);
-        setCompressedRef(null);
-      }
-    }
-    setShowDeleteConfirm(null);
-    void deleteCanvasImageFromDB(id);
-    void deleteCanvasImageFromDB(canvasThumbKey(id));
-  }
-
-  // ── Download node ──
-  function downloadNode(node: CanvasNode) {
-    if (!node.objectUrl) return;
-    const a = document.createElement("a");
-    a.href = node.objectUrl;
-    a.download = `${node.model}-${node.params.aspectRatio.replace(":", "x")}-${Date.now()}.png`;
-    a.click();
-  }
-
-  // ── Copy prompt ──
-  function copyPrompt(node: CanvasNode) {
-    void navigator.clipboard.writeText(node.prompt);
-    showToast("提示词已复制");
-  }
-
-  // ── Enter optimize mode ──
-  async function enterOptimizeMode(node: CanvasNode) {
-    setPanelMode("optimize");
-    setOptimizeSourceNode(node);
-    setOptimizePrompt("");
-    setIsPanelOpen(true);
-    setCompressedRef(null);
-    // Compress the image
-    try {
-      const blob = await loadCanvasImageFromDB(node.id);
-      if (!blob) return;
-      const dataUrl = await blobToDataUrl(blob);
-      // Use createSquareThumbnail with maxEdge 1024
-      const result = await createSquareThumbnail(dataUrl, 1024);
-      const size = Math.round(result.dataUrl.length * 3 / 4); // approximate byte size
-      setCompressedRef({ dataUrl: result.dataUrl, size });
-    } catch {
-      // Failed to compress, use original objectUrl
-    }
-  }
-
-  // ── Generation flow ──
-  async function handleCanvasGenerate() {
-    const trimmedPrompt = canvasPrompt.trim();
-    if (!trimmedPrompt || !canvasModel || modelState.status !== "ready") return;
-
-    const aspectNum = aspectRatioToNumber(canvasAspectRatio);
-    const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
-    const nodeH = Math.round(nodeW / aspectNum);
-    const center = viewportCenter();
-    const pos = findNonOverlappingPos(center.x, center.y, nodeW, nodeH);
-
-    const nodeId = uid();
-    const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
-    const newNode: CanvasNode = {
-      id: nodeId,
-      type: "image",
-      x: pos.x,
-      y: pos.y,
-      width: nodeW,
-      height: nodeH,
-      prompt: trimmedPrompt,
-      model: canvasModel,
-      protocol: apiConfig.protocol,
-      params: {
-        aspectRatio: canvasAspectRatio,
-        size,
-        resolution: canvasResolution,
-        quality: canvasQuality,
-        outputFormat: "png",
-        batchCount: 1,
-        concurrency: 1,
-        retryLimit: 0,
-        seed: "",
-        negativePrompt: "",
-      },
-      status: "generating",
-      createdAt: Date.now(),
-    };
-
-    setCanvasNodes((prev) => [...prev, newNode]);
-    setCanvasPrompt("");
-    setIsGenerating(true);
-
-    const startedAt = Date.now();
-    try {
-      const response = await fetch("/api/images/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
-          apiKey: apiConfig.apiKey,
-          clientId: getClientId(),
-          request: {
-            protocol: apiConfig.protocol,
-            model: canvasModel,
-            prompt: trimmedPrompt,
-            referenceImages: [],
-            aspectRatio: canvasAspectRatio,
-            size,
-            resolution: canvasResolution,
-            quality: canvasQuality,
-            outputFormat: "png",
-            seed: "",
-          },
-        }),
-      });
-      const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
-        const detail = payload.detail && typeof payload.detail === "object"
-          ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
-          : payload.detail || "生成失败";
-        throw new Error(String(detail));
-      }
-      const blob = await generatedImageToBlob(payload.images[0]);
-      const objectUrl = URL.createObjectURL(blob);
-      const { width, height } = await getImageSize(objectUrl);
-      // 画布节点用缩略图渲染：30 节点画布的位图内存从 ~500MB 降到 ~30MB
-      const thumb = await createListThumbnail(blob);
-      const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
-      const duration = Date.now() - startedAt;
-      const adjustedH = Math.round(nodeW * (height / width));
-
-      setCanvasNodes((prev) => prev.map((n) =>
-        n.id === nodeId ? {
-          ...n,
-          status: "success" as const,
-          objectUrl,
-          thumbUrl,
-          width: nodeW,
-          height: adjustedH,
-          imageWidth: width,
-          imageHeight: height,
-          duration,
-        } : n
-      ));
-      await saveCanvasImageToDB(nodeId, blob);
-      if (thumb) await saveCanvasImageToDB(canvasThumbKey(nodeId), thumb.blob);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setCanvasNodes((prev) => prev.map((n) =>
-        n.id === nodeId ? { ...n, status: "error" as const, error: message } : n
-      ));
-    } finally {
-      setIsGenerating(false);
-    }
-  }
-
-  // ── Optimize generation flow ──
-  async function handleCanvasOptimize() {
-    if (!optimizeSourceNode || !compressedRef) return;
-    const sourceNode = optimizeSourceNode;
-    const supplement = optimizePrompt.trim();
-    const finalPrompt = supplement
-      ? `基于参考图进行优化。原始描述：${sourceNode.prompt}。优化方向：${supplement}`
-      : sourceNode.prompt;
-
-    const aspectNum = aspectRatioToNumber(canvasAspectRatio);
-    const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
-    const nodeH = Math.round(nodeW / aspectNum);
-
-    // Position to the right of parent
-    let newX = sourceNode.x + sourceNode.width + 60;
-    let newY = sourceNode.y;
-    // If overlapping, shift down
-    let attempts = 0;
-    while (
-      nodesRef.current.some((n) =>
-        newX < n.x + n.width + 20 && newX + nodeW + 20 > n.x &&
-        newY < n.y + n.height + 20 && newY + nodeH + 20 > n.y
-      ) && attempts < 20
-    ) {
-      newY += nodeH + 40;
-      attempts++;
-    }
-
-    const nodeId = uid();
-    const edgeId = uid();
-    const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
-    const newNode: CanvasNode = {
-      id: nodeId,
-      type: "image",
-      x: newX,
-      y: newY,
-      width: nodeW,
-      height: nodeH,
-      prompt: finalPrompt,
-      model: canvasModel,
-      protocol: apiConfig.protocol,
-      params: {
-        aspectRatio: canvasAspectRatio,
-        size,
-        resolution: canvasResolution,
-        quality: canvasQuality,
-        outputFormat: "png",
-        batchCount: 1,
-        concurrency: 1,
-        retryLimit: 0,
-        seed: "",
-        negativePrompt: "",
-      },
-      status: "generating",
-      parentId: sourceNode.id,
-      referenceNodeId: sourceNode.id,
-      createdAt: Date.now(),
-    };
-    const newEdge: CanvasEdge = { id: edgeId, fromNodeId: sourceNode.id, toNodeId: nodeId };
-
-    setCanvasNodes((prev) => [...prev, newNode]);
-    setCanvasEdges((prev) => [...prev, newEdge]);
-    setIsGenerating(true);
-
-    const startedAt = Date.now();
-    try {
-      const response = await fetch("/api/images/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
-          apiKey: apiConfig.apiKey,
-          clientId: getClientId(),
-          request: {
-            protocol: apiConfig.protocol,
-            model: canvasModel,
-            prompt: finalPrompt,
-            referenceImages: [{
-              name: "reference.webp",
-              type: "image/webp",
-              dataUrl: compressedRef.dataUrl,
-              originalBytes: compressedRef.size,
-              requestBytes: compressedRef.size,
-              compressed: true,
-            }],
-            aspectRatio: canvasAspectRatio,
-            size,
-            resolution: canvasResolution,
-            quality: canvasQuality,
-            outputFormat: "png",
-            seed: "",
-          },
-        }),
-      });
-      const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
-        const detail = payload.detail && typeof payload.detail === "object"
-          ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
-          : payload.detail || "生成失败";
-        throw new Error(String(detail));
-      }
-      const blob = await generatedImageToBlob(payload.images[0]);
-      const objectUrl = URL.createObjectURL(blob);
-      const { width, height } = await getImageSize(objectUrl);
-      // 画布节点用缩略图渲染：30 节点画布的位图内存从 ~500MB 降到 ~30MB
-      const thumb = await createListThumbnail(blob);
-      const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
-      const duration = Date.now() - startedAt;
-      const adjustedH = Math.round(nodeW * (height / width));
-
-      setCanvasNodes((prev) => prev.map((n) =>
-        n.id === nodeId ? {
-          ...n,
-          status: "success" as const,
-          objectUrl,
-          thumbUrl,
-          width: nodeW,
-          height: adjustedH,
-          imageWidth: width,
-          imageHeight: height,
-          duration,
-        } : n
-      ));
-      await saveCanvasImageToDB(nodeId, blob);
-      if (thumb) await saveCanvasImageToDB(canvasThumbKey(nodeId), thumb.blob);
-      // Auto-select new node for chaining
-      setSelectedNodeId(nodeId);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setCanvasNodes((prev) => prev.map((n) =>
-        n.id === nodeId ? { ...n, status: "error" as const, error: message } : n
-      ));
-    } finally {
-      setIsGenerating(false);
-    }
-  }
-
-  // ── Retry failed node ──
-  async function retryNode(node: CanvasNode) {
-    setCanvasNodes((prev) => prev.map((n) =>
-      n.id === node.id ? { ...n, status: "generating" as const, error: undefined } : n
-    ));
-    setIsGenerating(true);
-    const startedAt = Date.now();
-    try {
-      const referenceImages: SubmittedReference[] = [];
-      if (node.referenceNodeId && node.parentId) {
-        // Try to get parent's compressed reference
-        const parentBlob = await loadCanvasImageFromDB(node.parentId);
-        if (parentBlob) {
-          const parentDataUrl = await blobToDataUrl(parentBlob);
-          const compressed = await createSquareThumbnail(parentDataUrl, 1024);
-          referenceImages.push({
-            name: "reference.webp",
-            type: "image/webp",
-            dataUrl: compressed.dataUrl,
-            originalBytes: compressed.dataUrl.length,
-            requestBytes: compressed.dataUrl.length,
-            compressed: true,
-          });
-        }
-      }
-      const response = await fetch("/api/images/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
-          apiKey: apiConfig.apiKey,
-          clientId: getClientId(),
-          request: {
-            protocol: node.protocol,
-            model: node.model,
-            prompt: node.prompt,
-            referenceImages,
-            aspectRatio: node.params.aspectRatio,
-            size: node.params.size,
-            resolution: node.params.resolution,
-            quality: node.params.quality,
-            outputFormat: node.params.outputFormat,
-            seed: "",
-          },
-        }),
-      });
-      const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
-        const detail = payload.detail && typeof payload.detail === "object"
-          ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
-          : payload.detail || "生成失败";
-        throw new Error(String(detail));
-      }
-      const blob = await generatedImageToBlob(payload.images[0]);
-      const objectUrl = URL.createObjectURL(blob);
-      const { width, height } = await getImageSize(objectUrl);
-      // 画布节点用缩略图渲染：30 节点画布的位图内存从 ~500MB 降到 ~30MB
-      const thumb = await createListThumbnail(blob);
-      const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
-      const duration = Date.now() - startedAt;
-      const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
-      const adjustedH = Math.round(nodeW * (height / width));
-
-      setCanvasNodes((prev) => prev.map((n) =>
-        n.id === node.id ? {
-          ...n,
-          status: "success" as const,
-          objectUrl,
-          thumbUrl,
-          width: nodeW,
-          height: adjustedH,
-          imageWidth: width,
-          imageHeight: height,
-          duration,
-          error: undefined,
-        } : n
-      ));
-      await saveCanvasImageToDB(node.id, blob);
-      if (thumb) await saveCanvasImageToDB(canvasThumbKey(node.id), thumb.blob);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setCanvasNodes((prev) => prev.map((n) =>
-        n.id === node.id ? { ...n, status: "error" as const, error: message } : n
-      ));
-    } finally {
-      setIsGenerating(false);
-    }
-  }
-
-  // ── Computed values ──
-  const selectedNode = canvasNodes.find((n) => n.id === selectedNodeId) || null;
-  const canScale = isGptImage2ProModel(canvasModel) || !usesOfficialGptImageSizing(apiConfig.protocol, canvasModel);
-  const canvasEffectiveResolution = canScale ? canvasResolution : DEFAULT_IMAGE_RESOLUTION;
-  const supportedAspectRatios = getSupportedAspectRatios(apiConfig.protocol, canvasModel, canvasEffectiveResolution);
-  const resolvedSize = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
-  const canvasExplicitSizeOptions = explicitSizeOptionsForModel(canvasModel, canvasEffectiveResolution);
-  const selectedCanvasSizeOption = canvasExplicitSizeOptions.find((option) => option.size === resolvedSize);
-  const isApiReady = modelState.status === "ready" && apiConfig.apiKey.trim().length >= 8;
-
-  // ── Update model when global changes ──
-  useEffect(() => {
-    if (globalSelectedModel && selectableModels.includes(globalSelectedModel)) {
-      setCanvasModel(globalSelectedModel);
-    }
-  }, [globalSelectedModel, selectableModels]);
-
-  // ── Update aspect ratio when model changes ──
-  useEffect(() => {
-    const nextResolution = canScale ? canvasResolution : DEFAULT_IMAGE_RESOLUTION;
-    const ratios = getSupportedAspectRatios(apiConfig.protocol, canvasModel, nextResolution);
-    if (!ratios.includes(canvasAspectRatio)) {
-      setCanvasAspectRatio(ratios[0] || "1:1");
-    }
-    if (!canScale && canvasResolution !== DEFAULT_IMAGE_RESOLUTION) {
-      setCanvasResolution("1K");
-    }
-    const nextSize = resolveRequestSize(canvasAspectRatio, nextResolution, apiConfig.protocol, canvasModel, canvasSize);
-    if (nextSize !== canvasSize) {
-      setCanvasSize(nextSize);
-    }
-  }, [apiConfig.protocol, canScale, canvasAspectRatio, canvasModel, canvasResolution, canvasSize]);
-
-  // ── Floating toolbar position ──
-  const toolbarPos = useMemo(() => {
-    if (!selectedNode || !containerRef.current) return null;
-    const rect = containerRef.current.getBoundingClientRect();
-    const screenX = (selectedNode.x - viewport.x) * viewport.zoom + rect.left + (selectedNode.width * viewport.zoom) / 2;
-    const screenY = (selectedNode.y - viewport.y) * viewport.zoom + rect.top;
-    const aboveY = screenY - 12;
-    const belowY = screenY + selectedNode.height * viewport.zoom + 12;
-    const y = aboveY > rect.top + 56 ? aboveY : belowY;
-    return {
-      x: clampNumber(screenX, rect.left + 100, rect.right - 100),
-      y: clampNumber(y, rect.top + 10, rect.bottom - 50),
-    };
-  }, [selectedNode, viewport]);
-
-  // ── Grid background style ──
-  const gridStyle = useMemo((): CSSProperties => {
-    if (viewport.zoom < 0.25) return {};
-    const spacing = viewport.zoom < 0.5 ? 40 : 20;
-    const rendered = spacing * viewport.zoom;
-    const ox = (-viewport.x * viewport.zoom) % rendered;
-    const oy = (-viewport.y * viewport.zoom) % rendered;
-    return {
-      backgroundImage: `radial-gradient(circle, rgba(245, 244, 239, 0.2) ${Math.max(1, viewport.zoom)}px, transparent ${Math.max(1, viewport.zoom)}px)`,
-      backgroundSize: `${rendered}px ${rendered}px`,
-      backgroundPosition: `${ox}px ${oy}px`,
-    };
-  }, [viewport]);
-
-  // ── Minimap data ──
-  const minimapData = useMemo(() => {
-    if (!isMinimapVisible || canvasNodes.length === 0) return null;
-    const pad = 40;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const n of canvasNodes) {
-      if (n.x < minX) minX = n.x;
-      if (n.y < minY) minY = n.y;
-      if (n.x + n.width > maxX) maxX = n.x + n.width;
-      if (n.y + n.height > maxY) maxY = n.y + n.height;
-    }
-    const cw = maxX - minX + pad * 2;
-    const ch = maxY - minY + pad * 2;
-    const scale = Math.min(170 / cw, 110 / ch);
-    const rect = containerRef.current?.getBoundingClientRect();
-    const vpW = rect ? rect.width / viewport.zoom : 0;
-    const vpH = rect ? rect.height / viewport.zoom : 0;
-    return { minX: minX - pad, minY: minY - pad, scale, cw, ch, vpW, vpH };
-  }, [isMinimapVisible, canvasNodes, viewport]);
-
-  // ── Render ──
-  return (
-    <main className={`canvas-page ${isPanelOpen ? "" : "panel-collapsed"}`}>
-      <header className="canvas-topbar">
-        <button type="button" className="home-brand canvas-brand" onClick={onBackHome}>
-          <span><img src={imageStudioLogo} alt="" /></span>
-          <strong>Image Studio</strong>
-          <span className="canvas-topbar-badge">Canvas</span>
-        </button>
-        <div className="canvas-topbar-nav">
-          <button type="button" className="subtle-button" onClick={onBackHome}>首页</button>
-          <button type="button" className="subtle-button" onClick={onEnterStudio}>工作台</button>
-          <button type="button" className="subtle-button" onClick={onEnterSquare}>广场</button>
-        </div>
-      </header>
-
-      {/* Canvas viewport */}
-      <div
-        className={`canvas-viewport ${isSpaceHeld ? "is-space-held" : ""}`}
-        ref={containerRef}
-        onPointerDown={handleCanvasPointerDown}
-        onPointerMove={handleCanvasPointerMove}
-        onPointerUp={handleCanvasPointerUp}
-        onContextMenu={handleContextMenu}
-        style={gridStyle}
-      >
-        {/* Transform layer —— 手势期间由 applyViewportToDom 直接驱动 */}
-        <div
-          className="canvas-transform-layer"
-          ref={transformLayerRef}
-          style={{
-            transform: `translate(${-viewport.x * viewport.zoom}px, ${-viewport.y * viewport.zoom}px) scale(${viewport.zoom})`,
-          }}
-        >
-          {/* SVG Edges */}
-          <svg className="canvas-edge-layer">
-            <defs>
-              <marker id="canvas-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-                <path d="M0,0 L6,3 L0,6 Z" fill="rgba(16,185,129,0.4)" />
-              </marker>
-            </defs>
-            {canvasEdges.map((edge) => {
-              const from = canvasNodes.find((n) => n.id === edge.fromNodeId);
-              const to = canvasNodes.find((n) => n.id === edge.toNodeId);
-              if (!from || !to) return null;
-              const x1 = from.x + from.width;
-              const y1 = from.y + from.height / 2;
-              const x2 = to.x;
-              const y2 = to.y + to.height / 2;
-              const dx = Math.abs(x2 - x1) * 0.5;
-              return (
-                <path
-                  key={edge.id}
-                  className="canvas-edge-path"
-                  d={`M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`}
-                  markerEnd="url(#canvas-arrow)"
-                />
-              );
-            })}
-          </svg>
-
-          {/* Nodes —— memo 化，拖拽时只重渲染被拖节点 */}
-          {canvasNodes.map((node) => (
-            <CanvasNodeView
-              key={node.id}
-              node={node}
-              selected={selectedNodeId === node.id}
-              dragging={isDraggingNodeRef.current && dragStartRef.current.nodeId === node.id}
-              handlersRef={canvasNodeHandlersRef}
-            />
-          ))}
-        </div>
-
-        {/* Empty state */}
-        {canvasLoaded && canvasNodes.length === 0 && (
-          <div className="canvas-empty-state">
-            <ImagePlus size={48} strokeWidth={1.2} />
-            <strong>无限画布</strong>
-            <p>在无边的空间中自由创作</p>
-            <p className="canvas-empty-hint">在右侧面板输入提示词，图片将生成到画布上。<br />选中图片后可以基于它继续优化。</p>
-            <button type="button" className="canvas-empty-action" onClick={() => { setIsPanelOpen(true); promptInputRef.current?.focus(); }}>
-              开始第一次生成 <ArrowRight size={16} />
-            </button>
-          </div>
-        )}
-
-        {/* Floating toolbar */}
-        {selectedNode && toolbarPos && (
-          <div
-            className="canvas-floating-toolbar"
-            style={{ position: "fixed", left: toolbarPos.x, top: toolbarPos.y, transform: "translate(-50%, -100%)" }}
-          >
-            {selectedNode.status === "success" && (
-              <>
-                <button type="button" onClick={() => void enterOptimizeMode(selectedNode)}>
-                  <WandSparkles size={14} /> 优化
-                </button>
-                <button type="button" onClick={() => downloadNode(selectedNode)}>
-                  <Download size={14} /> 下载
-                </button>
-                <button type="button" onClick={() => copyPrompt(selectedNode)}>
-                  <Copy size={14} /> 复制提示词
-                </button>
-                <button type="button" onClick={() => setShowDeleteConfirm(selectedNode.id)}>
-                  <Trash2 size={14} /> 删除
-                </button>
-              </>
-            )}
-            {selectedNode.status === "error" && (
-              <>
-                <button type="button" onClick={() => void retryNode(selectedNode)}>
-                  <RefreshCw size={14} /> 重试
-                </button>
-                <button type="button" onClick={() => setShowDeleteConfirm(selectedNode.id)}>
-                  <Trash2 size={14} /> 删除
-                </button>
-              </>
-            )}
-          </div>
-        )}
-
-        {/* Zoom bar */}
-        <div className="canvas-zoom-bar">
-          <button type="button" onClick={() => { const nz = clampZoomVal(viewport.zoom / 1.2); zoomAtCenter(nz); }}>-</button>
-          <input
-            type="range"
-            min={10}
-            max={300}
-            step={5}
-            value={Math.round(viewport.zoom * 100)}
-            onChange={(e) => zoomAtCenter(Number(e.target.value) / 100)}
-          />
-          <span className="canvas-zoom-label">{Math.round(viewport.zoom * 100)}%</span>
-          <button type="button" onClick={() => { const nz = clampZoomVal(viewport.zoom * 1.2); zoomAtCenter(nz); }}>+</button>
-          <button type="button" onClick={fitAllNodes} title="适应全部节点">
-            <Maximize2 size={15} />
-          </button>
-        </div>
-
-        {/* Minimap */}
-        {isMinimapVisible && minimapData && (
-          <div
-            className="canvas-minimap"
-            onPointerDown={(e) => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              const mx = (e.clientX - rect.left) / minimapData.scale + minimapData.minX;
-              const my = (e.clientY - rect.top) / minimapData.scale + minimapData.minY;
-              setViewport((v) => ({
-                ...v,
-                x: mx - minimapData.vpW / 2,
-                y: my - minimapData.vpH / 2,
-              }));
-            }}
-          >
-            {canvasNodes.map((n) => (
-              <div
-                key={n.id}
-                className={`canvas-minimap-node ${n.status} ${n.id === selectedNodeId ? "selected" : ""}`}
-                style={{
-                  left: (n.x - minimapData.minX) * minimapData.scale,
-                  top: (n.y - minimapData.minY) * minimapData.scale,
-                  width: Math.max(4, n.width * minimapData.scale),
-                  height: Math.max(4, n.height * minimapData.scale),
-                }}
-              />
-            ))}
-            <div
-              className="canvas-minimap-viewport"
-              style={{
-                left: (viewport.x - minimapData.minX) * minimapData.scale,
-                top: (viewport.y - minimapData.minY) * minimapData.scale,
-                width: minimapData.vpW * minimapData.scale,
-                height: minimapData.vpH * minimapData.scale,
-              }}
-            />
-          </div>
-        )}
-      </div>
-
-      {/* Right panel */}
-      <aside className={`canvas-right-panel ${isPanelOpen ? "open" : "closed"}`}>
-        {panelMode === "generate" ? (
-          <>
-            <div className="canvas-panel-header">
-              <strong>画布生成</strong>
-              <button type="button" className="icon-button" onClick={() => setIsPanelOpen(false)} title="收起面板">
-                <PanelRightClose size={16} />
-              </button>
-            </div>
-
-            {/* Model selector */}
-            <div className="canvas-panel-section">
-              <label className="canvas-panel-label">模型</label>
-              <select
-                className="canvas-select"
-                value={canvasModel}
-                onChange={(e) => setCanvasModel(e.target.value)}
-              >
-                {selectableModels.map((m) => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
-              </select>
-              <span className="canvas-panel-hint">{imageModelLaneLabel(canvasModel)}</span>
-            </div>
-
-            {/* Prompt */}
-            <div className="canvas-panel-section">
-              <label className="canvas-panel-label">提示词</label>
-              <textarea
-                ref={promptInputRef}
-                className="canvas-prompt-input"
-                value={canvasPrompt}
-                onChange={(e) => setCanvasPrompt(e.target.value)}
-                placeholder="描述你想生成的图片..."
-                rows={4}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    void handleCanvasGenerate();
-                  }
-                }}
-              />
-            </div>
-
-            {/* Params */}
-            <details className="canvas-panel-details" open>
-              <summary>参数</summary>
-              <div className="canvas-params-grid">
-                <div className="canvas-param">
-                  <label>宽高比</label>
-                  <select
-                    className="canvas-select"
-                    value={canvasAspectRatio}
-                    onChange={(e) => setCanvasAspectRatio(e.target.value)}
-                  >
-                    {supportedAspectRatios.map((r) => (
-                      <option key={r} value={r}>{r}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="canvas-param">
-                  <label>分辨率</label>
-                  <select
-                    className="canvas-select"
-                    value={canvasResolution}
-                    onChange={(e) => setCanvasResolution(e.target.value as ImageResolution)}
-                    disabled={!canScale}
-                  >
-                    <option value="1K">1K</option>
-                    <option value="2K">2K</option>
-                    <option value="4K">4K</option>
-                  </select>
-                </div>
-                {canvasExplicitSizeOptions.length > 0 && (
-                  <div className="canvas-param">
-                    <label>尺寸</label>
-                    <select
-                      className="canvas-select"
-                      value={resolvedSize}
-                      onChange={(e) => {
-                        const option = gptImage2SizeOptionForSize(e.target.value);
-                        if (!option) return;
-                        setCanvasAspectRatio(option.aspectRatio);
-                        setCanvasResolution(option.resolution);
-                        setCanvasSize(option.size);
-                      }}
-                    >
-                      {canvasExplicitSizeOptions.map((option) => (
-                        <option key={option.size} value={option.size}>
-                          {option.size}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                )}
-                <div className="canvas-param">
-                  <label>质量</label>
-                  <select
-                    className="canvas-select"
-                    value={canvasQuality}
-                    onChange={(e) => setCanvasQuality(e.target.value)}
-                  >
-                    <option value="auto">auto</option>
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                  </select>
-                </div>
-              </div>
-            </details>
-
-            {/* Size preview */}
-            <div className="canvas-size-preview">
-              {resolvedSize} &middot; {selectedCanvasSizeOption?.label || imageModelLaneLabel(canvasModel)}
-            </div>
-
-            {/* Generate button */}
-            <button
-              type="button"
-              className="canvas-generate-btn"
-              disabled={!canvasPrompt.trim() || !isApiReady || isGenerating}
-              onClick={() => void handleCanvasGenerate()}
-            >
-              {isGenerating ? <><Loader2 size={16} className="spin" /> 生成中...</> : "生成到画布"}
-            </button>
-
-            {!isApiReady && (
-              <div className="canvas-api-hint">
-                请先在工作台配置 API Key 并验证连接
-                <button type="button" className="link-button" onClick={onEnterStudio}>前往配置</button>
-              </div>
-            )}
-
-            {/* Selected node info */}
-            {selectedNode && selectedNode.status === "success" && panelMode === "generate" && (
-              <div className="canvas-panel-section canvas-selected-hint">
-                <span>已选中图片</span>
-                <button type="button" className="canvas-optimize-entry" onClick={() => void enterOptimizeMode(selectedNode)}>
-                  <WandSparkles size={14} /> 基于此图优化
-                </button>
-              </div>
-            )}
-          </>
-        ) : (
-          <>
-            {/* Optimize mode */}
-            <div className="canvas-panel-header">
-              <button type="button" className="canvas-back-btn" onClick={() => {
-                setPanelMode("generate");
-                setOptimizeSourceNode(null);
-                setCompressedRef(null);
-              }}>
-                &larr; 返回
-              </button>
-              <strong>优化图片</strong>
-            </div>
-
-            {/* Reference preview */}
-            {compressedRef && (
-              <div className="canvas-ref-preview">
-                <img src={compressedRef.dataUrl} alt="" />
-                <span className="canvas-ref-info">已自动压缩为参考图 &middot; {formatBytes(compressedRef.size)}</span>
-              </div>
-            )}
-            {!compressedRef && optimizeSourceNode && (
-              <div className="canvas-ref-preview loading">
-                <Loader2 size={20} className="spin" />
-                <span>压缩参考图中...</span>
-              </div>
-            )}
-
-            {/* Original prompt */}
-            {optimizeSourceNode && (
-              <div className="canvas-panel-section">
-                <label className="canvas-panel-label">原始提示词</label>
-                <div className="canvas-original-prompt">{optimizeSourceNode.prompt}</div>
-              </div>
-            )}
-
-            {/* Supplementary prompt */}
-            <div className="canvas-panel-section">
-              <label className="canvas-panel-label">补充优化提示词</label>
-              <textarea
-                ref={optimizePromptRef}
-                className="canvas-prompt-input"
-                value={optimizePrompt}
-                onChange={(e) => setOptimizePrompt(e.target.value)}
-                placeholder="描述你想要的修改，如：改为夜景、增加雪花效果..."
-                rows={3}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    void handleCanvasOptimize();
-                  }
-                }}
-              />
-            </div>
-
-            {/* Model & params */}
-            <div className="canvas-panel-section">
-              <label className="canvas-panel-label">模型</label>
-              <select
-                className="canvas-select"
-                value={canvasModel}
-                onChange={(e) => setCanvasModel(e.target.value)}
-              >
-                {selectableModels.map((m) => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
-              </select>
-            </div>
-
-            <div className="canvas-params-grid">
-              <div className="canvas-param">
-                <label>宽高比</label>
-                <select
-                  className="canvas-select"
-                  value={canvasAspectRatio}
-                  onChange={(e) => setCanvasAspectRatio(e.target.value)}
-                >
-                  {supportedAspectRatios.map((r) => (
-                    <option key={r} value={r}>{r}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="canvas-param">
-                <label>分辨率</label>
-                <select
-                  className="canvas-select"
-                  value={canvasResolution}
-                  onChange={(e) => setCanvasResolution(e.target.value as ImageResolution)}
-                  disabled={!canScale}
-                >
-                  <option value="1K">1K</option>
-                  <option value="2K">2K</option>
-                  <option value="4K">4K</option>
-                </select>
-              </div>
-              {canvasExplicitSizeOptions.length > 0 && (
-                <div className="canvas-param">
-                  <label>尺寸</label>
-                  <select
-                    className="canvas-select"
-                    value={resolvedSize}
-                    onChange={(e) => {
-                      const option = gptImage2SizeOptionForSize(e.target.value);
-                      if (!option) return;
-                      setCanvasAspectRatio(option.aspectRatio);
-                      setCanvasResolution(option.resolution);
-                      setCanvasSize(option.size);
-                    }}
-                  >
-                    {canvasExplicitSizeOptions.map((option) => (
-                      <option key={option.size} value={option.size}>
-                        {option.size}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
-            </div>
-
-            {/* Size preview */}
-            <div className="canvas-size-preview">
-              {resolvedSize} &middot; {selectedCanvasSizeOption?.label || imageModelLaneLabel(canvasModel)}
-            </div>
-
-            {/* Optimize button */}
-            <button
-              type="button"
-              className="canvas-generate-btn"
-              disabled={!compressedRef || !isApiReady || isGenerating}
-              onClick={() => void handleCanvasOptimize()}
-            >
-              {isGenerating ? <><Loader2 size={16} className="spin" /> 优化中...</> : "生成优化"}
-            </button>
-          </>
-        )}
-      </aside>
-
-      {/* Panel expand button when collapsed */}
-      {!isPanelOpen && (
-        <button type="button" className="canvas-panel-expand" onClick={() => setIsPanelOpen(true)}>
-          <PanelRightOpen size={18} />
-        </button>
-      )}
-
-      {/* Toast */}
-      {toastMessage && (
-        <div className="canvas-toast">{toastMessage}</div>
-      )}
-
-      {/* Delete confirmation dialog */}
-      {showDeleteConfirm && (
-        <div className="canvas-dialog-overlay" onClick={() => setShowDeleteConfirm(null)}>
-          <div className="canvas-dialog" onClick={(e) => e.stopPropagation()}>
-            <p>确认删除此图片？此操作不可撤销。</p>
-            <div className="canvas-dialog-actions">
-              <button type="button" className="subtle-button" onClick={() => setShowDeleteConfirm(null)}>取消</button>
-              <button type="button" className="canvas-dialog-danger" onClick={() => confirmDeleteNode(showDeleteConfirm)}>删除</button>
-            </div>
-          </div>
-        </div>
-      )}
-    </main>
-  );
-}
 
 const HOME_FEED_TABS: Array<{ value: SquareFeedTab; label: string }> = [
   { value: "hot", label: "热门" },
@@ -10988,8 +9784,10 @@ function HomePage({
   onSelectModel,
   recentRecords,
   hasApiKey,
+  runningCount,
 }: {
   onEnter: () => void; onSquare: () => void; onAdmin: () => void; onCanvas: () => void;
+  runningCount: number;
   oauthUser: { sub: string; username: string; displayName: string; email: string; role: number; group: string } | null;
   onOauthLogout: () => void;
   oauthEnabled: boolean;
@@ -11038,6 +9836,20 @@ function HomePage({
   const agents = runtimeIndustryAgents.slice(0, 6);
   const recent = recentRecords.filter((record) => record.thumbUrl || record.objectUrl).slice(0, 8);
   const showLoginHint = oauthEnabled && !oauthUser && !hasApiKey;
+  const [needKeyGuide, setNeedKeyGuide] = useState(false);
+  // 当前会用哪个上游站点——用户要去这里申请 Key，必须让他看见
+  const primaryEndpoint = runtimeEndpoints[0];
+
+  // 有 Key 就直接走生成；没有就地引导，不要把人丢到工作台再让他对着灰按钮猜
+  const guardedSubmit = () => {
+    if (!homePrompt.trim()) return;
+    if (!hasApiKey) {
+      setNeedKeyGuide(true);
+      return;
+    }
+    setNeedKeyGuide(false);
+    onHomeSubmit();
+  };
 
   return (
     <main className="home-page">
@@ -11050,33 +9862,7 @@ function HomePage({
         </div>
       )}
 
-      <header className="home-topbar">
-        <button type="button" className="home-brand" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}>
-          <img src={imageStudioLogo} alt="" aria-hidden="true" />
-          <strong>Image Studio</strong>
-        </button>
-        <nav className="home-topnav" aria-label="主导航">
-          <button type="button" onClick={onEnter}>工作台</button>
-          <button type="button" onClick={onCanvas}>画布</button>
-          <button type="button" onClick={onSquare}>广场</button>
-        </nav>
-        <div className="home-topbar-end">
-          {oauthUser ? (
-            <div className="home-account">
-              <User size={15} />
-              <span>{oauthUser.displayName || oauthUser.username}</span>
-              <button type="button" onClick={onOauthLogout}>退出</button>
-            </div>
-          ) : oauthEnabled ? (
-            <button type="button" className="home-login" onClick={onOauthLogin}>
-              登录
-            </button>
-          ) : null}
-          <button type="button" className="home-admin-icon" onClick={onAdmin} aria-label="管理后台" title="管理后台">
-            <ShieldCheck size={16} />
-          </button>
-        </div>
-      </header>
+      {/* 一级导航由全局 AppHeader 承担（App 分支渲染），页面内不再各自持有 */}
 
       <section className="home-hero">
         <h1>Image Studio</h1>
@@ -11092,7 +9878,7 @@ function HomePage({
               if (event.nativeEvent.isComposing || event.keyCode === 229) return;
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
-                onHomeSubmit();
+                guardedSubmit();
               }
             }}
             placeholder="描述你想生成的图片，例如：温暖木质感的咖啡厅菜单海报"
@@ -11105,7 +9891,7 @@ function HomePage({
             <button
               type="button"
               className="home-composer-send"
-              onClick={onHomeSubmit}
+              onClick={guardedSubmit}
               disabled={!homePrompt.trim()}
               aria-label="开始生成"
             >
@@ -11113,6 +9899,62 @@ function HomePage({
             </button>
           </div>
         </div>
+
+        {needKeyGuide && (
+          <div className="home-key-guide" role="alert">
+            <div className="home-key-guide-head">
+              <strong>还差一步：配置 API Key</strong>
+              <button type="button" className="home-key-guide-close" onClick={() => setNeedKeyGuide(false)} aria-label="关闭">
+                <X size={15} />
+              </button>
+            </div>
+            <p>
+              ImageHub 用你自己的 API Key 生成图片，Key 只保存在这台设备的浏览器里，不会上传服务器。
+              你的提示词已经留好了，配置完可以直接生成。
+            </p>
+            {runtimeTokenGuide?.tokenUrl && (
+              <ol className="home-key-guide-steps">
+                <li>
+                  打开 <a href={runtimeTokenGuide.tokenUrl} target="_blank" rel="noreferrer noopener">
+                    {runtimeTokenGuide.siteName || "中转站"}令牌管理页
+                  </a>
+                  <code>{runtimeTokenGuide.tokenUrl}</code>
+                </li>
+                {runtimeTokenGuide.groupName && (
+                  <li>新建令牌，分组选择 <b>{runtimeTokenGuide.groupName}</b></li>
+                )}
+                <li>复制生成的 Key，回到这里填写</li>
+              </ol>
+            )}
+            <div className="home-key-guide-actions">
+              {runtimeTokenGuide?.tokenUrl && (
+                <a
+                  className="home-key-guide-primary"
+                  href={runtimeTokenGuide.tokenUrl}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                >
+                  去获取 API Key
+                  <small>{runtimeTokenGuide.groupName ? `记得选「${runtimeTokenGuide.groupName}」分组` : "打开令牌管理页"}</small>
+                </a>
+              )}
+              {oauthEnabled && !oauthUser && (
+                <button type="button" className="home-key-guide-secondary" onClick={onOauthLogin}>
+                  登录太极 AI 账号
+                  <small>自动获取 Key，无需手动填写</small>
+                </button>
+              )}
+              <button
+                type="button"
+                className="home-key-guide-secondary"
+                onClick={() => { setNeedKeyGuide(false); onHomeSubmit(); }}
+              >
+                我已有 Key，去填写
+                <small>{primaryEndpoint ? `将使用 ${primaryEndpoint.label}` : "去工作台配置"}</small>
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="home-chips" role="group" aria-label="模型与场景">
           {models.slice(0, 4).map((model) => {
@@ -11239,11 +10081,15 @@ function SquarePage({
   onBackHome,
   onEnterStudio,
   onCanvas,
+  runningCount,
+  onReproduce,
 }: {
   apiKey: string;
   onBackHome: () => void;
   onEnterStudio: () => void;
   onCanvas: () => void;
+  runningCount: number;
+  onReproduce: (item: SquareFeedItem) => void;
 }) {
   const [tab, setTab] = useState<SquareFeedTab>("latest");
   const [items, setItems] = useState<SquareFeedItem[]>([]);
@@ -11372,26 +10218,7 @@ function SquarePage({
 
   return (
     <main className="square-page" ref={pageRef}>
-      <header className="square-topbar">
-        <button type="button" className="home-brand square-brand" onClick={onBackHome}>
-          <span>
-            <img src={imageStudioLogo} alt="" />
-          </span>
-          <strong>ImageHub Square</strong>
-        </button>
-        <div className="square-topbar-actions">
-          <button type="button" className="subtle-button" onClick={onEnterStudio}>
-            <WandSparkles size={16} />
-            工作台
-          </button>
-          <button type="button" className="subtle-button" onClick={onCanvas}>
-            画布
-          </button>
-          <button type="button" className="subtle-button" onClick={onBackHome}>
-            首页
-          </button>
-        </div>
-      </header>
+      {/* 一级导航由全局 AppHeader 承担 */}
 
       <section className="square-hero">
         <div className="square-hero-copy">
@@ -11524,6 +10351,7 @@ function SquarePage({
           onLike={() => void toggleLike(previewItem)}
           onCopyPrompt={() => void navigator.clipboard.writeText(previewItem.prompt)}
           onDownload={() => downloadUrl(previewItem.thumbnailUrl, `${sanitizeFilename(previewItem.caption || previewItem.id)}.png`)}
+          onReproduce={() => { setPreviewItem(null); onReproduce(previewItem); }}
         />
       )}
     </main>
@@ -11605,6 +10433,7 @@ function SquarePreviewModal({
   onLike,
   onCopyPrompt,
   onDownload,
+  onReproduce,
 }: {
   item: SquareFeedItem;
   apiKeyReady: boolean;
@@ -11613,6 +10442,7 @@ function SquarePreviewModal({
   onLike: () => void;
   onCopyPrompt: () => void;
   onDownload: () => void;
+  onReproduce: () => void;
 }) {
   const params = item.params || {};
   const sizeLabel = item.width && item.height ? `${item.width} x ${item.height}` : String(params.size || "-");
@@ -11649,7 +10479,9 @@ function SquarePreviewModal({
             <span>{sizeLabel}</span>
             {item.pageLabel && <span>{item.pageLabel}</span>}
           </div>
-          <div className="square-preview-prompt">{item.prompt}</div>
+          <div className="square-preview-prompt">
+            {item.prompt || (item.promptHidden ? "创作者选择不公开提示词" : "")}
+          </div>
           <div className="square-preview-actions">
             <button
               type="button"
@@ -11661,16 +10493,629 @@ function SquarePreviewModal({
               {pendingLike ? <Loader2 size={15} className="spin" /> : <Heart size={15} />}
               <span>{item.likeCount}</span>
             </button>
-            <button type="button" className="subtle-button" onClick={onCopyPrompt}>
-              <Copy size={15} />
-              复制提示词
+            <button type="button" className="subtle-button" onClick={onReproduce} title="把这张图的提示词与参数带回工作台直接生成">
+              <WandSparkles size={15} />
+              用同款参数生成
             </button>
+            {item.prompt && (
+              <button type="button" className="subtle-button" onClick={onCopyPrompt}>
+                <Copy size={15} />
+                复制提示词
+              </button>
+            )}
             <button type="button" className="subtle-button" onClick={onDownload}>
               <Download size={15} />
               下载预览图
             </button>
           </div>
         </aside>
+      </div>
+    </div>
+  );
+}
+
+// 管理端用户反馈面板：列表 + 状态流转 + 回复（用户端按 Key 哈希可见）
+type AdminFeatureRequest = FeatureRequestItem & { userTag: string; contentRaw: string };
+
+function AdminFeedbackPanel() {
+  const [items, setItems] = useState<AdminFeatureRequest[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [savingId, setSavingId] = useState("");
+  const [drafts, setDrafts] = useState<Record<string, { status: FeatureRequestItem["status"]; adminReply: string }>>({});
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/admin/feature-requests", { credentials: "same-origin" });
+      const data = await res.json();
+      if (data.ok) {
+        setItems(data.items || []);
+        setDrafts(Object.fromEntries((data.items || []).map((item: AdminFeatureRequest) => [
+          item.id, { status: item.status, adminReply: item.adminReply },
+        ])));
+      }
+    } catch { /* 刷新按钮兜底 */ }
+    setLoading(false);
+  };
+
+  useEffect(() => { void load(); }, []);
+
+  async function save(id: string) {
+    const draft = drafts[id];
+    if (!draft) return;
+    setSavingId(id);
+    try {
+      const res = await fetch(`/api/admin/feature-requests/${id}`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(draft),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(String(data.error || "保存失败"));
+      setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...draft, updatedAt: Date.now() } : item)));
+    } catch { /* 保持草稿，管理员可重试 */ }
+    setSavingId("");
+  }
+
+  return (
+    <section className="admin-feedback">
+      <div className="admin-feedback-head">
+        <h2>用户反馈（{items.length}）</h2>
+        <button type="button" className="subtle-button" onClick={() => void load()}>
+          <RefreshCw size={15} /> 刷新
+        </button>
+      </div>
+      {loading ? (
+        <div className="muted-box">加载中…</div>
+      ) : items.length === 0 ? (
+        <div className="muted-box">还没有用户提交反馈</div>
+      ) : (
+        <div className="admin-feedback-list">
+          {items.map((item) => (
+            <article key={item.id} className="admin-feedback-item">
+              <header>
+                <span className={`feedback-status is-${item.status}`}>{FEATURE_STATUS_LABELS[item.status]}</span>
+                <code title="API Key 哈希前 6 位，仅用于辨识同一用户">用户 {item.userTag}</code>
+                <small>{formatDate(item.createdAt)}</small>
+              </header>
+              <p className="admin-feedback-content">{item.content}</p>
+              {item.contentRaw !== item.content && (
+                <details className="admin-feedback-raw">
+                  <summary>查看用户原文</summary>
+                  <p>{item.contentRaw}</p>
+                </details>
+              )}
+              <div className="admin-feedback-actions">
+                <select
+                  value={drafts[item.id]?.status || item.status}
+                  onChange={(event) => setDrafts((prev) => ({
+                    ...prev,
+                    [item.id]: { status: event.target.value as FeatureRequestItem["status"], adminReply: prev[item.id]?.adminReply ?? item.adminReply },
+                  }))}
+                >
+                  {(Object.keys(FEATURE_STATUS_LABELS) as Array<FeatureRequestItem["status"]>).map((key) => (
+                    <option key={key} value={key}>{FEATURE_STATUS_LABELS[key]}</option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  value={drafts[item.id]?.adminReply ?? item.adminReply}
+                  onChange={(event) => setDrafts((prev) => ({
+                    ...prev,
+                    [item.id]: { status: prev[item.id]?.status ?? item.status, adminReply: event.target.value },
+                  }))}
+                  placeholder="给用户的回复（用户端可见）"
+                  maxLength={2000}
+                />
+                <button
+                  type="button"
+                  className="subtle-button"
+                  disabled={savingId === item.id}
+                  onClick={() => void save(item.id)}
+                >
+                  {savingId === item.id ? "保存中…" : "保存"}
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// 站点加固（2026-07-27）：把原本硬编码、静默的防爆破机制暴露到后台——
+// 阈值可调、封禁名单可管、安全事件可见。封禁按 clientIpKey 的 16 位哈希做，
+// 管理员从事件/锁定列表里复制哈希即可封禁，既不泄露原始 IP，又与 request_logs 同源。
+type SecurityThresholds = {
+  adminMaxFails: number;
+  adminLockMinutes: number;
+  anonGeneratePerMin: number;
+  anonAnalyzePerMin: number;
+  anonFeedbackPerMin: number;
+  anonFeaturePerMin: number;
+};
+type SecurityBan = { hash: string; reason: string; createdAt: number };
+type SecurityLockout = { ipHash: string; fails: number; lockedUntil: number };
+type SecurityEventRow = { at: number; type: string; ipHash: string; detail: string };
+
+const SECURITY_EVENT_LABELS: Record<string, string> = {
+  login_fail: "登录失败",
+  login_lock: "登录锁定",
+  rate_limit: "触发限流",
+  ban_hit: "命中封禁",
+  ban_add: "新增封禁",
+};
+
+const THRESHOLD_FIELDS: Array<{ key: keyof SecurityThresholds; label: string; hint: string }> = [
+  { key: "adminMaxFails", label: "登录失败锁定阈值", hint: "连续失败多少次后锁定（次）" },
+  { key: "adminLockMinutes", label: "锁定时长", hint: "触发后锁定多久（分钟）" },
+  { key: "anonGeneratePerMin", label: "生成接口限流", hint: "每 IP 每分钟（次）" },
+  { key: "anonAnalyzePerMin", label: "分析接口限流", hint: "每 IP 每分钟（次）" },
+  { key: "anonFeedbackPerMin", label: "点赞/反馈限流", hint: "每 IP 每分钟（次）" },
+  { key: "anonFeaturePerMin", label: "需求提交限流", hint: "每 IP 每分钟（次）" },
+];
+
+function AdminSecurityPanel() {
+  const [thresholds, setThresholds] = useState<SecurityThresholds | null>(null);
+  const [draft, setDraft] = useState<SecurityThresholds | null>(null);
+  const [bans, setBans] = useState<SecurityBan[]>([]);
+  const [lockouts, setLockouts] = useState<SecurityLockout[]>([]);
+  const [events, setEvents] = useState<SecurityEventRow[]>([]);
+  const [counters, setCounters] = useState<Record<string, number>>({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [banHash, setBanHash] = useState("");
+  const [banReason, setBanReason] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/admin/security", { credentials: "same-origin" });
+      const data = await res.json();
+      if (data.ok) {
+        setThresholds(data.thresholds);
+        setDraft(data.thresholds);
+        setBans(data.bans || []);
+        setLockouts(data.lockouts || []);
+        setEvents(data.events || []);
+        setCounters(data.counters || {});
+      }
+    } catch { /* 刷新按钮兜底 */ }
+    setLoading(false);
+  };
+
+  useEffect(() => { void load(); }, []);
+
+  async function saveThresholds() {
+    if (!draft) return;
+    setSaving(true);
+    setNotice("");
+    try {
+      const res = await fetch("/api/admin/config/security", {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(draft),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(String(data.error || "保存失败"));
+      setThresholds(data.thresholds);
+      setDraft(data.thresholds);
+      setNotice("阈值已保存，立即对后续请求生效");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "保存失败");
+    }
+    setSaving(false);
+  }
+
+  async function ban(hash: string, reason: string) {
+    const clean = hash.trim().toLowerCase();
+    if (!/^[0-9a-f]{16}$/.test(clean)) {
+      setNotice("IP 标识需为 16 位十六进制哈希（可从下方事件/锁定列表复制）");
+      return;
+    }
+    try {
+      const res = await fetch("/api/admin/security/ban", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hash: clean, reason }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(String(data.error || "封禁失败"));
+      setBans(data.bans || []);
+      setBanHash("");
+      setBanReason("");
+      setNotice(`已封禁 ${clean}`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "封禁失败");
+    }
+  }
+
+  async function unban(hash: string) {
+    try {
+      const res = await fetch("/api/admin/security/unban", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hash }),
+      });
+      const data = await res.json();
+      if (data.ok) setBans(data.bans || []);
+    } catch { /* 忽略：列表会在下次刷新校正 */ }
+  }
+
+  const bannedSet = new Set(bans.map((item) => item.hash));
+
+  return (
+    <section className="admin-security">
+      <div className="admin-security-head">
+        <h2><ShieldAlert size={18} /> 站点加固</h2>
+        <button type="button" className="subtle-button" onClick={() => void load()}>
+          <RefreshCw size={15} /> 刷新
+        </button>
+      </div>
+      {notice && <div className="admin-security-notice">{notice}</div>}
+
+      {loading || !draft ? (
+        <div className="muted-box">加载中…</div>
+      ) : (
+        <>
+          <div className="admin-security-counters">
+            {[
+              { key: "login_fail", label: "登录失败" },
+              { key: "login_lock", label: "登录锁定" },
+              { key: "rate_limit", label: "触发限流" },
+              { key: "ban_hit", label: "命中封禁" },
+            ].map((item) => (
+              <div key={item.key} className="admin-security-counter">
+                <strong>{counters[item.key] || 0}</strong>
+                <span>{item.label}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="admin-security-card">
+            <h3>防爆破阈值</h3>
+            <p className="admin-muted admin-config-hint">
+              <ShieldCheck size={13} /> 改完立即对下一次请求生效，无需重启。生成/分析等接口按每 IP 每分钟限流；管理员登录连续失败超阈值即锁定。
+            </p>
+            <div className="admin-security-grid">
+              {THRESHOLD_FIELDS.map((field) => (
+                <label key={field.key} className="admin-security-field">
+                  <span>{field.label}</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={draft[field.key]}
+                    onChange={(event) => setDraft((prev) => prev && ({ ...prev, [field.key]: Number(event.target.value) }))}
+                  />
+                  <small>{field.hint}</small>
+                </label>
+              ))}
+            </div>
+            <div className="admin-security-actions">
+              <button type="button" className="primary-button" disabled={saving} onClick={() => void saveThresholds()}>
+                <Save size={15} /> {saving ? "保存中…" : "保存阈值"}
+              </button>
+              {thresholds && <span className="admin-muted">当前生效：失败 {thresholds.adminMaxFails} 次锁 {thresholds.adminLockMinutes} 分钟</span>}
+            </div>
+          </div>
+
+          <div className="admin-security-card">
+            <h3><Ban size={15} /> IP 封禁名单（{bans.length}）</h3>
+            <p className="admin-muted admin-config-hint">
+              被封禁的 IP 访问生成、分析、反馈、需求提交及管理员登录时一律 403。封禁按 IP 哈希做，从下方「实时锁定 / 安全事件」里复制哈希最省事。
+            </p>
+            <div className="admin-security-banadd">
+              <input
+                type="text"
+                value={banHash}
+                onChange={(event) => setBanHash(event.target.value)}
+                placeholder="16 位 IP 哈希"
+                maxLength={16}
+              />
+              <input
+                type="text"
+                value={banReason}
+                onChange={(event) => setBanReason(event.target.value)}
+                placeholder="封禁原因（可选）"
+                maxLength={200}
+              />
+              <button type="button" className="subtle-button" onClick={() => void ban(banHash, banReason)}>
+                <Ban size={14} /> 封禁
+              </button>
+            </div>
+            {bans.length === 0 ? (
+              <div className="muted-box">暂无封禁记录</div>
+            ) : (
+              <ul className="admin-security-banlist">
+                {bans.map((item) => (
+                  <li key={item.hash}>
+                    <code>{item.hash}</code>
+                    <span className="admin-security-reason">{item.reason}</span>
+                    <small>{formatDate(item.createdAt)}</small>
+                    <button type="button" className="subtle-button" onClick={() => void unban(item.hash)}>解除</button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="admin-security-cols">
+            <div className="admin-security-card">
+              <h3>实时锁定 / 高频失败（{lockouts.length}）</h3>
+              {lockouts.length === 0 ? (
+                <div className="muted-box">当前没有被锁定或高频失败的 IP</div>
+              ) : (
+                <ul className="admin-security-lockouts">
+                  {lockouts.map((item) => (
+                    <li key={item.ipHash}>
+                      <code>{item.ipHash}</code>
+                      <span className={item.lockedUntil > Date.now() ? "sec-locked" : "sec-fails"}>
+                        {item.lockedUntil > Date.now() ? `锁定至 ${formatDate(item.lockedUntil)}` : `失败 ${item.fails} 次`}
+                      </span>
+                      {!bannedSet.has(item.ipHash) && (
+                        <button type="button" className="subtle-button" onClick={() => void ban(item.ipHash, "登录高频失败")}>封禁</button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div className="admin-security-card">
+              <h3>安全事件（近 {events.length}）</h3>
+              {events.length === 0 ? (
+                <div className="muted-box">暂无安全事件</div>
+              ) : (
+                <ul className="admin-security-events">
+                  {events.map((item, index) => (
+                    <li key={`${item.at}-${index}`}>
+                      <span className={`sec-event-tag is-${item.type}`}>{SECURITY_EVENT_LABELS[item.type] || item.type}</span>
+                      <code>{item.ipHash}</code>
+                      {item.detail && <span className="admin-security-detail">{item.detail}</span>}
+                      <small>{formatDate(item.at)}</small>
+                      {!bannedSet.has(item.ipHash) && /^[0-9a-f]{16}$/.test(item.ipHash) && (
+                        <button type="button" className="link-button" onClick={() => void ban(item.ipHash, `来自事件：${item.type}`)}>封禁</button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+// 用户需求反馈（2026-07-27）：提交需 API Key + 服务端滑块验证（防爆破），
+// 内容经大模型润色后进管理后台；用户按 Key 哈希看到自己的提交与管理员回复。
+type FeatureRequestItem = {
+  id: string;
+  content: string;
+  status: "pending" | "planned" | "done" | "rejected";
+  adminReply: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+const FEATURE_STATUS_LABELS: Record<FeatureRequestItem["status"], string> = {
+  pending: "待处理",
+  planned: "已排期",
+  done: "已完成",
+  rejected: "暂不考虑",
+};
+
+function FeedbackModal({
+  apiKey,
+  baseUrl,
+  analysisModel,
+  onClose,
+}: {
+  apiKey: string;
+  baseUrl: string;
+  analysisModel: string;
+  onClose: () => void;
+}) {
+  const [content, setContent] = useState("");
+  const [challenge, setChallenge] = useState<CaptchaChallenge | null>(null);
+  const [captchaX, setCaptchaX] = useState<number | null>(null);
+  const [captchaError, setCaptchaError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [myItems, setMyItems] = useState<FeatureRequestItem[]>([]);
+
+  const loadCaptcha = async () => {
+    setCaptchaX(null);
+    setCaptchaError("");
+    try {
+      const data = await fetch("/api/feature-requests/captcha").then((r) => r.json());
+      if (data.ok) setChallenge(data);
+    } catch { /* 稍后可手动刷新 */ }
+  };
+
+  const loadMine = async () => {
+    try {
+      const data = await fetch("/api/feature-requests/mine", {
+        headers: { "x-imagehub-api-key": apiKey },
+      }).then((r) => r.json());
+      if (data.ok) setMyItems(data.items || []);
+    } catch { /* 列表加载失败不影响提交 */ }
+  };
+
+  useEffect(() => {
+    void loadCaptcha();
+    void loadMine();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function submit() {
+    const trimmed = content.trim();
+    if (trimmed.length < 5) { setNotice("请至少写 5 个字，让我们能看懂你的需求"); return; }
+    if (!challenge || captchaX == null) { setNotice("请先完成滑块验证"); return; }
+    setSubmitting(true);
+    setNotice("");
+    try {
+      const res = await fetch("/api/feature-requests", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiKey,
+          baseUrl,
+          analysisModel,
+          content: trimmed,
+          captchaToken: challenge.token,
+          captchaX,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setNotice(String(data.error || "提交失败"));
+        // 滑块 token 一次性：无论成败都要换一个新的
+        void loadCaptcha();
+        return;
+      }
+      setContent("");
+      setNotice("已提交，感谢反馈！内容已由 AI 整理，管理员处理后可在下方看到回复。");
+      void loadCaptcha();
+      void loadMine();
+    } catch {
+      setNotice("网络异常，请稍后再试");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="feedback-modal" role="dialog" aria-modal="true" aria-label="需求反馈">
+      <button className="preview-backdrop" type="button" aria-label="关闭" onClick={onClose} />
+      <div className="feedback-shell">
+        <div className="feedback-head">
+          <strong>需求反馈</strong>
+          <span>写下你想要的功能或遇到的问题</span>
+          <button type="button" className="icon-button" onClick={onClose} title="关闭 (Esc)">
+            <X size={16} />
+          </button>
+        </div>
+        <textarea
+          value={content}
+          onChange={(event) => setContent(event.target.value)}
+          placeholder="例如：希望画布支持一键导出全部原图…（5–2000 字）"
+          rows={4}
+          maxLength={2000}
+        />
+        <SliderCaptcha
+          challenge={challenge}
+          solved={captchaX != null}
+          error={captchaError}
+          onRefresh={() => void loadCaptcha()}
+          onSolved={(x) => { setCaptchaX(x); setCaptchaError(""); }}
+        />
+        {notice && <div className="feedback-notice">{notice}</div>}
+        <button
+          type="button"
+          className="primary-action"
+          disabled={submitting || content.trim().length < 5 || captchaX == null}
+          onClick={() => void submit()}
+        >
+          {submitting ? <Loader2 size={16} className="spin" /> : <Send size={16} />} 提交反馈
+        </button>
+        <div className="feedback-mine">
+          <strong>我的反馈（{myItems.length}）</strong>
+          {myItems.length === 0 ? (
+            <span className="feedback-empty">还没有提交过反馈</span>
+          ) : (
+            myItems.map((item) => (
+              <div key={item.id} className="feedback-item">
+                <div className="feedback-item-head">
+                  <span className={`feedback-status is-${item.status}`}>{FEATURE_STATUS_LABELS[item.status]}</span>
+                  <small>{formatDate(item.createdAt)}</small>
+                </div>
+                <p>{item.content}</p>
+                {item.adminReply && (
+                  <div className="feedback-reply">
+                    <strong>管理员回复：</strong>{item.adminReply}
+                  </div>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 参考图库（roadmap PRD B3）：本机收藏的参考图，跨 Studio/画布复用。
+// objectUrl 随 items 变化重建、卸载时统一 revoke。
+function ReferenceLibraryModal({
+  items,
+  onUse,
+  onDelete,
+  onClose,
+}: {
+  items: ReferenceLibraryItem[];
+  onUse: (item: ReferenceLibraryItem) => void;
+  onDelete: (id: string) => void;
+  onClose: () => void;
+}) {
+  const [urls, setUrls] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const map: Record<string, string> = {};
+    items.forEach((item) => { map[item.id] = URL.createObjectURL(item.blob); });
+    setUrls(map);
+    return () => Object.values(map).forEach((url) => URL.revokeObjectURL(url));
+  }, [items]);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="ref-library-modal" role="dialog" aria-modal="true" aria-label="参考图库">
+      <button className="preview-backdrop" type="button" aria-label="关闭图库" onClick={onClose} />
+      <div className="ref-library-shell">
+        <div className="ref-library-head">
+          <strong>参考图库</strong>
+          <span>{items.length}/{REFERENCE_LIBRARY_LIMIT} · 仅存本机浏览器</span>
+          <button type="button" className="icon-button" onClick={onClose} title="关闭">
+            <X size={16} />
+          </button>
+        </div>
+        {items.length === 0 ? (
+          <div className="muted-box">还没有收藏。上传参考图后点击 ★ 即可收藏到这里。</div>
+        ) : (
+          <div className="ref-library-grid">
+            {items.map((item) => (
+              <div key={item.id} className="ref-library-item">
+                <button type="button" className="ref-library-pick" title="用作参考图" onClick={() => onUse(item)}>
+                  {urls[item.id] ? <img src={urls[item.id]} alt={item.name} loading="lazy" /> : null}
+                </button>
+                <div className="ref-library-meta">
+                  <span title={item.name}>{item.name}</span>
+                  <small>{formatBytes(item.bytes)}</small>
+                  <button type="button" className="icon-button" title="从图库删除" onClick={() => onDelete(item.id)}>
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -11840,7 +11285,7 @@ function OnboardingGuide({
 // 签名元素：生成链路脉冲线 —— 段宽 = 各环节真实耗时占比（接收→上游生成→落盘→返回），
 // 失败时停在断掉的那一段并转红；运行中为品牌色流光。结构装置编码真实信息，非装饰。
 function JobPulseLine({ status, stages }: { status: JobStatus; stages?: JobStages }) {
-  if (status === "queued") return null;
+  if (status === "submitting" || status === "queued") return null;
   if (status === "running") {
     return (
       <div className="pulse-line running" aria-hidden="true">
@@ -11895,6 +11340,7 @@ const JobCard = memo(function JobCard({
   onDownload,
   onCopyPrompt,
   onRecommend,
+  onOpenInCanvas,
   recommendState,
   canRecommend,
   feedback,
@@ -11912,6 +11358,7 @@ const JobCard = memo(function JobCard({
   onDownload: () => void;
   onCopyPrompt: () => void;
   onRecommend: () => void;
+  onOpenInCanvas?: () => void;
   recommendState?: SquareRecommendStatus;
   canRecommend: boolean;
   feedback?: 1 | -1;
@@ -11927,7 +11374,13 @@ const JobCard = memo(function JobCard({
   const elapsed = job.status === "running" && job.startedAt ? tickNow - job.startedAt : job.durationMs || 0;
   const previewClass = aspectClass(job.width, job.height, job.params.aspectRatio);
   const sizeLabel = job.width && job.height ? `${job.width} x ${job.height}` : job.params.size;
-  const durationLabel = job.status === "queued" ? "等待" : elapsed > 0 ? formatDuration(elapsed) : "-";
+  const durationLabel = job.status === "submitting"
+    ? "确认"
+    : job.status === "queued"
+      ? "等待"
+      : elapsed > 0
+        ? formatDuration(elapsed)
+        : "-";
   const compactPrompt = job.prompt.replace(/\s+/g, " ").trim();
   const compactPromptChars = Array.from(compactPrompt);
   const promptPreview = compactPromptChars.length > 64 ? `${compactPromptChars.slice(0, 64).join("")}...` : compactPrompt;
@@ -11966,6 +11419,12 @@ const JobCard = memo(function JobCard({
           <div className="tile-state running">
             <Loader2 className="spin" size={24} />
             <strong>{formatDuration(elapsed)}</strong>
+          </div>
+        )}
+        {job.status === "submitting" && (
+          <div className="tile-state submitting">
+            <Loader2 className="spin" size={24} />
+            <strong>{job.errorDetail ? "状态确认中" : "提交中"}</strong>
           </div>
         )}
         {job.status === "queued" && (
@@ -12051,6 +11510,11 @@ const JobCard = memo(function JobCard({
                 <Download size={16} />
               </button>
             )}
+            {job.status === "success" && onOpenInCanvas && (
+              <button type="button" className="icon-button" title="在画布中打开：作为节点继续迭代" onClick={onOpenInCanvas}>
+                <Frame size={16} />
+              </button>
+            )}
             {job.status === "success" && onFeedback && (
               <button
                 type="button"
@@ -12084,6 +11548,11 @@ const JobCard = memo(function JobCard({
             {job.status === "queued" && (
               <button type="button" className="icon-button" title="排队中" disabled>
                 <Clock3 size={16} />
+              </button>
+            )}
+            {job.status === "submitting" && (
+              <button type="button" className="icon-button" title="正在确认服务端接单状态" disabled>
+                <Loader2 size={16} className="spin" />
               </button>
             )}
             {job.status === "running" && (
@@ -12254,23 +11723,37 @@ function AgentModeSwitch({
   status: AgentModeStatus;
   onToggle: () => void;
 }) {
+  // 未启用时只留一个 chip：默认关闭的功能不该常驻占两行说明
+  if (!enabled) {
+    return (
+      <button
+        type="button"
+        className="composer-tool-chip"
+        onClick={onToggle}
+        title="开启 Agent 模式 A：自动编排单图、多图与宣传画册"
+      >
+        <Bot size={14} />
+        {AGENT_MODE_NAME}
+      </button>
+    );
+  }
   return (
-    <div className={`agent-mode-switch ${enabled ? "is-on" : "is-off"} status-${status}`}>
+    <div className={`agent-mode-switch is-on status-${status}`}>
       <div className="agent-mode-switch-copy">
         <strong>{AGENT_MODE_NAME}</strong>
-        <span>{enabled ? "理解任务并自动拆解" : "自动编排单图、多图与宣传画册"}</span>
+        <span>理解任务并自动拆解</span>
       </div>
       <button
         type="button"
         role="switch"
         aria-checked={enabled}
-        className={`agent-mode-toggle ${enabled ? "is-on" : "is-off"}`}
+        className="agent-mode-toggle is-on"
         onClick={onToggle}
-        title={enabled ? "关闭 Agent 模式 A" : "开启 Agent 模式 A"}
+        title="关闭 Agent 模式 A"
       >
         <span className="agent-mode-toggle-track">
           <span className="agent-mode-toggle-thumb">
-            {enabled ? <Bot size={14} /> : <WandSparkles size={14} />}
+            <Bot size={14} />
           </span>
         </span>
       </button>
@@ -12467,6 +11950,7 @@ function BrochurePlannerModal({
 
 function StatusBadge({ status, elapsed }: { status: JobStatus; elapsed: number }) {
   const map = {
+    submitting: { label: "状态确认", icon: <Loader2 size={15} className="spin" /> },
     queued: { label: "排队", icon: <Clock3 size={15} /> },
     running: { label: formatDuration(elapsed), icon: <Loader2 size={15} className="spin" /> },
     success: { label: formatDuration(elapsed), icon: <CheckCircle2 size={15} /> },
@@ -12557,7 +12041,7 @@ function HistoryDetail({
           <span className="eyebrow">历史记录</span>
           <strong>{record.model}</strong>
         </div>
-        <StatusBadge status={record.status === "success" ? "success" : "error"} elapsed={record.durationMs || 0} />
+        <StatusBadge status={record.status} elapsed={record.durationMs || 0} />
       </div>
 
       {record.objectUrl ? (
@@ -12575,6 +12059,11 @@ function HistoryDetail({
             </span>
           </button>
           <ImageInfo job={record} />
+        </div>
+      ) : record.status === "submitting" || record.status === "queued" || record.status === "running" ? (
+        <div className="loading-frame queued">
+          <Loader2 size={20} className="spin" />
+          <span>{record.status === "submitting" ? "正在确认服务端接单状态" : record.status === "queued" ? "任务排队中" : "任务生成中"}</span>
         </div>
       ) : (
         <div className="error-box">

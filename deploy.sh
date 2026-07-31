@@ -38,6 +38,9 @@ check_node() {
 ensure_env() {
   # 保留太极 AI 一键登录：OAuth 凭据通过 .env 注入（loadEnv 会自动读取项目根目录的 .env）
   if [ ! -f .env ]; then
+    # 先建空文件并收紧权限，再写内容：避免凭据在 0644 状态下短暂可读。
+    # umask 放在子 shell 里，免得影响脚本后续创建的日志等文件。
+    ( umask 077; : > .env )
     cat > .env <<'EOF'
 # ── ImageHub 环境配置 ──
 # 太极 AI 一键登录（OAuth）。填入凭据后自动启用，留空则隐藏登录按钮。
@@ -49,13 +52,19 @@ OAUTH_PROVIDER_URL=https://www.taijiai.online
 OAUTH_REDIRECT_URI=
 
 # 管理后台初始账号（仅首次创建 .data/admin-store.json 时生效）
+# 初始密码请自行设置为强口令，首次登录后会强制修改。
 # ADMIN_USERNAME=admin
-# ADMIN_INITIAL_PASSWORD=admin123456
+# ADMIN_INITIAL_PASSWORD=
 EOF
     warn "已生成 .env 模板 —— 请填入太极 OAuth 凭据后重新执行 ./deploy.sh restart"
   else
     info ".env 已存在，保留现有配置（含太极 OAuth）✓"
   fi
+  # 无论新建还是沿用，都确保 .env 与 .data/ 只有属主可读：
+  # 里面是 OAuth client_secret、实例密钥、以及全部用户生成的图片
+  chmod 600 .env 2>/dev/null || true
+  [ -d .data ] && chmod 700 .data 2>/dev/null || true
+  [ -f .data/instance-secret ] && chmod 600 .data/instance-secret 2>/dev/null || true
 }
 
 install_deps() {

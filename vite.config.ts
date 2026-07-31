@@ -2,6 +2,7 @@ import react from "@vitejs/plugin-react";
 import { Buffer } from "node:buffer";
 import {
   createHash,
+  createHmac,
   randomBytes,
   randomUUID,
   scryptSync,
@@ -11,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync,
 import Database from "better-sqlite3";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { defineConfig, loadEnv, type PluginOption, type ViteDevServer } from "vite";
 
 const _env = loadEnv("development", process.cwd(), "");
@@ -57,13 +59,44 @@ type GenerateRequest = {
 };
 
 type GenerateBody = {
+  requestId?: string;
   baseUrl?: string;
   apiKey?: string;
   clientId?: string;
+  trace?: {
+    surface?: "studio" | "canvas";
+    localRecordId?: string;
+    submittedAt?: number;
+    persistedAt?: number;
+    requestStartedAt?: number;
+  };
   request?: GenerateRequest & {
     batchId?: string;
     index?: number;
     total?: number;
+  };
+};
+
+type GenerationClientEventBody = {
+  requestId?: string;
+  clientId?: string;
+  phase?: string;
+  occurredAt?: number;
+  surface?: "studio" | "canvas";
+  localRecordId?: string;
+  detail?: string;
+  context?: {
+    protocol?: ImageProtocol;
+    model?: string;
+    prompt?: string;
+    baseUrl?: string;
+    batchId?: string;
+    batchIndex?: number;
+    batchTotal?: number;
+    aspectRatio?: string;
+    resolution?: string;
+    size?: string;
+    referenceCount?: number;
   };
 };
 
@@ -87,11 +120,21 @@ type AdminUser = {
   updatedAt: number;
 };
 
-type RequestLogStatus = "running" | "success" | "error";
+type RequestLogStatus = "submitting" | "queued" | "running" | "success" | "error";
 type RequestLogType = "image_generation" | "prompt_analysis" | "agent_analysis";
+
+type RequestLifecycleEvent = {
+  id: string;
+  phase: string;
+  source: "client" | "server" | "upstream";
+  at: number;
+  recordedAt?: number;
+  detail?: string;
+};
 
 type RequestLog = {
   requestId: string;
+  requestFingerprint?: string;
   requestType: RequestLogType;
   batchId?: string;
   batchIndex?: number;
@@ -104,7 +147,6 @@ type RequestLog = {
   apiKeyPresent?: boolean;
   apiKeyLength?: number;
   apiKeyPrefix?: string;
-  apiKeySuffix?: string;
   endpoint: string;
   model: string;
   prompt: string;
@@ -143,6 +185,11 @@ type RequestLog = {
   imageSaved: boolean;
   savedImages?: SavedImageMeta[];
   stages?: RequestStages;
+  lifecycleEvents?: RequestLifecycleEvent[];
+  sourceSurface?: "studio" | "canvas";
+  localRecordId?: string;
+  idempotentReplayCount?: number;
+  lastIdempotentReplayAt?: number;
 };
 
 type SavedImageMeta = {
@@ -156,11 +203,28 @@ type SavedImageMeta = {
 };
 
 type RequestStages = {
+  clientSubmittedAt?: number;
+  clientPersistedAt?: number;
+  clientRequestStartedAt?: number;
   receivedAt?: number;
+  requestParsedAt?: number;
+  validatedAt?: number;
+  validationFailedAt?: number;
+  idempotencyClaimedAt?: number;
+  enqueuedAt?: number;
+  acceptedResponseAt?: number;
+  clientAcceptedAt?: number;
+  // 出队开始执行的时刻。receivedAt→dispatchedAt 是排队等待，不该算进生成耗时
+  dispatchedAt?: number;
   upstreamRequestedAt?: number;
   upstreamRespondedAt?: number;
   imageSavedAt?: number;
   returnedAt?: number;
+  taskCompletedAt?: number;
+  lastReconcileAt?: number;
+  lastIdempotentRetryAt?: number;
+  clientResultReceivedAt?: number;
+  clientErrorReceivedAt?: number;
 };
 
 type AdminAuditLog = {
@@ -195,6 +259,9 @@ type SquareItem = {
   aspectRatio?: string;
   sourceType: string;
   reasonPlan?: unknown;
+  // 创作者选择不公开提示词（roadmap PRD B1）。store 里仍保留原文供管理端治理，
+  // 只在公开 feed 的出口处遮蔽。
+  promptHidden?: boolean;
   recommenderHash: string;
   recommenderLabel: string;
   pageLabel?: string;
@@ -284,7 +351,17 @@ type SquareStore = {
   moderationAudits: SquareModerationAudit[];
 };
 
-const API_TIMEOUT_MS = 300_000;
+// Node 内置 fetch（undici）自己的 headersTimeout / bodyTimeout 默认值。
+// 超过它就必须换一个放宽超时的 dispatcher，否则底层会先掐断连接。
+const UNDICI_DEFAULT_TIMEOUT_MS = 300_000;
+// 下面两个只是「配置中心还没写过值」时的出厂默认，实际生效值走 apiTimeoutMs() / generationTimeoutMs()。
+// 生图本来就慢：4K、多图、上游排队都可能超过 5 分钟，所以生成链路单独一档长超时。
+// 模型列表 / OAuth / 提示词分析这类交互式请求走短的那档，不能跟着放大到 20 分钟。
+const DEFAULT_API_TIMEOUT_MS = 300_000;
+const DEFAULT_GENERATION_TIMEOUT_MS = 1_200_000;
+// 管理员可配范围：下限防止填 0 把所有请求秒杀，上限防止填成永不超时。
+const API_TIMEOUT_RANGE_MS = { min: 10_000, max: 600_000 } as const;
+const GENERATION_TIMEOUT_RANGE_MS = { min: 30_000, max: 3_600_000 } as const;
 const MAX_REQUEST_BYTES = 60 * 1024 * 1024;
 const DEFAULT_PROTOCOL: ImageProtocol = "custom-openai";
 const GPT_IMAGE_2_MODEL = "gpt-image-2";
@@ -299,6 +376,7 @@ const DATA_DIR = join(process.cwd(), ".data");
 const ADMIN_STORE_PATH = join(DATA_DIR, "admin-store.json");
 const SQUARE_STORE_PATH = join(DATA_DIR, "square-store.json");
 const LOCAL_IMAGE_DIR = join(DATA_DIR, "images");
+const INSTANCE_SECRET_PATH = join(DATA_DIR, "instance-secret");
 const LOCAL_IMAGE_URL_PREFIX = "/api/images/local/";
 // 相对路径形如 <用户目录>/<文件名>.<ext>，用户目录与文件名均限制安全字符、禁止路径穿越
 const LOCAL_IMAGE_PATH_PATTERN = /^[A-Za-z0-9_-]{1,64}\/[A-Za-z0-9_.-]{1,120}\.(png|jpg|webp|gif)$/;
@@ -313,6 +391,7 @@ const OAUTH_ENABLED = OAUTH_CLIENT_ID.length > 0 && OAUTH_CLIENT_SECRET.length >
 const OAUTH_SESSION_COOKIE = "imagehub_oauth_session";
 const OAUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 24;
 const OAUTH_STATE_TTL_MS = 1000 * 60 * 10;
+const OAUTH_STATE_COOKIE = "imagehub_oauth_state";
 if (OAUTH_ENABLED && OAUTH_PROVIDER_URL && !ALLOWED_API_BASE_URLS.some((url) => url.replace(/\/+$/, "") === OAUTH_PROVIDER_URL)) {
   ALLOWED_API_BASE_URLS.push(OAUTH_PROVIDER_URL);
 }
@@ -632,6 +711,14 @@ type ConfigStore = {
     agentAnalyze: string;
     promptAnalyze: string;
   };
+  // 新用户没有 API Key 时的获取引导：指向中转站的令牌管理页，并说明该选哪个分组
+  tokenGuide: {
+    enabled: boolean;
+    siteName: string;
+    tokenUrl: string;
+    groupName: string;
+    note: string;
+  };
   quotas: {
     squareShelfLimit: number;
     squareDailyRecommend: number;
@@ -639,6 +726,23 @@ type ConfigStore = {
     squareMaxFeed: number;
     generationDailyLimit: number;
     userDiskLimitMB: number;
+  };
+  // 上游请求超时。生成链路和交互式请求分两档，管理员可分别调。
+  timeouts: {
+    apiTimeoutMs: number;
+    generationTimeoutMs: number;
+  };
+  // 站点加固：登录爆破阈值 + 匿名接口限流 + IP 封禁名单。全部可在管理后台调。
+  // 封禁按 clientIpKey() 的 16 位哈希做，管理员从安全事件里复制哈希即可封禁，
+  // 既不泄露原始 IP，又和 request_logs.client_ip_hash 同源可对照。
+  security: {
+    adminMaxFails: number;      // 登录失败多少次后锁定
+    adminLockMinutes: number;   // 锁定时长（分钟）
+    anonGeneratePerMin: number; // 匿名生成限流（次/分/IP）
+    anonAnalyzePerMin: number;  // 匿名分析限流
+    anonFeedbackPerMin: number; // 匿名点赞/反馈限流
+    anonFeaturePerMin: number;  // 需求提交限流
+    bannedIps: Array<{ hash: string; reason: string; createdAt: number }>;
   };
 };
 
@@ -666,6 +770,13 @@ function defaultConfigStore(): ConfigStore {
       agentAnalyze: DEFAULT_AGENT_ANALYZE_SYSTEM_PROMPT,
       promptAnalyze: DEFAULT_PROMPT_ANALYZE_SYSTEM_PROMPT,
     },
+    tokenGuide: {
+      enabled: true,
+      siteName: "BobDong",
+      tokenUrl: "http://216.236.1.196:3000/console/token",
+      groupName: "banana Pro 官转",
+      note: "在令牌管理页新建令牌时，分组选择「banana Pro 官转」，复制生成的 Key 回来填写即可。",
+    },
     quotas: {
       squareShelfLimit: SQUARE_SHELF_LIMIT,
       squareDailyRecommend: SQUARE_DAILY_RECOMMEND_LIMIT,
@@ -673,6 +784,19 @@ function defaultConfigStore(): ConfigStore {
       squareMaxFeed: SQUARE_MAX_FEED_LIMIT,
       generationDailyLimit: 0,
       userDiskLimitMB: 0,
+    },
+    timeouts: {
+      apiTimeoutMs: DEFAULT_API_TIMEOUT_MS,
+      generationTimeoutMs: DEFAULT_GENERATION_TIMEOUT_MS,
+    },
+    security: {
+      adminMaxFails: 5,
+      adminLockMinutes: 15,
+      anonGeneratePerMin: 60,
+      anonAnalyzePerMin: 30,
+      anonFeedbackPerMin: 120,
+      anonFeaturePerMin: 5,
+      bannedIps: [],
     },
   };
 }
@@ -700,6 +824,13 @@ function readConfigStore(): ConfigStore {
       presets: { ...fallback.presets, ...(parsed.presets && typeof parsed.presets === "object" ? parsed.presets : {}) },
       systemPrompts: { ...fallback.systemPrompts, ...(parsed.systemPrompts && typeof parsed.systemPrompts === "object" ? parsed.systemPrompts : {}) },
       quotas: { ...fallback.quotas, ...(parsed.quotas && typeof parsed.quotas === "object" ? parsed.quotas : {}) },
+      timeouts: { ...fallback.timeouts, ...(parsed.timeouts && typeof parsed.timeouts === "object" ? parsed.timeouts : {}) },
+      tokenGuide: { ...fallback.tokenGuide, ...(parsed.tokenGuide && typeof parsed.tokenGuide === "object" ? parsed.tokenGuide : {}) },
+      security: {
+        ...fallback.security,
+        ...(parsed.security && typeof parsed.security === "object" ? parsed.security : {}),
+        bannedIps: Array.isArray(parsed.security?.bannedIps) ? parsed.security.bannedIps : fallback.security.bannedIps,
+      },
     };
     configStoreCache = merged;
     return merged;
@@ -727,6 +858,26 @@ function enabledModelIds(): string[] {
   return readConfigStore().models
     .filter((item) => item.enabled)
     .map((item) => normalizedModelId(item.id));
+}
+
+// 超时的实际生效值。每次调用都读一遍配置（configStoreCache 命中，无 IO），
+// 这样管理员改完立刻对下一个请求生效，不需要重启进程。
+function clampTimeoutMs(value: unknown, range: { min: number; max: number }, fallback: number) {
+  const num = Math.round(Number(value));
+  if (!Number.isFinite(num) || num <= 0) return fallback;
+  return Math.min(range.max, Math.max(range.min, num));
+}
+
+function apiTimeoutMs(): number {
+  return clampTimeoutMs(readConfigStore().timeouts?.apiTimeoutMs, API_TIMEOUT_RANGE_MS, DEFAULT_API_TIMEOUT_MS);
+}
+
+function generationTimeoutMs(): number {
+  return clampTimeoutMs(
+    readConfigStore().timeouts?.generationTimeoutMs,
+    GENERATION_TIMEOUT_RANGE_MS,
+    DEFAULT_GENERATION_TIMEOUT_MS,
+  );
 }
 
 const INTERNAL_HOST_PATTERN = /^(localhost|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/i;
@@ -819,6 +970,27 @@ function clearOAuthCookie(res: ServerResponse) {
   }
 }
 
+// state 必须同时绑到发起登录的那个浏览器上。
+// 只把 state 记在服务端 Map 里是不够的：攻击者自己走一遍 /login 就拿到了一个合法 state，
+// 再把 callback?code=<自己的>&state=<自己的> 塞给受害者，受害者的浏览器就会拿到一个
+// 属于攻击者账号的 OAuth 会话——而这个会话携带的是真实上游 Key，后续生成会记在攻击者名下。
+function appendCookie(res: ServerResponse, cookie: string) {
+  const existing = res.getHeader("Set-Cookie");
+  if (existing) {
+    res.setHeader("Set-Cookie", Array.isArray(existing) ? [...existing, cookie] : [String(existing), cookie]);
+  } else {
+    res.setHeader("Set-Cookie", cookie);
+  }
+}
+
+function setOAuthStateCookie(res: ServerResponse, state: string) {
+  appendCookie(res, `${OAUTH_STATE_COOKIE}=${state}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.round(OAUTH_STATE_TTL_MS / 1000)}`);
+}
+
+function clearOAuthStateCookie(res: ServerResponse) {
+  appendCookie(res, `${OAUTH_STATE_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
+}
+
 function cleanupOAuthExpired() {
   const now = Date.now();
   for (const [key, session] of oauthSessions) {
@@ -908,18 +1080,49 @@ function truncateText(value: unknown, max = 2000) {
   return text.slice(0, max);
 }
 
+// 日志里允许保留的 Key 信息：仅用于「用户报障时确认是不是同一把 Key」。
+// 刻意不存后缀——前缀 + 后缀 + 精确长度三者合起来会显著缩小暴力猜测空间，
+// 而排障只需要能区分两把 Key，前 4 位足够。短 Key 一律不回显任何字符。
+const API_KEY_MASK_MIN_LENGTH = 20;
+
 function apiKeyLogMeta(apiKey: string) {
   const trimmed = apiKey.trim();
   return {
     apiKeyPresent: trimmed.length > 0,
     apiKeyLength: trimmed.length,
-    apiKeyPrefix: trimmed ? trimmed.slice(0, 6) : undefined,
-    apiKeySuffix: trimmed.length > 4 ? trimmed.slice(-4) : undefined,
+    apiKeyPrefix: trimmed.length >= API_KEY_MASK_MIN_LENGTH ? trimmed.slice(0, 4) : undefined,
   };
 }
 
+// ── 值级凭据脱敏 ────────────────────────────────────────────
+// 按属性名脱敏（sanitizeForLog）挡不住上游把 Key 回显在**错误文案**里的情况，
+// 例如 OpenAI 风格的 `Incorrect API key provided: sk-xxxx`。上游是用户自填的中转站，
+// 回显与否不受我们控制，所以必须按「值长什么样」再洗一遍。
+// 这是本仓库最现实的一条跨主体泄漏路径：用户的 Key 经由错误日志落到运营方手里。
+const CREDENTIAL_VALUE_PATTERNS: Array<[RegExp, string]> = [
+  // 常见带前缀的 Key：sk-、sk-ant-、xai-、gsk_、ghp_、AIza… 统一按「前缀 + 长随机串」匹配
+  [/\b(sk|pk|rk|xai|gsk|ghp|gho|glpat|hf|nvapi|sk-ant|sk-or-v1|sk-proj)[-_][A-Za-z0-9_-]{12,}/gi, "[key-redacted]"],
+  // Google API Key：官方是 AIza + 35 位，但中转站回显时长度未必规整，
+  // 这里放宽为 30 位以上，且不用 \b 收尾（Key 里含 - 时 \b 匹配不到）
+  [/AIza[0-9A-Za-z_-]{30,}/g, "[key-redacted]"],
+  // Bearer / Basic 授权头值
+  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, "$1 [key-redacted]"],
+  // JWT
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/g, "[jwt-redacted]"],
+  // 「api key ... <值>」这类自然语言回显，覆盖上面前缀规则漏掉的自定义格式
+  [/((?:api[\s_-]?key|apikey|access[\s_-]?token|secret)[^A-Za-z0-9]{0,4})([A-Za-z0-9_-]{16,})/gi, "$1[key-redacted]"],
+];
+
+function redactCredentialText(value: string) {
+  let out = value;
+  for (const [pattern, replacement] of CREDENTIAL_VALUE_PATTERNS) {
+    out = out.replace(pattern, replacement);
+  }
+  return out;
+}
+
 function redactImageText(value: string, max = 4000) {
-  return truncateText(value, max)
+  return redactCredentialText(truncateText(value, max))
     .replace(/data:image\/[a-zA-Z+.-]+;base64,[A-Za-z0-9+/=]+/g, "[image-data-redacted]")
     .replace(/"b64_json"\s*:\s*"[^"]+"/g, "\"b64_json\":\"[image-data-redacted]\"")
     .replace(/"dataUrl"\s*:\s*"[^"]+"/g, "\"dataUrl\":\"[image-data-redacted]\"")
@@ -967,11 +1170,24 @@ function referenceImagesForLog(value: unknown) {
   });
 }
 
+// 按属性名判定是否为凭据字段。原先是五个名字的精确相等，漏掉了本仓库自己
+// 正在往上游发的 x-goog-api-key，以及 x-api-key / access_token / client_secret 等。
+// 改为「归一化去掉分隔符后再匹配」，一次覆盖 apiKey / api_key / x-api-key / X-Api-Key 等写法。
+const CREDENTIAL_KEY_NAMES = new Set([
+  "apikey", "xapikey", "xgoogapikey", "authorization", "proxyauthorization",
+  "password", "token", "accesstoken", "refreshtoken", "idtoken",
+  "clientsecret", "secret", "credentials", "cookie", "setcookie",
+]);
+
+function isCredentialKeyName(lowerKey: string) {
+  return CREDENTIAL_KEY_NAMES.has(lowerKey.replace(/[-_\s]/g, ""));
+}
+
 function sanitizeForLog(value: unknown, key = "", depth = 0): unknown {
   const lowerKey = key.toLowerCase();
   if (depth > 8) return "[depth-limit]";
   if (value === null || value === undefined) return value;
-  if (lowerKey === "apikey" || lowerKey === "api_key" || lowerKey === "authorization" || lowerKey === "password" || lowerKey === "token") {
+  if (isCredentialKeyName(lowerKey)) {
     return "[redacted]";
   }
   if (lowerKey === "referenceimages") {
@@ -991,6 +1207,16 @@ function sanitizeForLog(value: unknown, key = "", depth = 0): unknown {
   }
   if (typeof value === "number" || typeof value === "boolean") return value;
   if (Array.isArray(value)) {
+    // [name, value] 形式的头部数组（fetch 的 Headers 序列化结果就是这样）：
+    // 元素会继承父级 key，"Authorization" 出现在**值**里而非属性名上，
+    // 光靠属性名匹配会整条漏过。这里显式识别并只抹掉第二项。
+    if (
+      value.length === 2
+      && typeof value[0] === "string"
+      && isCredentialKeyName(value[0].toLowerCase())
+    ) {
+      return [value[0], "[redacted]"];
+    }
     return value.slice(0, 80).map((item) => sanitizeForLog(item, key, depth + 1));
   }
   if (typeof value === "object") {
@@ -1023,6 +1249,42 @@ const IMAGE_EXT_MIME: Record<string, string> = {
 function sanitizeUserDir(value: string): string {
   const cleaned = String(value || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
   return cleaned || "anonymous";
+}
+
+// 实例级随机密钥，只用于派生不可反推的图片目录名。落盘在 .data/ 下、权限 600。
+// 丢了不影响存量图片（记录里保存的是相对路径），只会让同一用户后续图片换到新目录。
+let instanceSecretCache = "";
+
+function instanceSecret(): string {
+  if (instanceSecretCache) return instanceSecretCache;
+  try {
+    if (existsSync(INSTANCE_SECRET_PATH)) {
+      const existing = readFileSync(INSTANCE_SECRET_PATH, "utf8").trim();
+      if (existing.length >= 32) {
+        instanceSecretCache = existing;
+        return instanceSecretCache;
+      }
+    }
+  } catch { /* 读不到就重新生成 */ }
+  const generated = randomBytes(32).toString("hex");
+  try {
+    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(INSTANCE_SECRET_PATH, generated, { mode: 0o600 });
+  } catch { /* 无法落盘时退化为进程内密钥：本次运行内仍然自洽 */ }
+  instanceSecretCache = generated;
+  return instanceSecretCache;
+}
+
+// 图片目录名必须与 clientId / OAuth 用户名解耦。
+// 原因：目录名直接出现在公开、免鉴权、immutable 缓存的 /api/images/local/<dir>/<file> 里，
+// 而 clientId 同时是 /api/tasks 与 /api/images/thumb 的唯一凭证——一张图片 URL 泄漏出去
+// 就等于把该用户的任务列表凭证一起泄漏。改成 HMAC(实例密钥, 命名空间+身份) 的截断值后，
+// URL 不再携带任何可回推身份的信息，同一用户仍稳定落在同一目录。
+function imageDirToken(identity: string, kind: "user" | "client"): string {
+  return createHmac("sha256", instanceSecret())
+    .update(`image-dir:${kind}:${identity}`)
+    .digest("hex")
+    .slice(0, 24);
 }
 
 // 图片按 <用户目录>/<生成ID>-<序号>.<ext> 存储，用户目录取自 OAuth 用户名或 clientId
@@ -1136,7 +1398,7 @@ function safeErrorSummary(detail: unknown) {
   const record = detail && typeof detail === "object" ? detail as Record<string, unknown> : {};
   const error = record.error && typeof record.error === "object" ? record.error as Record<string, unknown> : {};
   return {
-    message: truncateText(
+    message: redactCredentialText(truncateText(
       typeof record.error === "string"
         ? record.error
         : typeof error.message === "string"
@@ -1145,11 +1407,11 @@ function safeErrorSummary(detail: unknown) {
             ? detail
             : "请求失败",
       800,
-    ),
+    )),
     type: typeof error.type === "string" ? error.type : undefined,
     code: typeof error.code === "string" ? error.code : undefined,
     raw: redactImageText(typeof detail === "string" ? detail : JSON.stringify(sanitizeForLog(detail)), 2500),
-    // 完整错误内容（仅脱敏图片数据，不做长度截断）——用于排查"中转站看起来没错但生成报错"的情况
+    // 完整错误内容（脱敏图片数据与凭据，不做长度截断）——用于排查"中转站看起来没错但生成报错"的情况
     full: redactImageText(typeof detail === "string" ? detail : JSON.stringify(sanitizeForLog(detail), null, 2), 60000),
   };
 }
@@ -1157,6 +1419,513 @@ function safeErrorSummary(detail: unknown) {
 // ── SQLite 请求/生成记录存储 ──
 const REQUEST_LOG_LIMIT = 5000;
 const THUMBNAIL_MAX_BYTES = 512 * 1024;
+
+// ── 生成任务队列 ──────────────────────────────────────────────
+// 设计约束（已与 owner 确认）：apiKey 与参考图 base64 **只在内存**，进程退出即弃。
+// 这样不违反「Key 永不落盘」的隐私红线，代价是重启后队列不可恢复——
+// 由启动时的 sweepStaleTasks() 把遗留任务判死，前端据此提示重试。
+const GENERATION_MAX_CONCURRENCY = 4;
+const GENERATION_MAX_QUEUE_DEPTH = 200;
+// clientId 是客户端自报的，换个 UUID 即可绕过按 clientId 的日配额。按 IP 再叠一道上限
+// 作为可信兜底；倍率放宽是因为同一出口 IP 后面可能坐着多个正常用户（NAT、公司网络）。
+const GENERATION_IP_QUOTA_FACTOR = 5;
+// 排队超过这个时长仍未被执行就判死，防止 backlog 里的任务永远占着 queued。
+// 必须大于单次生成的超时：并发槽位被 N 个长任务占满时，后面排队的还没轮到就被判死，
+// 用户会看到「排队超时未执行」而实际上系统运转正常。管理员放大生成超时后这里跟着放大。
+function generationQueueTtlMs(): number {
+  return Math.max(30 * 60 * 1000, generationTimeoutMs() + 10 * 60 * 1000);
+}
+
+type QueuedGenerationTask = {
+  requestId: string;
+  clientId: string;
+  imageUserDir: string;
+  baseUrl: string;
+  apiKey: string;
+  protocol: ImageProtocol;
+  request: GenerateRequest;
+  publicBaseUrl: string;
+  referenceCount: number;
+  receivedAt: number;
+  enqueuedAt: number;
+};
+
+const generationQueue: QueuedGenerationTask[] = [];
+let generationRunning = 0;
+
+function generationQueueStats() {
+  return { queued: generationQueue.length, running: generationRunning, capacity: GENERATION_MAX_CONCURRENCY };
+}
+
+// 进程启动时清扫上一轮遗留的 queued/running：内存队列已随进程消失，
+// 这些行若不判死会永远停在非终态——既不进 daily_stats（累加靠 running→终态跳变），
+// 又会让前端无限轮询。
+// 真正执行一个任务。**不依赖 req/res** —— 这是它能被队列在请求结束后调用的前提。
+async function executeGenerationTask(task: QueuedGenerationTask) {
+  const { requestId, receivedAt } = task;
+  const dispatchedAt = Date.now();
+  // 排队等待与生成耗时必须分开计量，否则 P50/P95 会被 backlog 污染
+  updateRequestLog(requestId, {
+    status: "running",
+    stages: { receivedAt, dispatchedAt },
+  }, [
+    lifecycleEvent("dispatched", "server", dispatchedAt, "任务出队，开始执行"),
+  ]);
+
+  try {
+    const upstreamRequestedAt = Date.now();
+    updateRequestLog(requestId, {
+      stages: { upstreamRequestedAt },
+    }, [
+      lifecycleEvent("upstream_requested", "upstream", upstreamRequestedAt, "已向上游图片模型发送请求"),
+    ]);
+    const { protocol, baseUrl, apiKey, request, publicBaseUrl } = task;
+    const result = protocol === "openai-responses"
+      ? await generateOpenAiResponses(baseUrl, apiKey, request, requestId)
+      : protocol === "gemini-native"
+        ? await generateGeminiNative(baseUrl, apiKey, request, requestId)
+        : protocol === "google-imagen"
+          ? await generateImagen(baseUrl, apiKey, request, requestId)
+      : protocol === "stability-core"
+            ? await generateStability(baseUrl, apiKey, request, requestId)
+            : await generateOpenAiCompatible(baseUrl, apiKey, request, requestId, publicBaseUrl);
+
+    const upstreamRespondedAt = Date.now();
+    updateRequestLog(requestId, {
+      stages: { upstreamRespondedAt },
+    }, [
+      lifecycleEvent(
+        "upstream_responded",
+        "upstream",
+        upstreamRespondedAt,
+        result.ok ? `上游返回成功（HTTP ${result.status || 200}）` : `上游返回失败（HTTP ${result.status || 500}）`,
+      ),
+    ]);
+    if (result.ok) {
+      const { saved } = persistGeneratedImages(result.images ?? [], {
+        userDir: task.imageUserDir,
+        requestId,
+      });
+      const imageSavedAt = Date.now();
+      updateRequestLog(requestId, {
+        status: "success",
+        httpStatus: result.status || 200,
+        responseBody: sanitizeForLog({ ok: true, status: result.status, requestId }),
+        referenceUploadStatus: task.referenceCount === 0 ? "none" : "succeeded",
+        finishedAt: imageSavedAt,
+        // 从出队算起才是真实生成耗时
+        durationMs: imageSavedAt - dispatchedAt,
+        imageSaved: saved.length > 0,
+        savedImages: saved,
+        stages: {
+          receivedAt,
+          dispatchedAt,
+          upstreamRequestedAt,
+          upstreamRespondedAt,
+          imageSavedAt,
+          returnedAt: imageSavedAt,
+          taskCompletedAt: imageSavedAt,
+        },
+      }, [
+        lifecycleEvent("image_saved", "server", imageSavedAt, `已保存 ${saved.length} 张图片`),
+        lifecycleEvent("task_completed", "server", imageSavedAt, "服务端任务完成，结果可供前端取回"),
+      ]);
+      return;
+    }
+
+    const summary = safeErrorSummary(result.detail);
+    updateRequestLog(requestId, {
+      status: "error",
+      httpStatus: result.status || 500,
+      errorMessage: summary.message,
+      errorType: summary.type,
+      errorCode: summary.code,
+      errorRaw: summary.raw,
+      errorFull: summary.full,
+      responseBody: sanitizeForLog(result),
+      referenceUploadStatus: task.referenceCount === 0 ? "none" : "failed",
+      finishedAt: upstreamRespondedAt,
+      durationMs: upstreamRespondedAt - dispatchedAt,
+      stages: { receivedAt, dispatchedAt, upstreamRequestedAt, upstreamRespondedAt, taskCompletedAt: upstreamRespondedAt },
+    }, [
+      lifecycleEvent("task_failed", "server", upstreamRespondedAt, summary.message),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const causeError = (error as { cause?: unknown })?.cause;
+    const causeMessage = causeError instanceof Error ? causeError.message : "";
+    const summaryMessage = redactCredentialText(causeMessage && causeMessage !== message ? `${message}（${causeMessage}）` : message);
+    const finishedAt = Date.now();
+    updateRequestLog(requestId, {
+      status: "error",
+      httpStatus: 500,
+      errorMessage: truncateText(summaryMessage, 800),
+      errorType: "proxy_error",
+      errorRaw: redactImageText(summaryMessage, 2500),
+      errorFull: redactImageText(describeError(error), 60000),
+      responseBody: sanitizeForLog({ ok: false, detail: { error: summaryMessage } }),
+      referenceUploadStatus: "failed",
+      finishedAt,
+      durationMs: finishedAt - dispatchedAt,
+      stages: { taskCompletedAt: finishedAt },
+    }, [
+      lifecycleEvent("task_failed", "server", finishedAt, summaryMessage),
+    ]);
+  }
+}
+
+function pumpGenerationQueue() {
+  while (generationRunning < GENERATION_MAX_CONCURRENCY && generationQueue.length > 0) {
+    const task = generationQueue.shift();
+    if (!task) break;
+    // 排队太久的直接判死，不再打上游（用户多半已经放弃了）
+    if (Date.now() - task.enqueuedAt > generationQueueTtlMs()) {
+      const finishedAt = Date.now();
+      updateRequestLog(task.requestId, {
+        status: "error",
+        httpStatus: 504,
+        errorMessage: "任务排队超时未执行",
+        errorType: "queue_timeout",
+        finishedAt,
+        durationMs: finishedAt - task.receivedAt,
+        stages: { taskCompletedAt: finishedAt },
+      }, [
+        lifecycleEvent("queue_timeout", "server", finishedAt, "任务排队超时，未请求上游"),
+      ]);
+      continue;
+    }
+    generationRunning += 1;
+    void executeGenerationTask(task).finally(() => {
+      generationRunning -= 1;
+      pumpGenerationQueue();
+    });
+  }
+}
+
+function sweepStaleTasks() {
+  try {
+    const rows = getDb()
+      .prepare("SELECT data FROM request_logs WHERE status IN ('submitting','queued','running')")
+      .all() as Array<{ data: string }>;
+    let swept = 0;
+    for (const row of rows) {
+      try {
+        const log = JSON.parse(row.data) as RequestLog;
+        if (!log?.requestId) continue;
+        const finishedAt = Date.now();
+        updateRequestLog(log.requestId, {
+          status: "error",
+          httpStatus: 503,
+          errorMessage: "服务重启，任务已中断，请重新生成",
+          errorType: "server_restarted",
+          finishedAt,
+          durationMs: finishedAt - (log.startedAt || log.createdAt || finishedAt),
+          stages: { taskCompletedAt: finishedAt },
+        }, [
+          lifecycleEvent("server_restart_abort", "server", finishedAt, "服务重启导致内存任务中断"),
+        ]);
+        swept += 1;
+      } catch { /* 跳过损坏行 */ }
+    }
+    if (swept > 0) console.log(`[queue] 已清扫 ${swept} 条重启前未完成的任务`);
+  } catch (error) {
+    console.warn("[queue] 清扫遗留任务失败:", error);
+  }
+}
+
+// ── 管理员登录加固：滑块验证 + 失败限流 ──────────────────────────────
+// 滑块本身只是抬高自动化成本，真正防爆破的是下面的失败计数与锁定。
+// 校验必须在服务端做：只在前端判断等于没做，攻击者直接打 API 即可绕过。
+const CAPTCHA_TTL_MS = 3 * 60 * 1000;
+const CAPTCHA_TOLERANCE_PX = 8;
+const CAPTCHA_TRACK_WIDTH = 300;
+const CAPTCHA_PIECE_SIZE = 42;
+type CaptchaChallenge = { gapX: number; expiresAt: number; issuedAt: number };
+const captchaChallenges = new Map<string, CaptchaChallenge>();
+
+// 失败限流：按「IP + 用户名」聚合，两者任一被锁都拒绝
+const LOGIN_FAIL_WINDOW_MS = 10 * 60 * 1000;
+const DEFAULT_LOGIN_MAX_FAILS = 5;
+const DEFAULT_LOGIN_LOCK_MINUTES = 15;
+const LOGIN_CAPTCHA_AFTER = 1; // 失败 1 次后强制滑块
+type LoginAttempt = { fails: number; firstFailAt: number; lockedUntil: number };
+const loginAttempts = new Map<string, LoginAttempt>();
+
+// 阈值改为读配置：管理员在后台调完立刻对下一次登录生效，无需重启。
+function adminMaxFails(): number {
+  const v = Math.round(Number(readConfigStore().security?.adminMaxFails));
+  return Number.isFinite(v) && v >= 1 && v <= 100 ? v : DEFAULT_LOGIN_MAX_FAILS;
+}
+function adminLockMs(): number {
+  const m = Math.round(Number(readConfigStore().security?.adminLockMinutes));
+  return (Number.isFinite(m) && m >= 1 && m <= 1440 ? m : DEFAULT_LOGIN_LOCK_MINUTES) * 60 * 1000;
+}
+
+// ── 安全事件环形缓冲：把原本静默的登录失败/锁定/限流/封禁命中记录下来，供后台展示 ──
+type SecurityEvent = { at: number; type: string; ipHash: string; detail: string };
+const securityEvents: SecurityEvent[] = [];
+const securityCounters: Record<string, number> = {};
+function recordSecurityEvent(type: string, ipHash: string, detail = "") {
+  securityEvents.push({ at: Date.now(), type, ipHash, detail });
+  if (securityEvents.length > 500) securityEvents.splice(0, securityEvents.length - 500);
+  securityCounters[type] = (securityCounters[type] || 0) + 1;
+}
+
+// ── IP 封禁名单：从配置读取，缓存到 Set，配置写入时失效重建 ──
+let bannedIpSet: Set<string> | null = null;
+let bannedIpVersion = -1;
+function bannedIpHashes(): Set<string> {
+  const cfg = readConfigStore();
+  if (bannedIpSet && bannedIpVersion === cfg.version) return bannedIpSet;
+  bannedIpSet = new Set((cfg.security?.bannedIps || []).map((item) => item.hash));
+  bannedIpVersion = cfg.version;
+  return bannedIpSet;
+}
+// 命中即拦：返回 true 表示已写 403，调用方直接 return。放在各匿名入口最前面。
+function guardBanned(req: IncomingMessage, res: ServerResponse): boolean {
+  const ipHash = clientIpKey(req);
+  if (!bannedIpHashes().has(ipHash)) return false;
+  recordSecurityEvent("ban_hit", ipHash, (req.url || "").split("?")[0]);
+  sendJson(res, 403, { ok: false, error: "访问被拒绝" });
+  return true;
+}
+
+function cleanupSecurityMaps() {
+  const now = Date.now();
+  for (const [key, item] of captchaChallenges) {
+    if (item.expiresAt < now) captchaChallenges.delete(key);
+  }
+  for (const [key, item] of loginAttempts) {
+    if (item.lockedUntil < now && now - item.firstFailAt > LOGIN_FAIL_WINDOW_MS) loginAttempts.delete(key);
+  }
+}
+
+function clientIpKey(req: IncomingMessage) {
+  const raw = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "");
+  return createHash("sha256").update(raw.split(",")[0].trim()).digest("hex").slice(0, 16);
+}
+
+// ── 无鉴权 POST 的按 IP 限流 ────────────────────────────────
+// /api/images/generate、/api/prompt/analyze、/api/agent/analyze 都无需登录即可调用，
+// 而每次调用都会写一条 request_logs。日志表有 REQUEST_LOG_LIMIT 上限，淘汰时
+// deleteSavedImages() 会物理 unlink 对应图片文件——所以「不限量的匿名写入」等价于
+// 「任何人都能删光全站已保存的图片」。限流是这条链上的第一道闸，
+// createRequestLog 前置校验（见生成路由）是第二道。
+const ANON_RATE_WINDOW_MS = 60 * 1000;
+const ANON_RATE_DEFAULTS: Record<string, number> = {
+  generate: 60,
+  analyze: 30,
+  feedback: 120,
+  feature: 5,
+  // 一次正常生成会产生 5–10 个轻量链路事件，必须与生成限流分桶。
+  lifecycle: 600,
+};
+const anonRateBuckets = new Map<string, { count: number; resetAt: number }>();
+
+// 各桶的每分钟上限现在读配置：0 或非法值回退到默认，负数视为 0（关闭该桶时应封禁而非设 0）。
+function anonRateLimitFor(bucket: string): number {
+  const sec = readConfigStore().security;
+  const map: Record<string, number | undefined> = {
+    generate: sec?.anonGeneratePerMin,
+    analyze: sec?.anonAnalyzePerMin,
+    feedback: sec?.anonFeedbackPerMin,
+    feature: sec?.anonFeaturePerMin,
+  };
+  const v = Math.round(Number(map[bucket]));
+  return Number.isFinite(v) && v > 0 ? v : ANON_RATE_DEFAULTS[bucket] ?? 60;
+}
+
+function anonRateLimit(req: IncomingMessage, bucket: string) {
+  const now = Date.now();
+  // 顺手清理过期桶，避免长时间运行后 Map 无界增长
+  if (anonRateBuckets.size > 5000) {
+    for (const [key, item] of anonRateBuckets) {
+      if (item.resetAt <= now) anonRateBuckets.delete(key);
+    }
+  }
+  const ipHash = clientIpKey(req);
+  const key = `${bucket}:${ipHash}`;
+  const limit = anonRateLimitFor(bucket);
+  const current = anonRateBuckets.get(key);
+  if (!current || current.resetAt <= now) {
+    anonRateBuckets.set(key, { count: 1, resetAt: now + ANON_RATE_WINDOW_MS });
+    return { allowed: true, retryAfterSec: 0 };
+  }
+  current.count += 1;
+  if (current.count > limit) {
+    // 只在刚越线的那一次记事件，避免持续打满时把环形缓冲刷爆
+    if (current.count === limit + 1) recordSecurityEvent("rate_limit", ipHash, bucket);
+    return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((current.resetAt - now) / 1000)) };
+  }
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+// 手写 PNG 编码（node:zlib 内置，零依赖）。目的是让缺口位置只存在于**像素**里：
+// 若把 gapX 放进 JSON 下发，攻击者读一次响应就拿到答案，滑块等于没做。
+function pngCrc32(buf: Buffer) {
+  let c = ~0;
+  for (let i = 0; i < buf.length; i++) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+  }
+  return ~c >>> 0;
+}
+
+function pngChunk(type: string, data: Buffer) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(pngCrc32(body), 0);
+  return Buffer.concat([len, body, crc]);
+}
+
+function encodePng(width: number, height: number, rgba: Buffer) {
+  const stride = width * 4;
+  const raw = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y++) {
+    raw[y * (stride + 1)] = 0; // filter: none
+    rgba.copy(raw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;  // bit depth
+  ihdr[9] = 6;  // color type RGBA
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", deflateSync(raw, { level: 6 })),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+const CAPTCHA_BG_HEIGHT = 100;
+
+// 生成「带缺口的背景图」+「拼图块」两张 PNG
+function renderCaptchaImages(gapX: number, gapY: number, size: number) {
+  const w = CAPTCHA_TRACK_WIDTH;
+  const h = CAPTCHA_BG_HEIGHT;
+  const bg = Buffer.alloc(w * h * 4);
+  const rnd = randomBytes(64);
+  // 随机彩色斑块做底，保证每次图案不同，避免被模板匹配
+  const blobs = Array.from({ length: 10 }, (_, i) => ({
+    cx: (rnd[i * 4] / 255) * w,
+    cy: (rnd[i * 4 + 1] / 255) * h,
+    r: 18 + (rnd[i * 4 + 2] / 255) * 46,
+    hue: (rnd[i * 4 + 3] / 255) * 360,
+  }));
+  const hsl = (hue: number, s: number, l: number) => {
+    const a = s * Math.min(l, 1 - l);
+    const f = (n: number) => {
+      const k = (n + hue / 30) % 12;
+      return l - a * Math.max(-1, Math.min(Math.min(k - 3, 9 - k), 1));
+    };
+    return [f(0) * 255, f(8) * 255, f(4) * 255];
+  };
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let r = 236, g = 234, b = 226;
+      for (const bl of blobs) {
+        const d = Math.hypot(x - bl.cx, y - bl.cy);
+        if (d < bl.r) {
+          const t = 1 - d / bl.r;
+          const [cr, cg, cb] = hsl(bl.hue, 0.5, 0.62);
+          r = r * (1 - t * 0.7) + cr * t * 0.7;
+          g = g * (1 - t * 0.7) + cg * t * 0.7;
+          b = b * (1 - t * 0.7) + cb * t * 0.7;
+        }
+      }
+      const i = (y * w + x) * 4;
+      bg[i] = r; bg[i + 1] = g; bg[i + 2] = b; bg[i + 3] = 255;
+    }
+  }
+  // 裁出拼图块，再把原位挖暗
+  const piece = Buffer.alloc(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const sx = gapX + x;
+      const sy = gapY + y;
+      const di = (y * size + x) * 4;
+      if (sx >= w || sy >= h) { piece[di + 3] = 0; continue; }
+      const si = (sy * w + sx) * 4;
+      piece[di] = bg[si]; piece[di + 1] = bg[si + 1]; piece[di + 2] = bg[si + 2]; piece[di + 3] = 255;
+      bg[si] = bg[si] * 0.28; bg[si + 1] = bg[si + 1] * 0.28; bg[si + 2] = bg[si + 2] * 0.28;
+    }
+  }
+  return {
+    background: `data:image/png;base64,${encodePng(w, h, bg).toString("base64")}`,
+    piece: `data:image/png;base64,${encodePng(size, size, piece).toString("base64")}`,
+  };
+}
+
+function issueCaptcha() {
+  cleanupSecurityMaps();
+  const token = randomBytes(18).toString("hex");
+  // 缺口留出左右边距，避免出现在极端位置让人拖不到
+  const min = 60;
+  const max = CAPTCHA_TRACK_WIDTH - CAPTCHA_PIECE_SIZE - 10;
+  const gapX = min + Math.floor((randomBytes(2).readUInt16BE(0) / 65536) * (max - min));
+  const gapY = 10 + Math.floor((randomBytes(2).readUInt16BE(0) / 65536) * 46);
+  captchaChallenges.set(token, { gapX, expiresAt: Date.now() + CAPTCHA_TTL_MS, issuedAt: Date.now() });
+  const images = renderCaptchaImages(gapX, gapY, CAPTCHA_PIECE_SIZE);
+  // 响应里没有 gapX：答案只在 background 图的暗色缺口像素中
+  return { token, gapY, trackWidth: CAPTCHA_TRACK_WIDTH, pieceSize: CAPTCHA_PIECE_SIZE, ...images };
+}
+
+function verifyCaptcha(token: string, x: number): { ok: boolean; error?: string } {
+  const item = captchaChallenges.get(token);
+  // 一次性：无论成败都立即销毁，杜绝同一 token 反复试位置
+  captchaChallenges.delete(token);
+  if (!item) return { ok: false, error: "验证已失效，请重新拖动滑块" };
+  if (item.expiresAt < Date.now()) return { ok: false, error: "验证已超时，请重新拖动滑块" };
+  // 人类拖动不可能快于 ~200ms，机器直接提交答案会被这条挡下
+  if (Date.now() - item.issuedAt < 200) return { ok: false, error: "验证异常，请重试" };
+  if (!Number.isFinite(x) || Math.abs(x - item.gapX) > CAPTCHA_TOLERANCE_PX) {
+    return { ok: false, error: "拼图未对齐，请重试" };
+  }
+  return { ok: true };
+}
+
+function loginGateState(ipKey: string, username: string) {
+  cleanupSecurityMaps();
+  const now = Date.now();
+  const keys = [`ip:${ipKey}`, `user:${username.toLowerCase()}`];
+  let lockedUntil = 0;
+  let fails = 0;
+  for (const key of keys) {
+    const item = loginAttempts.get(key);
+    if (!item) continue;
+    if (now - item.firstFailAt > LOGIN_FAIL_WINDOW_MS && item.lockedUntil < now) continue;
+    lockedUntil = Math.max(lockedUntil, item.lockedUntil);
+    fails = Math.max(fails, item.fails);
+  }
+  return { lockedUntil, fails, captchaRequired: fails >= LOGIN_CAPTCHA_AFTER };
+}
+
+function recordLoginFail(ipKey: string, username: string) {
+  const now = Date.now();
+  const maxFails = adminMaxFails();
+  const lockMs = adminLockMs();
+  for (const key of [`ip:${ipKey}`, `user:${username.toLowerCase()}`]) {
+    const item = loginAttempts.get(key);
+    if (!item || now - item.firstFailAt > LOGIN_FAIL_WINDOW_MS) {
+      loginAttempts.set(key, { fails: 1, firstFailAt: now, lockedUntil: 0 });
+      continue;
+    }
+    item.fails += 1;
+    if (item.fails >= maxFails && item.lockedUntil < now) {
+      item.lockedUntil = now + lockMs;
+      if (key.startsWith("ip:")) recordSecurityEvent("login_lock", ipKey, `user=${username}`);
+    }
+  }
+  recordSecurityEvent("login_fail", ipKey, `user=${username}`);
+}
+
+function clearLoginFails(ipKey: string, username: string) {
+  loginAttempts.delete(`ip:${ipKey}`);
+  loginAttempts.delete(`user:${username.toLowerCase()}`);
+}
 let sqliteDb: Database.Database | null = null;
 
 function getDb(): Database.Database {
@@ -1180,10 +1949,19 @@ function getDb(): Database.Database {
       upstream_responded INTEGER DEFAULT 0,
       image_saved INTEGER DEFAULT 0,
       search TEXT,
+      client_ip_hash TEXT,
       data TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_request_logs_status ON request_logs(status);
+    CREATE TABLE IF NOT EXISTS generation_idempotency (
+      request_id TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL,
+      request_fingerprint TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_generation_idempotency_created
+      ON generation_idempotency(created_at);
     CREATE TABLE IF NOT EXISTS daily_stats (
       date TEXT NOT NULL,
       model TEXT NOT NULL,
@@ -1202,8 +1980,84 @@ function getDb(): Database.Database {
       rating INTEGER,
       created_at INTEGER
     );
+    CREATE TABLE IF NOT EXISTS feature_requests (
+      id TEXT PRIMARY KEY,
+      api_key_hash TEXT NOT NULL,
+      content_raw TEXT NOT NULL,
+      content_polished TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      admin_reply TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_feature_requests_hash ON feature_requests(api_key_hash, created_at);
   `);
+  // 幂等键不需要永久保存，但必须显著长于前端的 24 小时任务找回窗口。
+  // request_logs 仍存在时，即使这行已过期，下面的 claim 也会拒绝复用同一 UUID。
+  db.prepare("DELETE FROM generation_idempotency WHERE created_at < ?")
+    .run(Date.now() - 30 * 24 * 60 * 60 * 1000);
   sqliteDb = db;
+  // 增量列迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
+  // 老库必须显式 ALTER。client_ip_hash 用于按 IP 的生成配额兜底。
+  try {
+    const columns = db.prepare("PRAGMA table_info(request_logs)").all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "client_ip_hash")) {
+      db.exec("ALTER TABLE request_logs ADD COLUMN client_ip_hash TEXT");
+      // 存量行的 IP 哈希本就在 data JSON 里，回填一次让配额统计对历史数据也生效
+      const rows = db.prepare("SELECT request_id, data FROM request_logs").all() as Array<{ request_id: string; data: string }>;
+      const backfillIp = db.transaction(() => {
+        const update = db.prepare("UPDATE request_logs SET client_ip_hash = ? WHERE request_id = ?");
+        for (const row of rows) {
+          try {
+            const hash = (JSON.parse(row.data) as RequestLog).clientIpHash;
+            if (hash) update.run(hash, row.request_id);
+          } catch { /* 单条损坏忽略 */ }
+        }
+      });
+      backfillIp();
+    }
+  } catch {
+    // 迁移失败不阻断启动：按 IP 的配额兜底会失效，按 clientId 的仍然生效
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_request_logs_ip ON request_logs(client_ip_hash)");
+  // 一次性抹掉存量记录里多余的 Key 字符。旧版本存了 6 位前缀 + 4 位后缀，
+  // 仅改类型与渲染不够——/api/admin/logs/export 是把整个 data JSON 原样导出的。
+  try {
+    const legacyKeyRows = db
+      .prepare("SELECT request_id, data FROM request_logs WHERE data LIKE '%apiKeySuffix%' OR data LIKE '%apiKeyPrefix%'")
+      .all() as Array<{ request_id: string; data: string }>;
+    if (legacyKeyRows.length > 0) {
+      const update = db.prepare("UPDATE request_logs SET data = ? WHERE request_id = ?");
+      const scrub = db.transaction(() => {
+        for (const row of legacyKeyRows) {
+          try {
+            const log = JSON.parse(row.data) as RequestLog & { apiKeySuffix?: string };
+            delete log.apiKeySuffix;
+            if (typeof log.apiKeyPrefix === "string") {
+              log.apiKeyPrefix = (log.apiKeyLength || 0) >= API_KEY_MASK_MIN_LENGTH
+                ? log.apiKeyPrefix.slice(0, 4)
+                : undefined;
+            }
+            // requestParams.credential 里也有一份同样的摘要
+            const params = log.requestParams as { credential?: Record<string, unknown> } | undefined;
+            if (params?.credential && typeof params.credential === "object") {
+              delete params.credential.apiKeySuffix;
+              const prefix = params.credential.apiKeyPrefix;
+              if (typeof prefix === "string") {
+                params.credential.apiKeyPrefix = (log.apiKeyLength || 0) >= API_KEY_MASK_MIN_LENGTH
+                  ? prefix.slice(0, 4)
+                  : undefined;
+              }
+            }
+            update.run(JSON.stringify(log), row.request_id);
+          } catch { /* 单条损坏忽略 */ }
+        }
+      });
+      scrub();
+    }
+  } catch {
+    // 清理失败不阻断启动
+  }
   // 首次启动时把历史 admin-store.json 里的旧日志迁移进来（一次性）
   try {
     const legacy = readAdminStore();
@@ -1230,7 +2084,12 @@ function getDb(): Database.Database {
         for (const row of rows) {
           try {
             const log = JSON.parse(row.data) as RequestLog;
-            if (log.requestType === "image_generation" && (log.status === "success" || log.status === "error")) {
+            if (
+              log.requestType === "image_generation"
+              && (log.status === "success" || log.status === "error")
+              && log.errorType !== "validation_error"
+              && log.errorType !== "client_submission_error"
+            ) {
               bumpDailyStats(log);
             }
           } catch { /* 单条损坏忽略 */ }
@@ -1241,8 +2100,15 @@ function getDb(): Database.Database {
   } catch {
     // 回填失败不阻断启动
   }
+  // 内存队列随进程消失，上一轮遗留的 submitting/queued/running 必须判死，
+  // 否则既不进 daily_stats（累加靠 running→终态跳变），前端也会无限轮询
+  if (!staleSwept) {
+    staleSwept = true;  // sqliteDb 已在上面赋值，sweepStaleTasks 内的 getDb() 不会递归
+    sweepStaleTasks();
+  }
   return db;
 }
+let staleSwept = false;
 
 // 请求到达终态时累加当日聚合（date + model 维度）
 function bumpDailyStats(log: RequestLog) {
@@ -1269,24 +2135,129 @@ function bumpDailyStats(log: RequestLog) {
 }
 
 function requestLogSearchText(log: RequestLog): string {
-  return `${log.requestId} ${log.clientId} ${log.prompt} ${log.model} ${log.resolution || ""} ${log.agentName || ""} ${log.agentScenario || ""} ${log.errorMessage || ""}`.toLowerCase();
+  // errorMessage 在各写入点已做值级脱敏，这里再过一次是纵深防御：
+  // 搜索列一旦写进去就会被后台模糊匹配命中，代价比多跑一次正则高得多。
+  return redactCredentialText(
+    `${log.requestId} ${log.clientId} ${log.prompt} ${log.model} ${log.resolution || ""} ${log.agentName || ""} ${log.agentScenario || ""} ${log.errorMessage || ""}`,
+  ).toLowerCase();
+}
+
+const REQUEST_LIFECYCLE_EVENT_LIMIT = 80;
+const CLIENT_LIFECYCLE_CLOCK_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+function safeClientLifecycleAt(value: unknown, serverNow = Date.now()): number {
+  const timestamp = typeof value === "number" ? Math.round(value) : Number(value);
+  return Number.isFinite(timestamp) && Math.abs(timestamp - serverNow) <= CLIENT_LIFECYCLE_CLOCK_WINDOW_MS
+    ? timestamp
+    : serverNow;
+}
+
+function lifecycleEvent(
+  phase: string,
+  source: RequestLifecycleEvent["source"],
+  at = Date.now(),
+  detail?: string,
+  recordedAt = Date.now(),
+): RequestLifecycleEvent {
+  return {
+    id: randomUUID(),
+    phase,
+    source,
+    at,
+    recordedAt,
+    detail: detail ? truncateText(redactCredentialText(detail), 500) : undefined,
+  };
+}
+
+function mergeLifecycleEvents(
+  current: RequestLifecycleEvent[] | undefined,
+  incoming: RequestLifecycleEvent[] | undefined,
+): RequestLifecycleEvent[] | undefined {
+  if (!current?.length && !incoming?.length) return undefined;
+  const merged: RequestLifecycleEvent[] = [];
+  for (const event of [...(current || []), ...(incoming || [])]) {
+    if (!event || !event.phase || !Number.isFinite(event.at)) continue;
+    // 主 POST 的 trace 与先到的旁路事件可能描述同一时间点；按 phase + 时间去重。
+    if (merged.some((item) =>
+      item.id === event.id
+      || (item.phase === event.phase && item.source === event.source && Math.abs(item.at - event.at) <= 5)
+    )) continue;
+    merged.push(event);
+  }
+  return merged
+    .sort((a, b) => a.at - b.at || (a.recordedAt || a.at) - (b.recordedAt || b.at))
+    .slice(-REQUEST_LIFECYCLE_EVENT_LIMIT);
+}
+
+function clientLifecycleStagePatch(phase: string, at: number): Partial<RequestStages> {
+  if (phase === "client_submitted") return { clientSubmittedAt: at };
+  if (phase === "client_persisted") return { clientPersistedAt: at };
+  if (phase === "client_request_started") return { clientRequestStartedAt: at };
+  if (phase === "client_accepted") return { clientAcceptedAt: at };
+  if (phase === "client_reconcile_started" || phase === "client_reconcile_found" || phase === "client_reconcile_miss") {
+    return { lastReconcileAt: at };
+  }
+  if (phase === "client_idempotent_retry") return { lastIdempotentRetryAt: at };
+  if (phase === "client_result_received") return { clientResultReceivedAt: at };
+  if (phase === "client_error_received") return { clientErrorReceivedAt: at };
+  return {};
+}
+
+function traceStages(trace: GenerateBody["trace"], serverNow = Date.now()): Partial<RequestStages> {
+  if (!trace || typeof trace !== "object") return {};
+  const stages: Partial<RequestStages> = {};
+  if (trace.submittedAt != null) stages.clientSubmittedAt = safeClientLifecycleAt(trace.submittedAt, serverNow);
+  if (trace.persistedAt != null) stages.clientPersistedAt = safeClientLifecycleAt(trace.persistedAt, serverNow);
+  if (trace.requestStartedAt != null) stages.clientRequestStartedAt = safeClientLifecycleAt(trace.requestStartedAt, serverNow);
+  return stages;
+}
+
+function traceLifecycleEvents(
+  trace: GenerateBody["trace"],
+  recordedAt = Date.now(),
+): RequestLifecycleEvent[] {
+  if (!trace || typeof trace !== "object") return [];
+  const stages = traceStages(trace, recordedAt);
+  return [
+    stages.clientSubmittedAt != null
+      ? lifecycleEvent("client_submitted", "client", stages.clientSubmittedAt, "用户点击提交", recordedAt)
+      : null,
+    stages.clientPersistedAt != null
+      ? lifecycleEvent("client_persisted", "client", stages.clientPersistedAt, "任务快照已写入本地数据库", recordedAt)
+      : null,
+    stages.clientRequestStartedAt != null
+      ? lifecycleEvent("client_request_started", "client", stages.clientRequestStartedAt, "开始发送生成 POST", recordedAt)
+      : null,
+  ].filter((event): event is RequestLifecycleEvent => event !== null);
+}
+
+function isProvisionalGenerationLog(log: RequestLog | null | undefined): log is RequestLog {
+  return Boolean(
+    log
+    && log.requestType === "image_generation"
+    && !log.requestFingerprint
+    && (log.status === "submitting" || log.errorType === "validation_error" || log.errorType === "client_submission_error"),
+  );
 }
 
 function requestLogRow(log: RequestLog) {
+  // error_key 是给后台按错误类型分组统计用的索引列，会渲染成概览页的错误标签。
+  // 兜底到 errorMessage 时必须截短并脱敏：整条上游原文（含可能被回显的 Key、
+  // 甚至整页 HTML）落进索引列既没有分组价值，也把泄漏面从 data 扩大到索引。
   const errorKey = log.status === "error"
-    ? (log.errorCode || log.errorType || log.errorMessage || "未知错误")
+    ? truncateText(redactCredentialText(log.errorCode || log.errorType || log.errorMessage || "未知错误"), 120)
     : null;
   const upstreamResponded = log.stages?.upstreamRespondedAt
-    || (log.status !== "running" && log.errorType !== "validation_error") ? 1 : 0;
+    || ((log.status === "success" || log.status === "error") && log.errorType !== "validation_error") ? 1 : 0;
   getDb().prepare(`
     INSERT INTO request_logs
-      (request_id, request_type, client_id, model, status, error_key, created_at, duration_ms, image_count, ref_count, ref_status, upstream_responded, image_saved, search, data)
-    VALUES (@request_id, @request_type, @client_id, @model, @status, @error_key, @created_at, @duration_ms, @image_count, @ref_count, @ref_status, @upstream_responded, @image_saved, @search, @data)
+      (request_id, request_type, client_id, model, status, error_key, created_at, duration_ms, image_count, ref_count, ref_status, upstream_responded, image_saved, search, client_ip_hash, data)
+    VALUES (@request_id, @request_type, @client_id, @model, @status, @error_key, @created_at, @duration_ms, @image_count, @ref_count, @ref_status, @upstream_responded, @image_saved, @search, @client_ip_hash, @data)
     ON CONFLICT(request_id) DO UPDATE SET
       request_type=excluded.request_type, client_id=excluded.client_id, model=excluded.model, status=excluded.status,
       error_key=excluded.error_key, created_at=excluded.created_at, duration_ms=excluded.duration_ms, image_count=excluded.image_count,
       ref_count=excluded.ref_count, ref_status=excluded.ref_status, upstream_responded=excluded.upstream_responded,
-      image_saved=excluded.image_saved, search=excluded.search, data=excluded.data
+      image_saved=excluded.image_saved, search=excluded.search, client_ip_hash=excluded.client_ip_hash, data=excluded.data
   `).run({
     request_id: log.requestId,
     request_type: log.requestType,
@@ -1302,6 +2273,7 @@ function requestLogRow(log: RequestLog) {
     upstream_responded: upstreamResponded,
     image_saved: log.imageSaved ? 1 : 0,
     search: requestLogSearchText(log),
+    client_ip_hash: log.clientIpHash || null,
     data: JSON.stringify(log),
   });
 }
@@ -1312,26 +2284,236 @@ function readRequestLogRecord(requestId: string): RequestLog | null {
   try { return JSON.parse(row.data) as RequestLog; } catch { return null; }
 }
 
-function createRequestLog(log: RequestLog) {
-  requestLogRow(log);
-  // 保留最近 REQUEST_LOG_LIMIT 条，清理超出的记录与其图片文件
-  const overflow = getDb()
-    .prepare("SELECT data FROM request_logs ORDER BY created_at DESC LIMIT -1 OFFSET ?")
-    .all(REQUEST_LOG_LIMIT) as Array<{ data: string }>;
-  if (overflow.length > 0) {
+function trimRequestLogs() {
+  // 保留最近 REQUEST_LOG_LIMIT 条，清理超出的记录与其图片文件。
+  //
+  // 淘汰顺序不是单纯的「最旧优先」：先淘汰不持有图片的行（分析请求、失败的生成），
+  // 只有当这些都清完仍然超限，才去动带图片的记录。
+  // 原因是淘汰会 unlink 真实文件——若按纯时间序淘汰，大量廉价的无图请求就能把
+  // 有图记录挤出表并删掉用户的图片。这样排序后，写入无图记录不再具备破坏力。
+  const excess = (getDb()
+    .prepare("SELECT COUNT(*) AS n FROM request_logs")
+    .get() as { n: number }).n - REQUEST_LOG_LIMIT;
+  if (excess > 0) {
+    const overflow = getDb()
+      .prepare(`SELECT request_id, data FROM request_logs
+        ORDER BY (image_count > 0) ASC, created_at ASC LIMIT ?`)
+      .all(excess) as Array<{ request_id: string; data: string }>;
     for (const row of overflow) {
       try { deleteSavedImages((JSON.parse(row.data) as RequestLog).savedImages); } catch { /* ignore */ }
     }
-    getDb().prepare(`DELETE FROM request_logs WHERE request_id IN (
-      SELECT request_id FROM request_logs ORDER BY created_at DESC LIMIT -1 OFFSET ?
-    )`).run(REQUEST_LOG_LIMIT);
+    const remove = getDb().prepare("DELETE FROM request_logs WHERE request_id = ?");
+    const removeAll = getDb().transaction((rows: Array<{ request_id: string }>) => {
+      for (const row of rows) remove.run(row.request_id);
+    });
+    removeAll(overflow);
   }
 }
 
-function updateRequestLog(requestId: string, patch: Partial<RequestLog>) {
+function createRequestLog(log: RequestLog) {
+  requestLogRow(log);
+  trimRequestLogs();
+}
+
+type GenerationIdempotencyRow = {
+  request_id: string;
+  client_id: string;
+  request_fingerprint: string;
+  created_at: number;
+};
+
+type GenerationRequestResolution =
+  | { kind: "available" }
+  | { kind: "accepted" }
+  | { kind: "duplicate"; log: RequestLog }
+  | { kind: "conflict" }
+  | { kind: "expired" };
+
+function generationRequestFingerprint(
+  clientId: string,
+  baseUrl: string,
+  protocol: ImageProtocol,
+  request: GenerateRequest,
+  requestMeta: Record<string, unknown>,
+): string {
+  // 只指纹化会决定任务语义的内容。API Key 不落盘也不参与指纹；
+  // 参考图只保存 sha256，避免把 base64 带入数据库。
+  const references = (Array.isArray(request.referenceImages) ? request.referenceImages : []).map((image) => ({
+    name: typeof image?.name === "string" ? image.name : "",
+    type: typeof image?.type === "string" ? image.type : "",
+    sha256: createHash("sha256").update(typeof image?.dataUrl === "string" ? image.dataUrl : "").digest("hex"),
+  }));
+  const canonical = {
+    clientId,
+    baseUrl: baseUrl.replace(/\/+$/, ""),
+    protocol,
+    model: request.model || "",
+    prompt: request.prompt || "",
+    size: request.size || "",
+    aspectRatio: request.aspectRatio || "",
+    resolution: request.resolution || "",
+    quality: request.quality || "",
+    outputFormat: request.outputFormat || "",
+    seed: request.seed || "",
+    negativePrompt: request.negativePrompt || "",
+    references,
+    batchId: typeof requestMeta.batchId === "string" ? requestMeta.batchId : "",
+    batchIndex: getNumber(requestMeta.index) ?? null,
+    batchTotal: getNumber(requestMeta.total) ?? null,
+    agentId: typeof requestMeta.agentId === "string" ? requestMeta.agentId : "",
+    agentName: typeof requestMeta.agentName === "string" ? requestMeta.agentName : "",
+    agentScenario: typeof requestMeta.agentScenario === "string" ? requestMeta.agentScenario : "",
+    promptVariant: typeof requestMeta.promptVariant === "string" ? requestMeta.promptVariant : "",
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+function resolveGenerationRequest(
+  requestId: string,
+  clientId: string,
+  requestFingerprint: string,
+): GenerationRequestResolution {
+  const row = getDb()
+    .prepare("SELECT request_id, client_id, request_fingerprint, created_at FROM generation_idempotency WHERE request_id = ?")
+    .get(requestId) as GenerationIdempotencyRow | undefined;
+  if (row) {
+    if (row.client_id !== clientId || row.request_fingerprint !== requestFingerprint) {
+      return { kind: "conflict" };
+    }
+    const log = readRequestLogRecord(requestId);
+    return log ? { kind: "duplicate", log } : { kind: "expired" };
+  }
+
+  // 兼容升级前已经存在的 request_logs。没有可靠指纹时绝不能覆盖旧任务。
+  const legacyLog = readRequestLogRecord(requestId);
+  if (!legacyLog) return { kind: "available" };
+  // “用户点击”旁路会先写一条 provisional 记录；它不是已受理任务，主 POST 可以继续校验并 claim。
+  if (isProvisionalGenerationLog(legacyLog) && legacyLog.clientId === clientId) {
+    return { kind: "available" };
+  }
+  if (legacyLog.clientId === clientId && legacyLog.requestFingerprint === requestFingerprint) {
+    getDb().prepare(`
+      INSERT OR IGNORE INTO generation_idempotency
+        (request_id, client_id, request_fingerprint, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(requestId, clientId, requestFingerprint, legacyLog.createdAt);
+    return { kind: "duplicate", log: legacyLog };
+  }
+  return { kind: "conflict" };
+}
+
+function claimGenerationRequest(log: RequestLog): GenerationRequestResolution {
+  const db = getDb();
+  const claim = db.transaction((): GenerationRequestResolution => {
+    const current = db
+      .prepare("SELECT request_id, client_id, request_fingerprint, created_at FROM generation_idempotency WHERE request_id = ?")
+      .get(log.requestId) as GenerationIdempotencyRow | undefined;
+    if (current) {
+      if (current.client_id !== log.clientId || current.request_fingerprint !== log.requestFingerprint) {
+        return { kind: "conflict" };
+      }
+      const existing = readRequestLogRecord(log.requestId);
+      return existing ? { kind: "duplicate", log: existing } : { kind: "expired" };
+    }
+
+    const legacyLog = readRequestLogRecord(log.requestId);
+    if (legacyLog) {
+      if (isProvisionalGenerationLog(legacyLog) && legacyLog.clientId === log.clientId) {
+        db.prepare(`
+          INSERT INTO generation_idempotency
+            (request_id, client_id, request_fingerprint, created_at)
+          VALUES (?, ?, ?, ?)
+        `).run(log.requestId, log.clientId, log.requestFingerprint, log.createdAt);
+        // 保留先到的客户端点击/落盘事件，再用通过校验的正式请求字段覆盖 provisional 占位值。
+        requestLogRow({
+          ...legacyLog,
+          ...log,
+          createdAt: Math.min(legacyLog.createdAt, log.createdAt),
+          stages: { ...(legacyLog.stages || {}), ...(log.stages || {}) },
+          lifecycleEvents: mergeLifecycleEvents(legacyLog.lifecycleEvents, log.lifecycleEvents),
+        });
+        return { kind: "accepted" };
+      }
+      if (legacyLog.clientId === log.clientId && legacyLog.requestFingerprint === log.requestFingerprint) {
+        db.prepare(`
+          INSERT OR IGNORE INTO generation_idempotency
+            (request_id, client_id, request_fingerprint, created_at)
+          VALUES (?, ?, ?, ?)
+        `).run(log.requestId, log.clientId, log.requestFingerprint, legacyLog.createdAt);
+        return { kind: "duplicate", log: legacyLog };
+      }
+      return { kind: "conflict" };
+    }
+
+    db.prepare(`
+      INSERT INTO generation_idempotency
+        (request_id, client_id, request_fingerprint, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(log.requestId, log.clientId, log.requestFingerprint, log.createdAt);
+    requestLogRow(log);
+    return { kind: "accepted" };
+  });
+  return claim();
+}
+
+function respondToGenerationResolution(
+  res: ServerResponse,
+  resolution: GenerationRequestResolution,
+): boolean {
+  if (resolution.kind === "available" || resolution.kind === "accepted") return false;
+  if (resolution.kind === "conflict") {
+    sendJson(res, 409, {
+      ok: false,
+      detail: { error: "requestId 已被另一份请求占用，请勿使用同一 ID 提交不同内容" },
+    });
+    return true;
+  }
+  if (resolution.kind === "expired") {
+    sendJson(res, 410, {
+      ok: false,
+      detail: { error: "该 requestId 已受理过，但任务记录已过期；为避免重复扣费不会重新执行" },
+    });
+    return true;
+  }
+  const { log } = resolution;
+  const replayAt = Date.now();
+  updateRequestLog(log.requestId, {
+    idempotentReplayCount: (log.idempotentReplayCount || 0) + 1,
+    lastIdempotentReplayAt: replayAt,
+  }, [
+    lifecycleEvent("idempotent_replay", "server", replayAt, `返回已有任务，当前状态：${log.status}`),
+  ]);
+  const refreshedLog = readRequestLogRecord(log.requestId) || log;
+  const active = refreshedLog.status === "submitting" || refreshedLog.status === "queued" || refreshedLog.status === "running";
+  sendJson(res, active ? 202 : 200, {
+    ok: true,
+    requestId: refreshedLog.requestId,
+    status: refreshedLog.status,
+    idempotent: true,
+    stages: refreshedLog.stages,
+    queue: generationQueueStats(),
+  });
+  return true;
+}
+
+function updateRequestLog(
+  requestId: string,
+  patch: Partial<RequestLog>,
+  lifecycleEvents: RequestLifecycleEvent[] = [],
+) {
   const current = readRequestLogRecord(requestId);
   if (!current) return;
-  const merged = { ...current, ...patch };
+  const merged: RequestLog = {
+    ...current,
+    ...patch,
+    stages: patch.stages
+      ? { ...(current.stages || {}), ...patch.stages }
+      : current.stages,
+    lifecycleEvents: mergeLifecycleEvents(
+      current.lifecycleEvents,
+      [...(patch.lifecycleEvents || []), ...lifecycleEvents],
+    ),
+  };
   requestLogRow(merged);
   // 生图请求首次从 running 进入终态时累加每日聚合（终态只发生一次，保证不重复计数）
   if (
@@ -1341,6 +2523,179 @@ function updateRequestLog(requestId: string, patch: Partial<RequestLog>) {
   ) {
     bumpDailyStats(merged);
   }
+}
+
+function appendRequestLifecycle(
+  requestId: string,
+  phase: string,
+  source: RequestLifecycleEvent["source"],
+  options: {
+    at?: number;
+    detail?: string;
+    stages?: Partial<RequestStages>;
+    patch?: Partial<RequestLog>;
+  } = {},
+) {
+  const at = options.at ?? Date.now();
+  updateRequestLog(requestId, {
+    ...(options.patch || {}),
+    stages: options.stages,
+  }, [lifecycleEvent(phase, source, at, options.detail)]);
+}
+
+const CLIENT_GENERATION_LIFECYCLE_PHASES = new Set([
+  "client_submitted",
+  "client_persisted",
+  "client_request_started",
+  "client_accepted",
+  "client_transport_ambiguous",
+  "client_reconcile_started",
+  "client_reconcile_found",
+  "client_reconcile_miss",
+  "client_idempotent_retry",
+  "client_submission_rejected",
+  "client_submission_unconfirmed",
+  "client_result_received",
+  "client_error_received",
+]);
+
+function recordGenerationClientEvent(
+  req: IncomingMessage,
+  body: GenerationClientEventBody,
+): { ok: true; log: RequestLog } | { ok: false; status: number; error: string } {
+  const requestId = String(body.requestId || "").trim();
+  const clientId = truncateText(String(body.clientId || "").trim(), 120);
+  const phase = String(body.phase || "").trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) {
+    return { ok: false, status: 400, error: "requestId 必须是合法 UUID" };
+  }
+  if (!clientId) return { ok: false, status: 400, error: "缺少 clientId" };
+  if (!CLIENT_GENERATION_LIFECYCLE_PHASES.has(phase)) {
+    return { ok: false, status: 400, error: "未知的链路阶段" };
+  }
+
+  const serverRecordedAt = Date.now();
+  const occurredAt = safeClientLifecycleAt(body.occurredAt, serverRecordedAt);
+  const event = lifecycleEvent(
+    phase,
+    "client",
+    occurredAt,
+    typeof body.detail === "string" ? body.detail : undefined,
+    serverRecordedAt,
+  );
+  const stagePatch = clientLifecycleStagePatch(phase, occurredAt);
+  const existing = readRequestLogRecord(requestId);
+  if (existing) {
+    if (existing.requestType !== "image_generation" || existing.clientId !== clientId) {
+      return { ok: false, status: 403, error: "无权写入该请求的链路日志" };
+    }
+    const terminalClientError = existing.status === "submitting"
+      && (phase === "client_submission_rejected" || phase === "client_error_received");
+    updateRequestLog(requestId, {
+      sourceSurface: existing.sourceSurface || (body.surface === "canvas" ? "canvas" : body.surface === "studio" ? "studio" : undefined),
+      localRecordId: existing.localRecordId || truncateText(String(body.localRecordId || ""), 120) || undefined,
+      stages: stagePatch,
+      ...(terminalClientError ? {
+        status: "error" as const,
+        errorType: "client_submission_error",
+        errorMessage: truncateText(redactCredentialText(String(body.detail || "客户端提交失败")), 800),
+        finishedAt: serverRecordedAt,
+        durationMs: Math.max(0, serverRecordedAt - existing.createdAt),
+      } : {}),
+    }, [event]);
+    return { ok: true, log: readRequestLogRecord(requestId) || existing };
+  }
+
+  const context: NonNullable<GenerationClientEventBody["context"]> =
+    body.context && typeof body.context === "object" ? body.context : {};
+  const surface = body.surface === "canvas" ? "canvas" : body.surface === "studio" ? "studio" : undefined;
+  const isTerminalClientError = phase === "client_submission_rejected" || phase === "client_error_received";
+  const provisional: RequestLog = {
+    requestId,
+    requestType: "image_generation",
+    batchId: typeof context.batchId === "string" ? truncateText(context.batchId, 120) : undefined,
+    batchIndex: typeof context.batchIndex === "number" ? context.batchIndex : undefined,
+    batchTotal: typeof context.batchTotal === "number" ? context.batchTotal : undefined,
+    clientId,
+    clientUserAgent: truncateText(req.headers["user-agent"] || "", 500),
+    clientIpHash: hashClientIp(req),
+    protocol: getProtocol(context.protocol),
+    apiBaseUrl: truncateText(typeof context.baseUrl === "string" ? context.baseUrl : "", 500),
+    apiKeyPresent: false,
+    apiKeyLength: 0,
+    endpoint: "/api/images/generate",
+    model: truncateText(typeof context.model === "string" ? context.model : "", 240),
+    prompt: truncateText(typeof context.prompt === "string" ? context.prompt : "", 4000),
+    aspectRatio: typeof context.aspectRatio === "string" ? context.aspectRatio : undefined,
+    size: typeof context.size === "string" ? context.size : undefined,
+    resolution: typeof context.resolution === "string" ? context.resolution : undefined,
+    referenceCount: typeof context.referenceCount === "number" ? Math.max(0, Math.round(context.referenceCount)) : 0,
+    requestParams: sanitizeForLog({
+      diagnosticAttempt: true,
+      surface,
+      localRecordId: body.localRecordId,
+      context,
+    }),
+    status: isTerminalClientError ? "error" : "submitting",
+    errorType: isTerminalClientError ? "client_submission_error" : undefined,
+    errorMessage: isTerminalClientError
+      ? truncateText(redactCredentialText(String(body.detail || "客户端提交失败")), 800)
+      : undefined,
+    createdAt: serverRecordedAt,
+    startedAt: serverRecordedAt,
+    finishedAt: isTerminalClientError ? serverRecordedAt : undefined,
+    durationMs: isTerminalClientError ? 0 : undefined,
+    imageSaved: false,
+    stages: stagePatch,
+    lifecycleEvents: [event],
+    sourceSurface: surface,
+    localRecordId: truncateText(String(body.localRecordId || ""), 120) || undefined,
+  };
+  createRequestLog(provisional);
+  return { ok: true, log: provisional };
+}
+
+function persistRejectedGenerationAttempt(
+  attemptLog: RequestLog,
+  httpStatus: number,
+  message: string,
+) {
+  const rejectedAt = Date.now();
+  const current = readRequestLogRecord(attemptLog.requestId);
+  const compatibleCurrent = isProvisionalGenerationLog(current) && current.clientId === attemptLog.clientId
+    ? current
+    : null;
+  const safeMessage = truncateText(redactCredentialText(message), 800);
+  const rejected: RequestLog = {
+    ...(compatibleCurrent || {}),
+    ...attemptLog,
+    // 校验失败尚未 claim，不能留下 requestFingerprint，否则相同 ID 会被误判成已收费任务。
+    requestFingerprint: undefined,
+    createdAt: compatibleCurrent ? Math.min(compatibleCurrent.createdAt, attemptLog.createdAt) : attemptLog.createdAt,
+    status: "error",
+    httpStatus,
+    errorMessage: safeMessage,
+    errorType: "validation_error",
+    errorRaw: safeMessage,
+    errorFull: safeMessage,
+    responseBody: sanitizeForLog({ ok: false, requestId: attemptLog.requestId, detail: { error: safeMessage } }),
+    finishedAt: rejectedAt,
+    durationMs: Math.max(0, rejectedAt - (attemptLog.startedAt || attemptLog.createdAt || rejectedAt)),
+    stages: {
+      ...(compatibleCurrent?.stages || {}),
+      ...(attemptLog.stages || {}),
+      validationFailedAt: rejectedAt,
+      taskCompletedAt: rejectedAt,
+    },
+    lifecycleEvents: mergeLifecycleEvents(
+      compatibleCurrent?.lifecycleEvents,
+      [
+        ...(attemptLog.lifecycleEvents || []),
+        lifecycleEvent("request_rejected", "server", rejectedAt, `HTTP ${httpStatus} · ${safeMessage}`),
+      ],
+    ),
+  };
+  createRequestLog(rejected);
 }
 
 function generationEndpointLabel(protocol: ImageProtocol, model = "", referenceCount = 0) {
@@ -1361,17 +2716,108 @@ function getNumber(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = API_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+// Node 内置 fetch（undici）的 headersTimeout / bodyTimeout 默认都是 300 秒，
+// 只放大 AbortController 是假的长超时——请求照样在 5 分钟被底层掐断，
+// 而且抛出的是不透明的 UND_ERR_HEADERS_TIMEOUT，比原来的中文提示更难排查。
+// undici 没有作为依赖装进来，这里从全局 dispatcher 反射出 Agent 构造器克隆一个放宽超时的实例；
+// 反射失败就退回默认 dispatcher（行为等同改动前，长任务仍会在 5 分钟断）。
+let cachedDispatcher: unknown;
+let cachedDispatcherTimeoutMs = -1;
+function longTimeoutDispatcher(timeoutMs: number) {
+  if (timeoutMs <= UNDICI_DEFAULT_TIMEOUT_MS) return undefined;
+  if (cachedDispatcherTimeoutMs === timeoutMs) return cachedDispatcher;
   try {
-    return await fetch(url, {
-      ...init,
-      signal: controller.signal,
+    const globalDispatcher = (globalThis as Record<symbol, unknown>)[Symbol.for("undici.globalDispatcher.1")];
+    const Agent = (globalDispatcher as { constructor?: unknown } | undefined)?.constructor;
+    if (typeof Agent !== "function") return undefined;
+    cachedDispatcher = new (Agent as new (opts: Record<string, number>) => unknown)({
+      headersTimeout: timeoutMs,
+      bodyTimeout: timeoutMs,
     });
+    cachedDispatcherTimeoutMs = timeoutMs;
+    return cachedDispatcher;
+  } catch {
+    return undefined;
+  }
+}
+
+// 跨 origin 重定向时必须剥掉的请求头。
+// Node 的 fetch 只会自动剥 Authorization / Cookie / Proxy-Authorization，
+// **不会**剥自定义头——而本仓库给 Gemini/Imagen 发的是 x-goog-api-key。
+// 实测（Node v22）：302 到另一个 origin 时该头会被原样带过去。
+// 当前允许的上游可以是纯 http 裸 IP，链路上的中间人注入一个 302 就能收走用户的 Key。
+const CROSS_ORIGIN_STRIPPED_HEADERS = [
+  "authorization",
+  "cookie",
+  "proxy-authorization",
+  "x-goog-api-key",
+  "x-api-key",
+  "api-key",
+  "x-goog-user-project",
+];
+const MAX_REDIRECTS = 5;
+
+function stripCredentialHeaders(headers: HeadersInit | undefined) {
+  const next = new Headers(headers as HeadersInit);
+  for (const name of CROSS_ORIGIN_STRIPPED_HEADERS) next.delete(name);
+  return next;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 0) {
+  // 默认参数在调用时求值，所以这里读到的始终是管理员当前配置的值
+  const effectiveTimeoutMs = timeoutMs > 0 ? timeoutMs : apiTimeoutMs();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
+  const dispatcher = longTimeoutDispatcher(effectiveTimeoutMs);
+  try {
+    // 手动跟随重定向：只有自己接管才能在跨 origin 时把鉴权头摘掉。
+    let currentUrl = url;
+    let currentInit: RequestInit = { ...init };
+    for (let hop = 0; ; hop++) {
+      const response = await fetch(currentUrl, {
+        ...currentInit,
+        redirect: "manual",
+        signal: controller.signal,
+        ...(dispatcher ? { dispatcher } : {}),
+      } as RequestInit);
+
+      const location = response.status >= 300 && response.status < 400
+        ? response.headers.get("location")
+        : null;
+      if (!location) return response;
+      // 这一跳的响应体不会被读，主动取消，否则 undici 会把连接挂在半读状态
+      void response.body?.cancel().catch(() => {});
+      if (hop >= MAX_REDIRECTS) {
+        throw new Error(`上游重定向次数超过 ${MAX_REDIRECTS} 次，已中断`);
+      }
+
+      const target = new URL(location, currentUrl);
+      if (target.protocol !== "http:" && target.protocol !== "https:") {
+        throw new Error("上游重定向到了不支持的协议，已中断");
+      }
+      const crossOrigin = target.origin !== new URL(currentUrl).origin;
+      if (crossOrigin) {
+        currentInit = { ...currentInit, headers: stripCredentialHeaders(currentInit.headers) };
+      }
+      // 303 一律转 GET；301/302 对非 GET/HEAD 同样按浏览器惯例转 GET 并丢弃 body
+      if (
+        response.status === 303
+        || ((response.status === 301 || response.status === 302)
+          && currentInit.method
+          && !["GET", "HEAD"].includes(currentInit.method.toUpperCase()))
+      ) {
+        currentInit = { ...currentInit, method: "GET", body: undefined };
+      }
+      currentUrl = target.toString();
+    }
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(`请求超过 ${Math.round(timeoutMs / 1000)} 秒，已自动超时`);
+      throw new Error(`请求超过 ${Math.round(effectiveTimeoutMs / 1000)} 秒，已自动超时`);
+    }
+    // 兜底：反射 dispatcher 失败时底层仍可能在 300 秒抛 undici 超时，翻译成人话再往上抛。
+    const code = (error as { cause?: { code?: string } } | undefined)?.cause?.code;
+    if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") {
+      throw new Error(`上游超过 ${Math.round(UNDICI_DEFAULT_TIMEOUT_MS / 1000)} 秒没有返回响应，连接已被底层断开`);
     }
     throw error;
   } finally {
@@ -1500,18 +2946,23 @@ function isLikedBy(store: SquareStore, apiKeyHash: string, itemId: string) {
 function squareFeedItem(item: SquareItem, store: SquareStore, tab: SquareFeedTab, viewerApiKeyHash = "", cachedRankScore?: number) {
   return {
     id: item.id,
-    imageId: item.imageId,
+    // 刻意不下发 imageId：它是 `<用户目录>/<文件名>` 形式的相对路径，
+    // 存量记录里的用户目录仍是明文 clientId / OAuth 用户名，等于把推荐者身份
+    // 挂在公开 feed 上。前端渲染只用 thumbnailUrl，从未读过这个字段。
     requestId: item.requestId,
     thumbnailUrl: `/api/square/image/${item.id}`,
-    prompt: item.prompt,
-    caption: item.caption,
+    // 创作者选择隐藏提示词时：prompt 清空；caption 若只是 prompt 的默认拷贝也一并清空
+    prompt: item.promptHidden ? "" : item.prompt,
+    caption: item.promptHidden && item.caption === truncateText(item.prompt, 240) ? "" : item.caption,
     model: item.model,
     params: item.params,
+    promptHidden: Boolean(item.promptHidden),
     width: item.width,
     height: item.height,
     aspectRatio: item.aspectRatio,
     sourceType: item.sourceType,
-    reasonPlan: item.reasonPlan,
+    // reasonPlan（Agent 规划）里可能整段包含提示词，隐藏时一并不下发
+    reasonPlan: item.promptHidden ? undefined : item.reasonPlan,
     recommenderLabel: item.recommenderLabel,
     pageLabel: item.pageLabel,
     likeCount: item.likeCount || 0,
@@ -1902,15 +3353,96 @@ function dataUrlFromBase64(base64: string, mime: string) {
   return `data:${mime};base64,${base64}`;
 }
 
-async function urlToDataUrl(url: string) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`读取图片 URL 失败：HTTP ${response.status} ${text.slice(0, 400)}`);
+// 上游有时不回 base64 而是回一个图片 URL，我们再去下载。
+// 那个 URL 完全由上游（可能只是个中转站）决定，所以这里的每一条限制都不是可选项：
+// 不校验主机就等于把服务器变成 SSRF 代理，抓到的字节还会被当成"图片"存盘并在后台展示。
+const IMAGE_FETCH_MAX_BYTES = 32 * 1024 * 1024;
+
+function assertPublicHttpUrl(raw: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("图片地址格式不合法");
   }
-  const contentType = response.headers.get("content-type") || "image/png";
-  const bytes = Buffer.from(await response.arrayBuffer()).toString("base64");
-  return `data:${contentType};base64,${bytes}`;
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("图片地址协议不受支持");
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  // 除了复用站点白名单那套内网判断，还要补 IPv6 回环/私有段，
+  // 以及 http://2130706433/ 这种十进制整数写法（等价于 127.0.0.1，正则匹配不到）。
+  if (
+    INTERNAL_HOST_PATTERN.test(host)
+    || host.endsWith(".local")
+    || host === "::1"
+    || host === "::"
+    || /^f[cd][0-9a-f]{2}:/.test(host)
+    || /^fe[89ab][0-9a-f]:/.test(host)
+    || /^\d+$/.test(host)
+  ) {
+    throw new Error("不允许读取内网或云元数据地址的图片");
+  }
+  return parsed;
+}
+
+// 只认真正的图片字节：Content-Type 是上游自报的，靠它把关等于没把关。
+// 按魔数识别既能挡住"内网返回一段 JSON 被当图片存下来"，也不会误伤
+// 那些把图片标成 application/octet-stream 的中转站。
+function sniffImageMime(buffer: Buffer): string {
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  if (buffer.length >= 6 && buffer.subarray(0, 6).toString("latin1").startsWith("GIF8")) return "image/gif";
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString("latin1") === "RIFF" && buffer.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+  // 刻意只认这四种：它们与 IMAGE_MIME_EXT 一一对应，
+  // 多认一种（比如 bmp）会在落盘时被安上 .png 后缀，属于自找的不一致。
+  return "";
+}
+
+async function urlToDataUrl(url: string) {
+  let currentUrl = assertPublicHttpUrl(url).toString();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), apiTimeoutMs());
+  try {
+    let response: Response;
+    // 手动跟随重定向：自动跟随时中间跳一次内网地址就能绕过上面的主机校验
+    for (let hop = 0; ; hop++) {
+      response = await fetch(currentUrl, { redirect: "manual", signal: controller.signal });
+      const location = response.status >= 300 && response.status < 400
+        ? response.headers.get("location")
+        : null;
+      if (!location) break;
+      void response.body?.cancel().catch(() => {});
+      if (hop >= MAX_REDIRECTS) {
+        throw new Error(`图片地址重定向次数超过 ${MAX_REDIRECTS} 次，已中断`);
+      }
+      currentUrl = assertPublicHttpUrl(new URL(location, currentUrl).toString()).toString();
+    }
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`读取图片 URL 失败：HTTP ${response.status} ${redactCredentialText(text.slice(0, 400))}`);
+    }
+    const declaredBytes = Number(response.headers.get("content-length") || 0);
+    if (declaredBytes > IMAGE_FETCH_MAX_BYTES) {
+      void response.body?.cancel().catch(() => {});
+      throw new Error("图片体积超出上限");
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > IMAGE_FETCH_MAX_BYTES) {
+      throw new Error("图片体积超出上限");
+    }
+    const mime = sniffImageMime(buffer);
+    if (!mime) {
+      throw new Error("图片 URL 返回的内容不是可识别的图片格式");
+    }
+    return `data:${mime};base64,${buffer.toString("base64")}`;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`读取图片 URL 超时（${Math.round(apiTimeoutMs() / 1000)} 秒）`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function extractModelIds(payload: unknown, key: "data" | "models" = "data") {
@@ -3097,7 +4629,7 @@ async function generateOpenAiImageEdit(baseUrl: string, apiKey: string, request:
       Authorization: `Bearer ${apiKey}`,
     },
     body: form,
-  });
+  }, generationTimeoutMs());
   return readOpenAiImageResponse(response, outputFormat);
 }
 
@@ -3182,7 +4714,7 @@ async function generateOpenAiCompatible(baseUrl: string, apiKey: string, request
             "Content-Type": "application/json",
           },
           body: JSON.stringify(attemptPayload),
-        });
+        }, generationTimeoutMs());
         const result = await readOpenAiImageResponse(response, outputFormat);
         if (result.ok) return result;
         lastResult = result;
@@ -3243,7 +4775,7 @@ async function generateOpenAiResponses(baseUrl: string, apiKey: string, request:
       "Content-Type": "application/json",
     },
     body: JSON.stringify(upstreamPayload),
-  });
+  }, generationTimeoutMs());
   return readGenericJsonImageResponse(response, outputFormat);
 }
 
@@ -3284,7 +4816,7 @@ async function generateGeminiNative(baseUrl: string, apiKey: string, request: Ge
       "x-goog-api-key": apiKey,
     },
     body: JSON.stringify(upstreamPayload),
-  });
+  }, generationTimeoutMs());
   return readGenericJsonImageResponse(response, outputFormat);
 }
 
@@ -3316,7 +4848,7 @@ async function generateImagen(baseUrl: string, apiKey: string, request: Generate
       "x-goog-api-key": apiKey,
     },
     body: JSON.stringify(upstreamPayload),
-  });
+  }, generationTimeoutMs());
   return readGenericJsonImageResponse(response, outputFormat);
 }
 
@@ -3352,7 +4884,7 @@ async function generateStability(baseUrl: string, apiKey: string, request: Gener
       Accept: "image/*",
     },
     body: form,
-  });
+  }, generationTimeoutMs());
 
   const contentType = response.headers.get("content-type") || outputMime(outputFormat);
   if (!response.ok) {
@@ -3610,6 +5142,7 @@ async function handleSquareRecommend(req: IncomingMessage, res: ServerResponse) 
       caption: truncateText(caption || prompt, 240),
       model: truncateText(model, 240),
       params: sanitizeForLog(params) as Record<string, unknown>,
+      promptHidden: Boolean(body.hidePrompt),
       width,
       height,
       aspectRatio: getNestedString(sourceImageMeta, "aspectRatio") || (typeof params.aspectRatio === "string" ? params.aspectRatio : undefined),
@@ -3989,6 +5522,8 @@ export function registerApiRoutes(app: ApiApp) {
             .sort((a, b) => a.sort - b.sort)
             .map((item) => ({ id: item.id, displayName: item.displayName, sizing: item.sizing, tags: item.tags || [] })),
           presets: store.presets,
+          // 前端要用它引导新用户去哪里申请 Key、选哪个分组
+          tokenGuide: store.tokenGuide?.enabled ? store.tokenGuide : undefined,
         });
       });
 
@@ -4001,7 +5536,10 @@ export function registerApiRoutes(app: ApiApp) {
         try {
           const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
           const rows = getDb().prepare(
-            "SELECT model, status, duration_ms FROM request_logs WHERE request_type = 'image_generation' AND created_at >= ?",
+            `SELECT r.model, r.status, r.duration_ms
+             FROM request_logs r
+             INNER JOIN generation_idempotency g ON g.request_id = r.request_id
+             WHERE r.request_type = 'image_generation' AND g.created_at >= ?`,
           ).all(since) as Array<{ model: string; status: string; duration_ms: number | null }>;
           const feedbackRows = getDb().prepare(
             "SELECT model, rating, COUNT(*) AS n FROM image_feedback GROUP BY model, rating",
@@ -4119,9 +5657,251 @@ export function registerApiRoutes(app: ApiApp) {
         }
       });
 
-      app.use("/api/feedback", async (req, res) => {
+      // 客户端链路旁路：用户一点击就先写一条 provisional 记录。
+      // 即使后续参考图处理失败、POST 被浏览器拦截，管理员仍能看到任务停在了哪一步。
+      // 旁路不携带 API Key/图片正文，并单独限流；失败也不会影响真实生成请求。
+      app.use("/api/generation-events", async (req, res) => {
+        if (guardBanned(req, res)) return;
         if (req.method !== "POST") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        const lifecycleRate = anonRateLimit(req, "lifecycle");
+        if (!lifecycleRate.allowed) {
+          res.setHeader("Retry-After", String(lifecycleRate.retryAfterSec));
+          sendJson(res, 429, { ok: false, error: "链路日志上报过于频繁" });
+          return;
+        }
+        try {
+          const body = await readJsonBody(req) as GenerationClientEventBody;
+          const result = recordGenerationClientEvent(req, body);
+          if (!result.ok) {
+            sendJson(res, result.status, { ok: false, error: result.error });
+            return;
+          }
+          sendJson(res, 202, {
+            ok: true,
+            requestId: result.log.requestId,
+            status: result.log.status,
+          });
+        } catch (error) {
+          sendJson(res, 400, {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+
+      // 任务找回：服务端 handler 不会因客户端断开而中止，图其实已经生成并落盘了，
+      // 缺的只是让前端查回来的途径。request_logs 本身就具备任务表的全部字段，无需新表。
+      app.use("/api/tasks", (req, res) => {
+        if (req.method !== "GET") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        try {
+          const q = new URLSearchParams((req.url || "").split("?")[1] || "");
+          const clientId = (q.get("clientId") || "").trim();
+          if (!clientId) {
+            sendJson(res, 400, { ok: false, error: "缺少 clientId" });
+            return;
+          }
+          const since = Number(q.get("since")) || Date.now() - 24 * 60 * 60 * 1000;
+          const ids = (q.get("ids") || "").split(",").map((v) => v.trim()).filter(Boolean).slice(0, 100);
+
+          // 按 clientId 取最近的生成任务；ids 非空时额外把这些明确要查的补进来
+          const rows = getDb()
+            .prepare(
+              `SELECT data FROM request_logs
+               WHERE client_id = ? AND request_type = 'image_generation' AND created_at >= ?
+               ORDER BY created_at DESC LIMIT 200`,
+            )
+            .all(clientId, since) as Array<{ data: string }>;
+          const byId = new Map<string, RequestLog>();
+          for (const row of rows) {
+            try {
+              const log = JSON.parse(row.data) as RequestLog;
+              if (log?.requestId) byId.set(log.requestId, log);
+            } catch { /* 跳过损坏行 */ }
+          }
+          for (const id of ids) {
+            if (byId.has(id)) continue;
+            const log = readRequestLogRecord(id);
+            // 明确指名要查的任务，也必须是自己的
+            if (log && log.clientId === clientId) byId.set(id, log);
+          }
+
+          // 异步化后这里是前端恢复记录的唯一数据源，字段必须够用：
+          // 脉冲线要 stages、批次重组要 batchId、广场推荐要 params/尺寸、Agent 卡片要 agent*
+          const tasks = [...byId.values()].map((log) => ({
+            requestId: log.requestId,
+            status: log.status,
+            model: log.model,
+            protocol: log.protocol,
+            prompt: log.prompt,
+            negativePrompt: log.negativePrompt,
+            createdAt: log.createdAt,
+            durationMs: log.durationMs,
+            stages: log.stages,
+            lifecycleEvents: log.lifecycleEvents,
+            sourceSurface: log.sourceSurface,
+            idempotentReplayCount: log.idempotentReplayCount,
+            lastIdempotentReplayAt: log.lastIdempotentReplayAt,
+            batchId: log.batchId,
+            batchIndex: log.batchIndex,
+            batchTotal: log.batchTotal,
+            agentId: log.agentId,
+            agentName: log.agentName,
+            agentScenario: log.agentScenario,
+            promptVariant: log.promptVariant,
+            params: {
+              aspectRatio: log.aspectRatio,
+              size: log.size,
+              resolution: log.resolution,
+              quality: log.quality,
+              outputFormat: log.outputFormat,
+              seed: log.seed,
+            },
+            errorMessage: log.status === "error" ? log.errorMessage : undefined,
+            errorType: log.status === "error" ? log.errorType : undefined,
+            images: (log.savedImages || []).map((img) => ({
+              url: `${LOCAL_IMAGE_URL_PREFIX}${img.id}`,
+              thumbUrl: img.thumbId ? `${LOCAL_IMAGE_URL_PREFIX}${img.thumbId}` : undefined,
+              bytes: img.bytes,
+            })),
+          }));
+          sendJson(res, 200, { ok: true, tasks, serverTime: Date.now() });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      });
+
+      // ── 用户需求/建议反馈（feature requests）──
+      // 防爆破三道闸：①提交必须携带 API Key（≥16 字符，只存 sha256 哈希）；
+      // ②服务端滑块验证（复用管理员登录那套 issueCaptcha/verifyCaptcha，一次性 token）；
+      // ③IP 限流（feature 桶 5/min）+ 每个 Key 每日 10 条。
+      // 内容先经用户自己的 Key 调上游大模型润色（失败则原文入库），
+      // 原文与润色文都过 redactCredentialText——用户可能把自己的 Key 粘进反馈里。
+      app.use("/api/feature-requests", async (req, res) => {
+        if (guardBanned(req, res)) return;
+        const frPath = (req.url || "/").split("?")[0] || "/";
+        try {
+          if (frPath === "/captcha" && req.method === "GET") {
+            sendJson(res, 200, { ok: true, ...issueCaptcha() });
+            return;
+          }
+          if (frPath === "/mine" && req.method === "GET") {
+            const headerKey = String(req.headers["x-imagehub-api-key"] || "").trim();
+            if (headerKey.length < 16) {
+              sendJson(res, 401, { ok: false, error: "需要 API Key 才能查看自己的反馈" });
+              return;
+            }
+            const rows = getDb()
+              .prepare("SELECT id, content_polished, status, admin_reply, created_at, updated_at FROM feature_requests WHERE api_key_hash = ? ORDER BY created_at DESC LIMIT 50")
+              .all(hashApiKey(headerKey)) as Array<{
+                id: string; content_polished: string; status: string; admin_reply: string;
+                created_at: number; updated_at: number;
+              }>;
+            sendJson(res, 200, {
+              ok: true,
+              items: rows.map((row) => ({
+                id: row.id,
+                content: row.content_polished,
+                status: row.status,
+                adminReply: row.admin_reply,
+                createdAt: row.created_at,
+                updatedAt: row.updated_at,
+              })),
+            });
+            return;
+          }
+          if (frPath === "/" && req.method === "POST") {
+            const featureRate = anonRateLimit(req, "feature");
+            if (!featureRate.allowed) {
+              res.setHeader("Retry-After", String(featureRate.retryAfterSec));
+              sendJson(res, 429, { ok: false, error: "提交过于频繁，请稍后再试" });
+              return;
+            }
+            const body = await readJsonBody(req);
+            const apiKey = getString(body, "apiKey").trim();
+            if (apiKey.length < 16) {
+              sendJson(res, 400, { ok: false, error: "请先在工作台配置 API Key 再提交反馈" });
+              return;
+            }
+            const captchaVerdict = verifyCaptcha(getString(body, "captchaToken"), Number(body.captchaX));
+            if (!captchaVerdict.ok) {
+              sendJson(res, 400, { ok: false, error: captchaVerdict.error || "滑块验证失败" });
+              return;
+            }
+            const rawContent = getString(body, "content").trim();
+            if (rawContent.length < 5 || rawContent.length > 2000) {
+              sendJson(res, 400, { ok: false, error: "反馈内容需在 5–2000 字之间" });
+              return;
+            }
+            const keyHash = hashApiKey(apiKey);
+            const dayStart = new Date();
+            dayStart.setHours(0, 0, 0, 0);
+            const todayCount = (getDb()
+              .prepare("SELECT COUNT(*) AS c FROM feature_requests WHERE api_key_hash = ? AND created_at >= ?")
+              .get(keyHash, dayStart.getTime()) as { c: number }).c;
+            if (todayCount >= 10) {
+              sendJson(res, 429, { ok: false, error: "今日反馈已达上限（10 条），明天再来吧" });
+              return;
+            }
+            // LLM 润色：尽力而为。上游不可用 / 模型没给 / 白名单不过，都回退为原文
+            let polished = rawContent;
+            const polishModel = getString(body, "analysisModel").trim();
+            const rawBaseUrl = getString(body, "baseUrl").trim();
+            if (polishModel && rawBaseUrl) {
+              try {
+                const baseUrl = normalizeAllowedApiBaseUrl(rawBaseUrl);
+                const llmRes = await fetchWithTimeout(endpoint(baseUrl, "/v1/chat/completions"), {
+                  method: "POST",
+                  headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    model: polishModel,
+                    stream: false,
+                    max_tokens: 600,
+                    messages: [
+                      {
+                        role: "system",
+                        content: "你是产品需求整理助手。把用户的反馈整理成一条清晰、简洁的需求描述：保留原意与关键细节，去掉口语赘词，不要添加用户没提的内容，不要评价。直接输出整理后的文本。",
+                      },
+                      { role: "user", content: rawContent },
+                    ],
+                  }),
+                }, 30_000);
+                if (llmRes.ok) {
+                  const data = await llmRes.json() as { choices?: Array<{ message?: { content?: string } }> };
+                  const text = String(data.choices?.[0]?.message?.content || "").trim();
+                  if (text.length >= 5 && text.length <= 3000) polished = text;
+                }
+              } catch { /* 润色失败不阻塞提交 */ }
+            }
+            const now = Date.now();
+            const id = randomUUID();
+            getDb()
+              .prepare("INSERT INTO feature_requests (id, api_key_hash, content_raw, content_polished, status, admin_reply, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', '', ?, ?)")
+              .run(id, keyHash, redactCredentialText(rawContent), redactCredentialText(polished), now, now);
+            sendJson(res, 200, { ok: true, id, polished: redactCredentialText(polished) });
+            return;
+          }
+          sendJson(res, 404, { ok: false, error: "Not found" });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      });
+
+      app.use("/api/feedback", async (req, res) => {
+        if (guardBanned(req, res)) return;
+        if (req.method !== "POST") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        const feedbackRate = anonRateLimit(req, "feedback");
+        if (!feedbackRate.allowed) {
+          res.setHeader("Retry-After", String(feedbackRate.retryAfterSec));
+          sendJson(res, 429, { ok: false, error: "请求过于频繁，请稍后再试" });
           return;
         }
         try {
@@ -4137,8 +5917,18 @@ export function registerApiRoutes(app: ApiApp) {
             sendJson(res, 404, { ok: false, error: "请求记录不存在" });
             return;
           }
+          // 必须是这条生成记录的发起方本人。这个表是公开 /api/model-stats 的数据源，
+          // 而 requestId 会随广场 feed 一起发出去；不校验的话任何人都能给别人的
+          // 记录打分（还挂在受害者 clientId 名下），直接污染各模型的好评率。
+          const feedbackClientId = getString(body, "clientId");
+          if (!feedbackClientId || !log.clientId || feedbackClientId !== log.clientId) {
+            sendJson(res, 403, { ok: false, error: "无权为该记录提交反馈" });
+            return;
+          }
           if (rating === 0) {
-            getDb().prepare("DELETE FROM image_feedback WHERE request_id = ?").run(requestId);
+            getDb()
+              .prepare("DELETE FROM image_feedback WHERE request_id = ? AND client_id = ?")
+              .run(requestId, log.clientId);
           } else {
             getDb().prepare(`
               INSERT INTO image_feedback (request_id, client_id, model, rating, created_at)
@@ -4202,6 +5992,10 @@ export function registerApiRoutes(app: ApiApp) {
       });
 
       app.use("/api/square/image/", (req, res) => {
+        if (req.method !== "GET" && req.method !== "HEAD") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
         const itemId = decodeURIComponent((req.url || "/").split("?")[0]?.replace(/^\/+/, "") || "");
         if (!itemId) { sendJson(res, 400, { ok: false, error: "missing item id" }); return; }
         const store = readSquareStore();
@@ -4264,6 +6058,7 @@ export function registerApiRoutes(app: ApiApp) {
           if (path === "/login" && req.method === "GET") {
             const state = randomBytes(24).toString("hex");
             oauthPendingStates.set(state, { expiresAt: Date.now() + OAUTH_STATE_TTL_MS });
+            setOAuthStateCookie(res, state);
             const redirectUri = OAUTH_REDIRECT_URI || `${req.headers["x-forwarded-proto"] || "http"}://${req.headers.host}/api/auth/oauth/callback`;
             const params = new URLSearchParams({
               response_type: "code",
@@ -4285,21 +6080,28 @@ export function registerApiRoutes(app: ApiApp) {
             const baseRedirect = OAUTH_REDIRECT_URI ? new URL(OAUTH_REDIRECT_URI).origin : `${req.headers["x-forwarded-proto"] || "http"}://${req.headers.host}`;
 
             if (oauthError || !code) {
+              clearOAuthStateCookie(res);
               res.statusCode = 302;
               res.setHeader("Location", `${baseRedirect}/#oauth-error`);
               res.end();
               return;
             }
 
+            // 双重校验：服务端 Map（防重放/过期）+ 浏览器 cookie（防登录 CSRF）。
+            // 两者缺一不可，见 setOAuthStateCookie 的注释。
+            const stateCookie = cookieValue(req, OAUTH_STATE_COOKIE);
             const pending = oauthPendingStates.get(state);
-            if (!pending || pending.expiresAt < Date.now()) {
+            const stateMatchesBrowser = Boolean(state) && stateCookie === state;
+            if (!pending || pending.expiresAt < Date.now() || !stateMatchesBrowser) {
               oauthPendingStates.delete(state);
+              clearOAuthStateCookie(res);
               res.statusCode = 302;
               res.setHeader("Location", `${baseRedirect}/#oauth-error`);
               res.end();
               return;
             }
             oauthPendingStates.delete(state);
+            clearOAuthStateCookie(res);
 
             const redirectUri = OAUTH_REDIRECT_URI || `${req.headers["x-forwarded-proto"] || "http"}://${req.headers.host}/api/auth/oauth/callback`;
 
@@ -4411,18 +6213,66 @@ export function registerApiRoutes(app: ApiApp) {
         const store = readAdminStore();
 
         try {
+          // 登录前置：告诉前端当前是否需要滑块、是否已被锁定
+          if (path === "/login-state" && req.method === "GET") {
+            const loginStateQuery = new URLSearchParams((req.url || "").split("?")[1] || "");
+            const gate = loginGateState(clientIpKey(req), loginStateQuery.get("username") || "");
+            sendJson(res, 200, {
+              ok: true,
+              captchaRequired: gate.captchaRequired,
+              lockedUntil: gate.lockedUntil > Date.now() ? gate.lockedUntil : 0,
+            });
+            return;
+          }
+
+          if (path === "/captcha" && req.method === "GET") {
+            sendJson(res, 200, { ok: true, ...issueCaptcha() });
+            return;
+          }
+
           if (path === "/login" && req.method === "POST") {
+            if (guardBanned(req, res)) return;
             const body = await readJsonBody(req);
             const username = getString(body, "username");
             const password = getString(body, "password");
-            const user = store.admins.find((admin) => admin.username === username);
-            if (!user || !verifyPassword(password, user)) {
-              sendJson(res, 401, { ok: false, error: "账号或密码错误" });
+            const ipKey = clientIpKey(req);
+            const gate = loginGateState(ipKey, username);
+
+            if (gate.lockedUntil > Date.now()) {
+              const mins = Math.ceil((gate.lockedUntil - Date.now()) / 60000);
+              appendAuditLog(username || "(unknown)", "admin_login_locked", `ip=${ipKey}`);
+              sendJson(res, 429, { ok: false, error: `尝试过于频繁，请 ${mins} 分钟后再试`, lockedUntil: gate.lockedUntil });
               return;
             }
+
+            if (gate.captchaRequired) {
+              const verdict = verifyCaptcha(getString(body, "captchaToken"), Number(body.captchaX));
+              if (!verdict.ok) {
+                // 滑块失败不计入密码失败次数，否则拖错几次就把自己锁死
+                sendJson(res, 400, { ok: false, error: verdict.error, captchaRequired: true });
+                return;
+              }
+            }
+
+            const user = store.admins.find((admin) => admin.username === username);
+            if (!user || !verifyPassword(password, user)) {
+              // 用户名不存在时也跑一次等价的 scrypt，抹平时序差，避免被用来枚举用户名
+              if (!user) scryptSync(password || "x", "timing-equalizer-salt", 64);
+              recordLoginFail(ipKey, username);
+              const next = loginGateState(ipKey, username);
+              appendAuditLog(username || "(unknown)", "admin_login_failed", `ip=${ipKey} fails=${next.fails}`);
+              sendJson(res, 401, {
+                ok: false,
+                error: "账号或密码错误",
+                captchaRequired: next.captchaRequired,
+                remainingAttempts: Math.max(0, adminMaxFails() - next.fails),
+              });
+              return;
+            }
+            clearLoginFails(ipKey, username);
             const token = createSession(user.username);
             setSessionCookie(res, token);
-            appendAuditLog(user.username, "admin_login");
+            appendAuditLog(user.username, "admin_login", `ip=${ipKey}`);
             sendJson(res, 200, {
               ok: true,
               user: {
@@ -4450,6 +6300,51 @@ export function registerApiRoutes(app: ApiApp) {
             : null;
           if (session && !user) {
             sendJson(res, 401, { ok: false, error: "管理员不存在" });
+            return;
+          }
+
+          // ── 用户需求列表（feature requests）──
+          if (path === "/feature-requests" && req.method === "GET") {
+            const rows = getDb()
+              .prepare("SELECT id, api_key_hash, content_raw, content_polished, status, admin_reply, created_at, updated_at FROM feature_requests ORDER BY created_at DESC LIMIT 500")
+              .all() as Array<{
+                id: string; api_key_hash: string; content_raw: string; content_polished: string;
+                status: string; admin_reply: string; created_at: number; updated_at: number;
+              }>;
+            sendJson(res, 200, {
+              ok: true,
+              items: rows.map((row) => ({
+                id: row.id,
+                // 只给前 6 位哈希做"同一用户"的辨识，不可回推 Key
+                userTag: row.api_key_hash.slice(0, 6),
+                contentRaw: row.content_raw,
+                content: row.content_polished,
+                status: row.status,
+                adminReply: row.admin_reply,
+                createdAt: row.created_at,
+                updatedAt: row.updated_at,
+              })),
+            });
+            return;
+          }
+          if (path.startsWith("/feature-requests/") && req.method === "PUT") {
+            const frId = path.slice("/feature-requests/".length);
+            const body = await readJsonBody(req);
+            const status = getString(body, "status");
+            if (!["pending", "planned", "done", "rejected"].includes(status)) {
+              sendJson(res, 400, { ok: false, error: "状态不合法" });
+              return;
+            }
+            const adminReply = getString(body, "adminReply").slice(0, 2000);
+            const result = getDb()
+              .prepare("UPDATE feature_requests SET status = ?, admin_reply = ?, updated_at = ? WHERE id = ?")
+              .run(status, adminReply, Date.now(), frId);
+            if (result.changes === 0) {
+              sendJson(res, 404, { ok: false, error: "该反馈不存在" });
+              return;
+            }
+            appendAuditLog(session?.username || oauthSession?.username || "(oauth-admin)", "feature_request_update", `id=${frId} status=${status}`);
+            sendJson(res, 200, { ok: true });
             return;
           }
 
@@ -4594,7 +6489,10 @@ export function registerApiRoutes(app: ApiApp) {
                 success,
                 error,
                 running: imageRows.filter((r) => r.status === "running").length,
-                successRate: imageRows.length ? Math.round((success / imageRows.length) * 1000) / 10 : 0,
+                queued: imageRows.filter((r) => r.status === "queued").length,
+                // 成功率只在已完成的任务里算：排队/执行中的任务还没有结果，
+                // 计进分母会让成功率随 backlog 起伏而失真
+                successRate: (success + error) ? Math.round((success / (success + error)) * 1000) / 10 : 0,
                 avgDurationMs,
                 p50DurationMs,
                 p95DurationMs,
@@ -4795,6 +6693,49 @@ export function registerApiRoutes(app: ApiApp) {
             return;
           }
 
+          if (path === "/config/timeouts" && req.method === "PUT") {
+            const body = await readJsonBody(req);
+            const t = body.timeouts && typeof body.timeouts === "object" ? body.timeouts as Record<string, unknown> : {};
+            const configStore = readConfigStore();
+            const nextApi = clampTimeoutMs(t.apiTimeoutMs, API_TIMEOUT_RANGE_MS, DEFAULT_API_TIMEOUT_MS);
+            const nextGeneration = clampTimeoutMs(t.generationTimeoutMs, GENERATION_TIMEOUT_RANGE_MS, DEFAULT_GENERATION_TIMEOUT_MS);
+            // 生成超时比交互式超时还短是明显的配置错误：生图永远慢于查模型列表
+            if (nextGeneration < nextApi) {
+              sendJson(res, 400, { ok: false, error: "生成超时不能小于常规接口超时" });
+              return;
+            }
+            configStore.timeouts = { apiTimeoutMs: nextApi, generationTimeoutMs: nextGeneration };
+            writeConfigStore(configStore);
+            appendAuditLog(adminName, "config_update_timeouts", `api=${nextApi}ms generation=${nextGeneration}ms`);
+            sendJson(res, 200, { ok: true, config: readConfigStore() });
+            return;
+          }
+
+          if (path === "/config/token-guide" && req.method === "PUT") {
+            const body = await readJsonBody(req);
+            const g = body.tokenGuide && typeof body.tokenGuide === "object"
+              ? body.tokenGuide as Record<string, unknown> : {};
+            const configStore = readConfigStore();
+            const rawUrl = truncateText(getString(g, "tokenUrl"), 500).trim();
+            // 只接受 http/https 外链——这是要给用户点开的地址，不能是 javascript: 之类
+            const safeUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : "";
+            if (rawUrl && !safeUrl) {
+              sendJson(res, 400, { ok: false, error: "令牌页地址必须以 http:// 或 https:// 开头" });
+              return;
+            }
+            configStore.tokenGuide = {
+              enabled: g.enabled !== false,
+              siteName: truncateText(getString(g, "siteName"), 60) || configStore.tokenGuide?.siteName || "",
+              tokenUrl: safeUrl,
+              groupName: truncateText(getString(g, "groupName"), 80),
+              note: truncateText(getString(g, "note"), 300),
+            };
+            writeConfigStore(configStore);
+            appendAuditLog(adminName, "config_update_token_guide", configStore.tokenGuide.tokenUrl);
+            sendJson(res, 200, { ok: true, config: readConfigStore() });
+            return;
+          }
+
           if (path === "/config/reset" && req.method === "POST") {
             const body = await readJsonBody(req);
             const section = String(body.section || "");
@@ -4805,10 +6746,100 @@ export function registerApiRoutes(app: ApiApp) {
             else if (section === "presets") configStore.presets = defaults.presets;
             else if (section === "systemPrompts") configStore.systemPrompts = defaults.systemPrompts;
             else if (section === "quotas") configStore.quotas = defaults.quotas;
+            else if (section === "timeouts") configStore.timeouts = defaults.timeouts;
+            else if (section === "tokenGuide") configStore.tokenGuide = defaults.tokenGuide;
             else throw new Error("未知的配置分组");
             writeConfigStore(configStore);
             appendAuditLog(adminName, "config_reset", section);
             sendJson(res, 200, { ok: true, config: readConfigStore() });
+            return;
+          }
+
+          // ── 站点加固：安全总览（阈值 + 封禁名单 + 实时锁定 + 近期事件）──
+          if (path === "/security" && req.method === "GET") {
+            const cfg = readConfigStore();
+            const now = Date.now();
+            // 当前生效的锁定/失败计数：只看 ip: 键，过滤掉窗口外的陈旧项
+            const lockouts: Array<{ ipHash: string; fails: number; lockedUntil: number }> = [];
+            for (const [key, item] of loginAttempts) {
+              if (!key.startsWith("ip:")) continue;
+              if (item.lockedUntil < now && now - item.firstFailAt > LOGIN_FAIL_WINDOW_MS) continue;
+              lockouts.push({ ipHash: key.slice(3), fails: item.fails, lockedUntil: item.lockedUntil > now ? item.lockedUntil : 0 });
+            }
+            lockouts.sort((a, b) => b.fails - a.fails);
+            sendJson(res, 200, {
+              ok: true,
+              thresholds: {
+                adminMaxFails: cfg.security.adminMaxFails,
+                adminLockMinutes: cfg.security.adminLockMinutes,
+                anonGeneratePerMin: cfg.security.anonGeneratePerMin,
+                anonAnalyzePerMin: cfg.security.anonAnalyzePerMin,
+                anonFeedbackPerMin: cfg.security.anonFeedbackPerMin,
+                anonFeaturePerMin: cfg.security.anonFeaturePerMin,
+              },
+              bans: [...cfg.security.bannedIps].sort((a, b) => b.createdAt - a.createdAt),
+              lockouts: lockouts.slice(0, 100),
+              events: securityEvents.slice(-200).reverse(),
+              counters: securityCounters,
+            });
+            return;
+          }
+
+          if (path === "/config/security" && req.method === "PUT") {
+            const body = await readJsonBody(req);
+            const clampInt = (value: unknown, min: number, max: number, fallback: number) => {
+              const n = Math.round(Number(value));
+              return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+            };
+            const configStore = readConfigStore();
+            const cur = configStore.security;
+            configStore.security = {
+              ...cur,
+              adminMaxFails: clampInt(body.adminMaxFails, 1, 100, cur.adminMaxFails),
+              adminLockMinutes: clampInt(body.adminLockMinutes, 1, 1440, cur.adminLockMinutes),
+              anonGeneratePerMin: clampInt(body.anonGeneratePerMin, 1, 100000, cur.anonGeneratePerMin),
+              anonAnalyzePerMin: clampInt(body.anonAnalyzePerMin, 1, 100000, cur.anonAnalyzePerMin),
+              anonFeedbackPerMin: clampInt(body.anonFeedbackPerMin, 1, 100000, cur.anonFeedbackPerMin),
+              anonFeaturePerMin: clampInt(body.anonFeaturePerMin, 1, 100000, cur.anonFeaturePerMin),
+            };
+            writeConfigStore(configStore);
+            appendAuditLog(adminName, "config_security", "thresholds");
+            sendJson(res, 200, { ok: true, thresholds: configStore.security });
+            return;
+          }
+
+          if (path === "/security/ban" && req.method === "POST") {
+            const body = await readJsonBody(req);
+            // 只接受 clientIpKey 形态的 16 位十六进制哈希，杜绝把任意字符串塞进名单
+            const hash = String(body.hash || "").trim().toLowerCase();
+            if (!/^[0-9a-f]{16}$/.test(hash)) {
+              sendJson(res, 400, { ok: false, error: "IP 标识格式不正确（应为 16 位十六进制哈希）" });
+              return;
+            }
+            const reason = truncateText(String(body.reason || "").trim(), 200) || "管理员手动封禁";
+            const configStore = readConfigStore();
+            if (!configStore.security.bannedIps.some((item) => item.hash === hash)) {
+              configStore.security.bannedIps.push({ hash, reason, createdAt: Date.now() });
+              if (configStore.security.bannedIps.length > 1000) {
+                configStore.security.bannedIps = configStore.security.bannedIps.slice(-1000);
+              }
+              writeConfigStore(configStore);
+            }
+            appendAuditLog(adminName, "security_ban", `hash=${hash}`);
+            recordSecurityEvent("ban_add", hash, reason);
+            sendJson(res, 200, { ok: true, bans: configStore.security.bannedIps });
+            return;
+          }
+
+          if (path === "/security/unban" && req.method === "POST") {
+            const body = await readJsonBody(req);
+            const hash = String(body.hash || "").trim().toLowerCase();
+            const configStore = readConfigStore();
+            const before = configStore.security.bannedIps.length;
+            configStore.security.bannedIps = configStore.security.bannedIps.filter((item) => item.hash !== hash);
+            if (configStore.security.bannedIps.length !== before) writeConfigStore(configStore);
+            appendAuditLog(adminName, "security_unban", `hash=${hash}`);
+            sendJson(res, 200, { ok: true, bans: configStore.security.bannedIps });
             return;
           }
 
@@ -4853,8 +6884,15 @@ export function registerApiRoutes(app: ApiApp) {
       });
 
       app.use("/api/prompt/analyze", async (req, res) => {
+        if (guardBanned(req, res)) return;
         if (req.method !== "POST") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        const analyzeRate = anonRateLimit(req, "analyze");
+        if (!analyzeRate.allowed) {
+          res.setHeader("Retry-After", String(analyzeRate.retryAfterSec));
+          sendJson(res, 429, { ok: false, error: "请求过于频繁，请稍后再试" });
           return;
         }
         const requestId = randomUUID();
@@ -4995,8 +7033,15 @@ export function registerApiRoutes(app: ApiApp) {
       });
 
       app.use("/api/agent/analyze", async (req, res) => {
+        if (guardBanned(req, res)) return;
         if (req.method !== "POST") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        const agentRate = anonRateLimit(req, "analyze");
+        if (!agentRate.allowed) {
+          res.setHeader("Retry-After", String(agentRate.retryAfterSec));
+          sendJson(res, 429, { ok: false, error: "请求过于频繁，请稍后再试" });
           return;
         }
         const requestId = randomUUID();
@@ -5168,15 +7213,29 @@ export function registerApiRoutes(app: ApiApp) {
       });
 
       app.use("/api/images/generate", async (req, res) => {
+        if (guardBanned(req, res)) return;
         if (req.method !== "POST") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
           return;
         }
-        const requestId = randomUUID();
+        let requestId: string = randomUUID();
         const startedAt = Date.now();
         let logCreated = false;
+        let requestClientId = "";
         try {
-          const body = await readJsonBody(req);
+          const body = await readJsonBody(req) as GenerateBody & ProxyBody;
+          const requestParsedAt = Date.now();
+          // 允许客户端预先指定 requestId：前端在发请求前就知道任务 ID，
+          // 页面关闭后才能靠它去 /api/tasks 把结果找回来。
+          // 非法 ID 直接拒绝；合法的重复 ID 由下面的指纹幂等协议处理，绝不静默换 UUID。
+          const wanted = getString(body, "requestId");
+          if (wanted && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(wanted)) {
+            sendJson(res, 400, { ok: false, detail: { error: "requestId 必须是合法 UUID" } });
+            return;
+          }
+          if (wanted) requestId = wanted;
+          const clientId = truncateText(getString(body, "clientId") || "anonymous", 120);
+          requestClientId = clientId;
           const baseUrl = normalizeAllowedApiBaseUrl(getString(body, "baseUrl"));
           const apiKey = getString(body, "apiKey");
           const publicBaseUrl = publicBaseUrlFromRequest(req);
@@ -5186,10 +7245,57 @@ export function registerApiRoutes(app: ApiApp) {
           const requestMeta = body.request && typeof body.request === "object"
             ? body.request as Record<string, unknown>
             : {};
-          const clientId = getString(body, "clientId") || "anonymous";
-          // 图片按用户分目录存储：优先 OAuth 用户名，否则用 clientId
+          const requestFingerprint = generationRequestFingerprint(
+            clientId,
+            baseUrl,
+            protocol,
+            request,
+            requestMeta,
+          );
+
+          // 重投必须先于限流、配额和队列容量判断：已经受理的任务不会因第二次确认请求
+          // 被误判成一次新生成，也不会再次计费或再次入队。
+          if (respondToGenerationResolution(
+            res,
+            resolveGenerationRequest(requestId, clientId, requestFingerprint),
+          )) return;
+
+          const generateRate = anonRateLimit(req, "generate");
+          if (!generateRate.allowed) {
+            // 与第一份请求并发到达时，它可能刚好在上面的查询之后完成 claim；拒绝前再确认一次。
+            if (respondToGenerationResolution(
+              res,
+              resolveGenerationRequest(requestId, clientId, requestFingerprint),
+            )) return;
+            const rateLimitedAt = Date.now();
+            const provisional = readRequestLogRecord(requestId);
+            if (isProvisionalGenerationLog(provisional) && provisional.clientId === clientId) {
+              updateRequestLog(requestId, {
+                status: "error",
+                httpStatus: 429,
+                errorMessage: "请求过于频繁，请稍后再试",
+                errorType: "validation_error",
+                finishedAt: rateLimitedAt,
+                durationMs: Math.max(0, rateLimitedAt - provisional.createdAt),
+                stages: { validationFailedAt: rateLimitedAt, taskCompletedAt: rateLimitedAt },
+              }, [
+                lifecycleEvent("request_rejected", "server", rateLimitedAt, "HTTP 429 · 生成接口限流"),
+              ]);
+            }
+            res.setHeader("Retry-After", String(generateRate.retryAfterSec));
+            sendJson(res, 429, { ok: false, error: "请求过于频繁，请稍后再试" });
+            return;
+          }
+
+          // 图片按用户分目录存储，但目录名是 HMAC 派生的不透明串，不再直接暴露
+          // OAuth 用户名或 clientId（详见 imageDirToken 的注释）。
           const generateOauthSession = getOAuthSession(req);
-          const imageUserDir = generateOauthSession?.username || clientId;
+          const imageUserDir = generateOauthSession?.username
+            ? imageDirToken(generateOauthSession.username, "user")
+            : imageDirToken(clientId, "client");
+          // 存量图片仍在旧的明文目录下，磁盘配额要把两处都算上，
+          // 否则老用户一改版就凭空多出一整份额度。
+          const legacyImageUserDir = sanitizeUserDir(generateOauthSession?.username || clientId);
 
           const incomingRefs = Array.isArray(request.referenceImages) ? request.referenceImages : [];
           const referenceTotalBytes = incomingRefs.reduce((sum, image) => {
@@ -5202,14 +7308,14 @@ export function registerApiRoutes(app: ApiApp) {
           }, 0);
           const initialUploadStatus: NonNullable<RequestLog["referenceUploadStatus"]> =
             incomingRefs.length === 0 ? "none" : "received";
-
-          createRequestLog({
+          const clientTraceStages = traceStages(body.trace, startedAt);
+          const attemptLog: RequestLog = {
             requestId,
             requestType: "image_generation",
             batchId: typeof requestMeta.batchId === "string" ? requestMeta.batchId : undefined,
             batchIndex: getNumber(requestMeta.index),
             batchTotal: getNumber(requestMeta.total),
-            clientId: truncateText(clientId, 120),
+            clientId,
             clientUserAgent: truncateText(req.headers["user-agent"] || "", 500),
             clientIpHash: hashClientIp(req),
             protocol,
@@ -5242,145 +7348,187 @@ export function registerApiRoutes(app: ApiApp) {
               apiKey: undefined,
               credential: apiKeyLogMeta(apiKey),
             }),
-            status: "running",
+            status: "submitting",
             createdAt: startedAt,
             startedAt,
             imageSaved: false,
-          });
-          logCreated = true;
+            stages: {
+              ...clientTraceStages,
+              receivedAt: startedAt,
+              requestParsedAt,
+            },
+            lifecycleEvents: mergeLifecycleEvents(
+              traceLifecycleEvents(body.trace, startedAt),
+              [
+                lifecycleEvent("server_received", "server", startedAt, "服务端收到生成 POST"),
+                lifecycleEvent("request_parsed", "server", requestParsedAt, "请求体解析完成"),
+              ],
+            ),
+            sourceSurface: body.trace?.surface === "canvas" ? "canvas" : body.trace?.surface === "studio" ? "studio" : undefined,
+            localRecordId: truncateText(String(body.trace?.localRecordId || ""), 120) || undefined,
+          };
 
-          const failFast = (status: number, message: string) => {
-            const finishedAt = Date.now();
-            updateRequestLog(requestId, {
-              status: "error",
-              httpStatus: status,
-              errorMessage: message,
-              errorType: "validation_error",
-              responseBody: sanitizeForLog({ ok: false, requestId, detail: { error: message } }),
-              finishedAt,
-              durationMs: finishedAt - startedAt,
-            });
+          // 所有校验都必须跑在 claimGenerationRequest 之前。校验失败会留下无图片的
+          // provisional 诊断记录；trimRequestLogs 会优先淘汰无图片行，不会让垃圾请求
+          // 挤掉已有图片记录。
+          const rejectBeforeLog = (status: number, message: string) => {
+            if (respondToGenerationResolution(
+              res,
+              resolveGenerationRequest(requestId, clientId, requestFingerprint),
+            )) return;
+            persistRejectedGenerationAttempt(attemptLog, status, message);
             sendJson(res, status, { ok: false, requestId, detail: { error: message } });
           };
 
           if (!request.model || !request.prompt) {
-            failFast(400, "模型和提示词不能为空");
+            rejectBeforeLog(400, "模型和提示词不能为空");
             return;
           }
 
           const allowedModels = enabledModelIds();
           if (allowedModels.length > 0 && !allowedModels.includes(normalizedModelId(request.model))) {
-            failFast(400, "所选模型不在允许列表中");
+            rejectBeforeLog(400, "所选模型不在允许列表中");
             return;
           }
 
           if (!apiKey) {
-            failFast(400, "API Key 不能为空");
+            rejectBeforeLog(400, "API Key 不能为空");
             return;
           }
 
-          // 配额校验：每日生成次数（按 clientId、上海时区自然日）与每用户磁盘占用，0 = 不限
+          // 配额校验：每日生成次数与每用户磁盘占用，0 = 不限。
+          // clientId 由客户端自报，换一个 UUID 就能清零计数，所以再叠一道按 IP 的日上限
+          // 作为可信兜底——两者取严。
           const quotaConfig = readConfigStore().quotas;
           if ((quotaConfig.generationDailyLimit || 0) > 0) {
             const dayStart = new Date(`${squareDayKey()}T00:00:00+08:00`).getTime();
             const usedToday = (getDb().prepare(
-              "SELECT COUNT(*) AS n FROM request_logs WHERE request_type = 'image_generation' AND client_id = ? AND created_at >= ? AND request_id != ?",
-            ).get(truncateText(clientId, 120), dayStart, requestId) as { n: number }).n;
+              `SELECT COUNT(*) AS n
+               FROM request_logs r
+               INNER JOIN generation_idempotency g ON g.request_id = r.request_id
+               WHERE r.request_type = 'image_generation' AND r.client_id = ? AND g.created_at >= ?`,
+            ).get(truncateText(clientId, 120), dayStart) as { n: number }).n;
             if (usedToday >= quotaConfig.generationDailyLimit) {
-              failFast(429, `今日生成次数已达上限（${quotaConfig.generationDailyLimit} 次），请明天再试或联系管理员调整配额`);
+              rejectBeforeLog(429, `今日生成次数已达上限（${quotaConfig.generationDailyLimit} 次），请明天再试或联系管理员调整配额`);
+              return;
+            }
+            const usedTodayByIp = (getDb().prepare(
+              `SELECT COUNT(*) AS n
+               FROM request_logs r
+               INNER JOIN generation_idempotency g ON g.request_id = r.request_id
+               WHERE r.request_type = 'image_generation' AND r.client_ip_hash = ? AND g.created_at >= ?`,
+            ).get(hashClientIp(req), dayStart) as { n: number }).n;
+            if (usedTodayByIp >= quotaConfig.generationDailyLimit * GENERATION_IP_QUOTA_FACTOR) {
+              rejectBeforeLog(429, "该网络今日生成次数已达上限，请稍后再试或联系管理员调整配额");
               return;
             }
           }
           if ((quotaConfig.userDiskLimitMB || 0) > 0) {
-            const userDirPath = join(LOCAL_IMAGE_DIR, sanitizeUserDir(imageUserDir));
             let usedBytes = 0;
-            try {
-              if (existsSync(userDirPath)) {
-                for (const file of readdirSync(userDirPath)) {
-                  try { usedBytes += statSync(join(userDirPath, file)).size; } catch { /* 忽略单个文件 */ }
+            for (const dirName of new Set([sanitizeUserDir(imageUserDir), legacyImageUserDir])) {
+              const userDirPath = join(LOCAL_IMAGE_DIR, dirName);
+              try {
+                if (existsSync(userDirPath)) {
+                  for (const file of readdirSync(userDirPath)) {
+                    try { usedBytes += statSync(join(userDirPath, file)).size; } catch { /* 忽略单个文件 */ }
+                  }
                 }
-              }
-            } catch { /* 目录不可读时不拦截 */ }
+              } catch { /* 目录不可读时不拦截 */ }
+            }
             if (usedBytes >= quotaConfig.userDiskLimitMB * 1024 * 1024) {
-              failFast(429, `图片存储空间已达上限（${quotaConfig.userDiskLimitMB} MB），请联系管理员清理或调整配额`);
+              rejectBeforeLog(429, `图片存储空间已达上限（${quotaConfig.userDiskLimitMB} MB），请联系管理员清理或调整配额`);
               return;
             }
           }
 
-          const upstreamRequestedAt = Date.now();
-          const result = protocol === "openai-responses"
-            ? await generateOpenAiResponses(baseUrl, apiKey, request, requestId)
-            : protocol === "gemini-native"
-              ? await generateGeminiNative(baseUrl, apiKey, request, requestId)
-              : protocol === "google-imagen"
-                ? await generateImagen(baseUrl, apiKey, request, requestId)
-                : protocol === "stability-core"
-                  ? await generateStability(baseUrl, apiKey, request, requestId)
-                  : await generateOpenAiCompatible(baseUrl, apiKey, request, requestId, publicBaseUrl);
-
-          const upstreamRespondedAt = Date.now();
-          const finishedAt = upstreamRespondedAt;
-          const durationMs = finishedAt - startedAt;
-          if (result.ok) {
-            const { saved, publicImages } = persistGeneratedImages(result.images ?? [], { userDir: imageUserDir, requestId });
-            const imageSavedAt = Date.now();
-            const returnedAt = Date.now();
-            const responsePayload = {
-              ok: true,
-              status: result.status,
-              images: publicImages,
-              raw: sanitizeForLog(result.raw),
-              requestId,
-              // 链路阶段时间戳：前端脉冲线用它渲染各环节真实耗时占比
-              stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt, imageSavedAt, returnedAt },
-            };
-            updateRequestLog(requestId, {
-              status: "success",
-              httpStatus: result.status || 200,
-              responseBody: sanitizeForLog(responsePayload),
-              referenceUploadStatus: incomingRefs.length === 0 ? "none" : "succeeded",
-              finishedAt: returnedAt,
-              durationMs: returnedAt - startedAt,
-              imageSaved: saved.length > 0,
-              savedImages: saved,
-              stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt, imageSavedAt, returnedAt },
-            });
-            sendJson(res, 200, responsePayload);
+          if (generationQueue.length >= GENERATION_MAX_QUEUE_DEPTH) {
+            rejectBeforeLog(503, "服务端任务队列已满，请稍后再试");
             return;
           }
 
-          const summary = safeErrorSummary(result.detail);
-          updateRequestLog(requestId, {
-            status: "error",
-            httpStatus: result.status || 500,
-            errorMessage: summary.message,
-            errorType: summary.type,
-            errorCode: summary.code,
-            errorRaw: summary.raw,
-            errorFull: summary.full,
-            responseBody: sanitizeForLog(result),
-            referenceUploadStatus: incomingRefs.length === 0 ? "none" : "failed",
-            finishedAt,
-            durationMs,
-            stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt },
+          const validatedAt = Date.now();
+          const initialLog: RequestLog = {
+            ...attemptLog,
+            requestFingerprint,
+            status: "queued",
+            errorMessage: undefined,
+            errorType: undefined,
+            errorRaw: undefined,
+            errorFull: undefined,
+            finishedAt: undefined,
+            durationMs: undefined,
+            stages: {
+              ...(attemptLog.stages || {}),
+              validatedAt,
+            },
+            lifecycleEvents: mergeLifecycleEvents(attemptLog.lifecycleEvents, [
+              lifecycleEvent("request_validated", "server", validatedAt, "参数、模型、配额与队列校验通过"),
+            ]),
+          };
+          const claim = claimGenerationRequest(initialLog);
+          if (respondToGenerationResolution(res, claim)) return;
+          if (claim.kind !== "accepted") {
+            throw new Error(`无法受理生成任务：${claim.kind}`);
+          }
+          trimRequestLogs();
+          logCreated = true;
+          const idempotencyClaimedAt = Date.now();
+          appendRequestLifecycle(requestId, "idempotency_claimed", "server", {
+            at: idempotencyClaimedAt,
+            detail: "requestId 幂等占位成功",
+            stages: { idempotencyClaimedAt },
           });
 
-          sendJson(res, result.status || 500, {
-            ...result,
+          // 入队而非直接执行：请求到此立即返回，生成在服务端后台进行。
+          // 这样关闭页面不再影响生成，前端凭 requestId 去 /api/tasks 取结果。
+          const enqueuedAt = Date.now();
+          generationQueue.push({
             requestId,
-            stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt },
+            clientId,
+            imageUserDir,
+            baseUrl,
+            apiKey,
+            protocol,
+            request,
+            publicBaseUrl,
+            referenceCount: incomingRefs.length,
+            receivedAt: startedAt,
+            enqueuedAt,
           });
+          updateRequestLog(requestId, {
+            status: "queued",
+            stages: { receivedAt: startedAt, enqueuedAt },
+          }, [
+            lifecycleEvent("queued", "server", enqueuedAt, `任务进入服务端队列，队列深度：${generationQueue.length}`),
+          ]);
+          const acceptedResponseAt = Date.now();
+          appendRequestLifecycle(requestId, "accepted_response_sent", "server", {
+            at: acceptedResponseAt,
+            detail: "已向前端返回 202 Accepted",
+            stages: { acceptedResponseAt },
+          });
+          const responseStages = readRequestLogRecord(requestId)?.stages;
+          sendJson(res, 202, {
+            ok: true,
+            requestId,
+            status: "queued",
+            queue: generationQueueStats(),
+            stages: responseStages,
+          });
+          // 让 202 的 res.end() 先完成；任何出队后的同步准备工作都不能拖住接单响应。
+          setImmediate(pumpGenerationQueue);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           // undici 的 "terminated" 等错误真正原因在 cause 里，拼进摘要方便一眼看懂
           const causeError = (error as { cause?: unknown })?.cause;
           const causeMessage = causeError instanceof Error ? causeError.message : "";
-          const summaryMessage = causeMessage && causeMessage !== message ? `${message}（${causeMessage}）` : message;
+          const summaryMessage = redactCredentialText(causeMessage && causeMessage !== message ? `${message}（${causeMessage}）` : message);
+          const failureStatus = isAllowedApiBaseUrlError(error) ? 400 : 500;
+          const finishedAt = Date.now();
           if (logCreated) {
-            const finishedAt = Date.now();
             updateRequestLog(requestId, {
               status: "error",
-              httpStatus: 500,
+              httpStatus: failureStatus,
               errorMessage: truncateText(summaryMessage, 800),
               errorType: "proxy_error",
               errorRaw: redactImageText(summaryMessage, 2500),
@@ -5389,9 +7537,29 @@ export function registerApiRoutes(app: ApiApp) {
               referenceUploadStatus: "failed",
               finishedAt,
               durationMs: finishedAt - startedAt,
-            });
+              stages: { taskCompletedAt: finishedAt },
+            }, [
+              lifecycleEvent("task_failed", "server", finishedAt, summaryMessage),
+            ]);
+          } else {
+            const provisional = readRequestLogRecord(requestId);
+            if (isProvisionalGenerationLog(provisional) && (!requestClientId || provisional.clientId === requestClientId)) {
+              updateRequestLog(requestId, {
+                status: "error",
+                httpStatus: failureStatus,
+                errorMessage: truncateText(summaryMessage, 800),
+                errorType: "validation_error",
+                errorRaw: redactImageText(summaryMessage, 2500),
+                errorFull: redactImageText(describeError(error), 60000),
+                finishedAt,
+                durationMs: Math.max(0, finishedAt - provisional.createdAt),
+                stages: { validationFailedAt: finishedAt, taskCompletedAt: finishedAt },
+              }, [
+                lifecycleEvent("request_rejected", "server", finishedAt, summaryMessage),
+              ]);
+            }
           }
-          sendJson(res, isAllowedApiBaseUrlError(error) ? 400 : 500, { ok: false, requestId, detail: { error: summaryMessage } });
+          sendJson(res, failureStatus, { ok: false, requestId, detail: { error: summaryMessage } });
         }
       });
 }

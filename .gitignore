@@ -5,6 +5,7 @@ dist/
 screenshot-*.png
 generated_images/
 .data/
+.tmp/
 server-dist/
 logs/
 .env
